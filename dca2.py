@@ -121,7 +121,11 @@ LISTEN_KEY_KEEPALIVE_SEC = 25 * 60
 BALANCE_REFRESH_SEC = 60
 POSITION_RISK_POLL_SEC = 10
 MAX_BACKOFF_SEC = 30
-IDLE_DATA_TIMEOUT_SEC = 20
+IDLE_DATA_TIMEOUT_SEC = 20            # market data: bookTicker ticks constantly, so silence
+                                       # this long on an active symbol really does mean trouble
+USER_WS_IDLE_FALLBACK_SEC = 20 * 60   # user data: silence is NORMAL (no fills = no messages).
+                                       # This is a loose last-resort fallback, not the primary
+                                       # liveness check - see the comment in userdata_consumer.
 
 # --- Cloud-host resilience ---------------------------------------------------
 STARTUP_RETRY_ATTEMPTS = 5
@@ -780,37 +784,69 @@ class MartingaleManager:
 
 
 # ============================================================================
-# STARTUP POSITION RECONCILIATION
+# POSITION SYNC (the fix for "stuck ENTERING after a missed fill event")
 # ============================================================================
 
 
-async def reconcile_position_on_startup(client: RestClient, manager: MartingaleManager) -> None:
-    """Runs once, right after the manager is created and BEFORE either
-    websocket loop starts. If a position was open on Binance when the
-    previous process instance died (cloud restarts are routine), this
-    process must NOT start from a blank PositionState() - it would treat
-    itself as flat and open a brand new, unrelated position on top of the
-    existing one.
+async def initialize_sync(
+    client: RestClient,
+    manager: MartingaleManager,
+    context: str = "startup",
+    rows: Optional[list] = None,
+) -> None:
+    """Reconciles the bot's in-memory PositionState against Binance's actual
+    reported position. This runs from THREE places, not just startup:
 
-    Best-effort reconstruction: rebuilds side, avg entry, and qty so the
-    take-profit / hard-stop / DCA-trigger math behaves correctly. dca_step
-    is conservatively reset to 0 since the exact prior DCA step count isn't
-    recoverable from this endpoint - review manually after any redeploy if
-    that distinction matters to you.
+      1. Once at process startup.
+      2. Immediately after every user-data-stream (re)connection - a dropped
+         listenKey means any ORDER_TRADE_UPDATE fills that happened while
+         disconnected are gone for good; Binance does not replay them.
+      3. On every periodic position-risk poll (~10s) as a defense-in-depth
+         net, so even a fill missed for some OTHER reason (a bad message, a
+         brief gap between disconnect and reconnect, etc.) self-heals within
+         one poll cycle instead of staying stuck indefinitely.
+
+    Without repeated reconciliation like this, a fill that lands while the
+    websocket is down leaves the bot stuck in ENTERING/DCA_PENDING forever:
+    on_price_tick() only acts while status is FLAT or OPEN, so a stuck
+    ENTERING position is silently never checked against take-profit /
+    hard-stop / DCA - exactly the symptom in the reported logs (exchange
+    showing a real positionAmt while the bot showed status=ENTERING,
+    avg_entry=None, indefinitely).
+
+    `rows` lets a caller that already fetched position-risk data (the
+    poller) pass it in directly instead of doubling up on the API call.
     """
     if DRY_RUN:
-        print(color("[reconcile] DRY_RUN is on - skipping live position reconciliation.", GRAY))
-        return
-    try:
-        rows = await client.get_position_risk(SYMBOL)
-    except BinanceApiError as e:
-        print(color(f"[reconcile] could not fetch position risk on startup: {e}. "
-                     f"Assuming flat - VERIFY MANUALLY on Binance.", RED))
-        return
+        return  # nothing real to sync against
+
+    if rows is None:
+        try:
+            rows = await client.get_position_risk(SYMBOL)
+        except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+            print(color(
+                f"[sync:{context}] could not fetch position risk: {e}. "
+                f"Leaving local state as-is - will retry next cycle.", RED
+            ))
+            return
 
     row = next((r for r in rows if float(r.get("positionAmt", 0)) != 0), None)
+    p = manager.position
+
     if row is None:
-        print(color("[reconcile] no open position found on startup - starting flat, as expected.", GRAY))
+        # Exchange shows flat. If local state thinks there's a position OR a
+        # pending order in flight, either it already closed (TP/hard-stop/
+        # manual) or the entry never actually filled while we were
+        # disconnected - either way, waiting on a fill event that already
+        # happened (or never will) is exactly how the bot gets stuck.
+        if p.status != "FLAT":
+            print(color(
+                f"{now_str()} [sync:{context}] exchange reports NO open position, but local "
+                f"state was status={p.status} side={p.side}. Resetting to FLAT so the bot "
+                f"can evaluate a fresh entry instead of waiting on a fill that won't arrive.",
+                YELLOW,
+            ))
+            manager.position = PositionState(last_close_time=time.time())
         return
 
     amt = float(row["positionAmt"])
@@ -818,6 +854,27 @@ async def reconcile_position_on_startup(client: RestClient, manager: MartingaleM
     side = "LONG" if amt > 0 else "SHORT"
     qty = abs(amt)
 
+    # Don't clobber an already-healthy OPEN position (and its DCA step
+    # count) on every routine 10s poll - only rebuild when local state
+    # actually disagrees with what the exchange reports.
+    already_synced = (
+        p.status == "OPEN"
+        and p.side == side
+        and p.avg_entry_price is not None
+        and abs(p.total_qty - qty) < max(manager.filters.step_size, 1e-9)
+    )
+    if already_synced:
+        return
+
+    print(color(
+        f"{now_str()} [sync:{context}] *** RESYNCING TO MATCH EXCHANGE *** "
+        f"exchange shows side={side} qty={qty} avg_entry={entry_price:.2f}; local state "
+        f"was status={p.status} side={p.side} avg_entry={p.avg_entry_price}. Rebuilding "
+        f"local state so take-profit / hard-stop / DCA logic resumes managing this trade "
+        f"(dca_step reset to 0 - the exact prior step count isn't recoverable from this "
+        f"endpoint; review manually if that matters for your risk tolerance).",
+        YELLOW,
+    ))
     manager.position = PositionState(
         side=side,
         status="OPEN",
@@ -826,13 +883,6 @@ async def reconcile_position_on_startup(client: RestClient, manager: MartingaleM
         avg_entry_price=entry_price,
         total_qty=qty,
     )
-    print(color(
-        f"{now_str()} [reconcile] *** FOUND AN EXISTING OPEN POSITION ON STARTUP *** "
-        f"side={side} qty={qty} avg_entry={entry_price:.2f}. Rebuilt in-memory state to "
-        f"match it instead of starting flat. dca_step reset to 0 (exact prior DCA count "
-        f"is unknown) - review manually if that matters for your risk tolerance.",
-        YELLOW,
-    ))
 
 
 # ============================================================================
@@ -870,18 +920,24 @@ async def market_data_consumer(manager: MartingaleManager) -> None:
                 try:
                     async for raw in ws:
                         last_msg_time = time.time()
-                        msg = json.loads(raw)
-                        data = msg.get("data", {})
-                        bid = float(data.get("b", 0) or 0)
-                        ask = float(data.get("a", 0) or 0)
-                        if bid and ask:
-                            price = (bid + ask) / 2
-                            manager.current_price = price
-                            manager.update_price_history(price)
-                            await manager.on_price_tick()
+                        try:
+                            msg = json.loads(raw)
+                            data = msg.get("data", {})
+                            bid = float(data.get("b", 0) or 0)
+                            ask = float(data.get("a", 0) or 0)
+                            if bid and ask:
+                                price = (bid + ask) / 2
+                                manager.current_price = price
+                                manager.update_price_history(price)
+                                await manager.on_price_tick()
+                        except Exception as e:  # noqa: BLE001 - one bad tick must not kill the socket
+                            print(color(f"[market-ws] error processing message, skipping: {e}", RED))
                 finally:
                     wd_task.cancel()
-        except (ConnectionClosed, OSError, asyncio.TimeoutError) as e:
+        except Exception as e:  # noqa: BLE001 - this IS the reconnect boundary; anything
+            # that escapes the websocket context (dead socket, DNS blip, a bug
+            # in an untested code path) should trigger backoff+retry, not a
+            # crash - ask #3: no exception here should kill the bot.
             print(color(f"[market-ws] disconnected ({e}), retrying in {backoff:.1f}s ...", RED))
         host_idx += 1
         await asyncio.sleep(backoff)
@@ -905,11 +961,34 @@ async def userdata_consumer(client: RestClient, manager: MartingaleManager) -> N
                 backoff = 1.0
                 last_msg_time = time.time()
 
+                # Re-sync IMMEDIATELY after every (re)connection. Any fill
+                # that landed while this stream was down is gone for good -
+                # Binance doesn't replay missed events on a new listenKey -
+                # so this is what actually fixes the "stuck ENTERING with a
+                # real position open" bug, not just the idle-timeout tuning
+                # below.
+                await initialize_sync(client, manager, context="user-ws reconnect")
+
                 async def watchdog(ws_ref) -> None:
+                    # NOTE: user-data pushes events only when something
+                    # happens (a fill, a balance change) - it is completely
+                    # normal for this stream to go quiet for many minutes on
+                    # a low-activity account. The real heartbeat here is
+                    # `websockets`' own ping_interval/ping_timeout above,
+                    # which sends protocol-level pings and raises
+                    # ConnectionClosed on a genuinely dead socket - that's
+                    # already caught below. This watchdog is now just a very
+                    # loose fallback, not the primary liveness check, since
+                    # treating silence as staleness is what was forcing
+                    # needless reconnects (and losing fills) in the first
+                    # place.
                     while True:
-                        await asyncio.sleep(5)
-                        if time.time() - last_msg_time > IDLE_DATA_TIMEOUT_SEC * 3:
-                            print(color("[user-ws] idle timeout, forcing reconnect ...", RED))
+                        await asyncio.sleep(30)
+                        if time.time() - last_msg_time > USER_WS_IDLE_FALLBACK_SEC:
+                            print(color(
+                                "[user-ws] no messages AND no pong for an extended "
+                                "period, forcing reconnect as a last resort ...", RED
+                            ))
                             await ws_ref.close()
                             return
 
@@ -917,17 +996,22 @@ async def userdata_consumer(client: RestClient, manager: MartingaleManager) -> N
                 try:
                     async for raw in ws:
                         last_msg_time = time.time()
-                        event = json.loads(raw)
-                        etype = event.get("e")
-                        if etype == "ORDER_TRADE_UPDATE":
-                            await manager.handle_order_update(event)
-                        elif etype == "ACCOUNT_UPDATE":
-                            for b in event.get("a", {}).get("B", []):
-                                if b.get("a") == "USDT":
-                                    manager.available_balance = float(b.get("cw") or b.get("wb") or 0)
+                        try:
+                            event = json.loads(raw)
+                            etype = event.get("e")
+                            if etype == "ORDER_TRADE_UPDATE":
+                                await manager.handle_order_update(event)
+                            elif etype == "ACCOUNT_UPDATE":
+                                for b in event.get("a", {}).get("B", []):
+                                    if b.get("a") == "USDT":
+                                        manager.available_balance = float(b.get("cw") or b.get("wb") or 0)
+                        except Exception as e:  # noqa: BLE001 - one bad message must not kill the socket
+                            print(color(f"[user-ws] error processing message, skipping: {e}", RED))
                 finally:
                     wd_task.cancel()
-        except (ConnectionClosed, OSError, asyncio.TimeoutError, BinanceApiError) as e:
+        except Exception as e:  # noqa: BLE001 - this IS the reconnect boundary; any API/network
+            # error here (dead socket, listenKey creation failure, a bug) triggers
+            # backoff+retry rather than crashing the bot - ask #3.
             print(color(f"[user-ws] disconnected ({e}), retrying in {backoff:.1f}s ...", RED))
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, MAX_BACKOFF_SEC)
@@ -939,7 +1023,7 @@ async def listen_key_keepalive(client: RestClient) -> None:
         try:
             await client.keepalive_listen_key()
             print(color(f"{now_str()} [user-ws] listenKey keepalive sent.", GRAY))
-        except BinanceApiError as e:
+        except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
             print(color(f"[user-ws] listenKey keepalive failed: {e}", RED))
 
 
@@ -955,12 +1039,17 @@ async def balance_refresher(client: RestClient, manager: MartingaleManager) -> N
                 #manager.available_balance = float(usdt["availableBalance"])
                 real_balance = float(usdt["availableBalance"])
                 manager.available_balance = min(real_balance, 50.0)
-        except BinanceApiError as e:
+        except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
             print(color(f"[balance] refresh failed: {e}", RED))
         await asyncio.sleep(BALANCE_REFRESH_SEC)
 
 
 async def position_risk_poller(client: RestClient, manager: MartingaleManager) -> None:
+    """Polls Binance's OWN authoritative liquidation price AND, on every
+    cycle, calls initialize_sync() with the same fetched rows - this is
+    what guarantees the bot self-heals from a stuck ENTERING/DCA_PENDING
+    state within ~POSITION_RISK_POLL_SEC seconds, even independent of any
+    websocket reconnect event."""
     while True:
         if DRY_RUN:
             await asyncio.sleep(POSITION_RISK_POLL_SEC)
@@ -977,7 +1066,8 @@ async def position_risk_poller(client: RestClient, manager: MartingaleManager) -
                 ))
             else:
                 manager.liquidation_price = None
-        except BinanceApiError as e:
+            await initialize_sync(client, manager, context="periodic poll", rows=rows)
+        except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
             print(color(f"[risk] position risk poll failed: {e}", RED))
         await asyncio.sleep(POSITION_RISK_POLL_SEC)
 
@@ -1068,7 +1158,7 @@ async def main() -> None:
         manager.current_price = (float(book["bidPrice"]) + float(book["askPrice"])) / 2
         print(color(f"[setup] current price: {manager.current_price:.2f}", GRAY))
 
-        await reconcile_position_on_startup(client, manager)
+        await initialize_sync(client, manager, context="startup")
 
         await asyncio.gather(
             market_data_consumer(manager),
