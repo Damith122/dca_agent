@@ -101,8 +101,18 @@ MAX_DCA_STEPS = 5
 
 # --- Trade management ---------------------------------------------------------
 DCA_TRIGGER_PCT = 0.002
-TAKE_PROFIT_PCT = 0.003
+TAKE_PROFIT_PCT = 0.003        # base / floor TP - used as-is in quiet markets
 HARD_STOP_PCT = 0.05
+
+# --- Dynamic (volatility-based) Take Profit ----------------------------------
+# When the market is choppy/trending hard, a fixed 0.3% TP leaves money on the
+# table; when it's dead quiet, a wider TP just means longer exposure for no
+# extra edge. This lets TP breathe with realized volatility while never going
+# below the original static TAKE_PROFIT_PCT.
+DYNAMIC_TP_ENABLED = True
+TAKE_PROFIT_MAX_PCT = 0.006     # hard ceiling - TP will never expand past this
+TP_VOL_LOW = 0.0003             # tick-return std at/below this -> quiet -> base TP
+TP_VOL_HIGH = 0.0012            # tick-return std at/above this -> max TP expansion
 
 # --- Simple entry signal (warmup/fallback only, see BRAIN_* below) ----------
 SIGNAL_LOOKBACK_TICKS = 20
@@ -548,6 +558,49 @@ class MartingaleManager:
             dtype=float,
         )
 
+    def _recent_tick_volatility(self) -> float:
+        """Std-dev of tick-to-tick returns over the recent price_history window.
+        Kept as its own small method (separate from get_features) so the
+        entry-signal feature vector is never touched by TP logic - this only
+        feeds the dynamic take-profit calculation below."""
+        hist = self.price_history
+        if len(hist) < 3:
+            return 0.0
+        arr = np.asarray(hist, dtype=float)
+        rets = np.diff(arr) / np.where(arr[:-1] == 0, 1.0, arr[:-1])
+        vol = float(np.std(rets))
+        return vol if np.isfinite(vol) else 0.0
+
+    def get_dynamic_take_profit_pct(self) -> float:
+        """Volatility-based dynamic TP.
+
+        - Quiet/sideways market (recent tick-return std <= TP_VOL_LOW):
+          TP stays at the original static TAKE_PROFIT_PCT.
+        - High volatility (std >= TP_VOL_HIGH): TP expands up to the
+          TAKE_PROFIT_MAX_PCT ceiling, letting winners run further instead of
+          getting clipped early during a strong move.
+        - In between: linear interpolation, so TP widens smoothly rather than
+          jumping between two fixed values.
+
+        Always returns a plain float >= TAKE_PROFIT_PCT and <=
+        TAKE_PROFIT_MAX_PCT - never None/bool, so callers can compare it
+        directly against pct_move with no extra type checks.
+        """
+        if not DYNAMIC_TP_ENABLED:
+            return TAKE_PROFIT_PCT
+
+        vol = self._recent_tick_volatility()
+
+        if vol <= TP_VOL_LOW:
+            return TAKE_PROFIT_PCT
+        if vol >= TP_VOL_HIGH:
+            return TAKE_PROFIT_MAX_PCT
+
+        vol_range = TP_VOL_HIGH - TP_VOL_LOW
+        ratio = (vol - TP_VOL_LOW) / vol_range if vol_range > 0 else 0.0
+        dynamic_pct = TAKE_PROFIT_PCT + ratio * (TAKE_PROFIT_MAX_PCT - TAKE_PROFIT_PCT)
+        return dynamic_pct
+
     def _static_momentum_signal(self) -> Optional[str]:
         if len(self.price_history) <= SIGNAL_LOOKBACK_TICKS:
             return None
@@ -699,8 +752,12 @@ class MartingaleManager:
             )
             return
 
-        if pct_move >= TAKE_PROFIT_PCT:
-            await self.close_position(f"take-profit: {pct_move*100:.2f}% favorable move")
+        dynamic_tp_pct = self.get_dynamic_take_profit_pct()
+        if pct_move >= dynamic_tp_pct:
+            await self.close_position(
+                f"take-profit: {pct_move*100:.2f}% favorable move "
+                f"(dynamic TP={dynamic_tp_pct*100:.3f}%, base={TAKE_PROFIT_PCT*100:.2f}%)"
+            )
             return
 
         if pct_move <= -DCA_TRIGGER_PCT:
@@ -1033,10 +1090,7 @@ async def balance_refresher(client: RestClient, manager: MartingaleManager) -> N
             balances = await client.get_balance()
             usdt = next((b for b in balances if b["asset"] == "USDT"), None)
             if usdt:
-                # Use the REAL fetched balance - a prior version of this file
-                # hardcoded 50.0 here, which would silently mask your actual
-                # account balance the entire time the bot runs. Don't do that.
-                #manager.available_balance = float(usdt["availableBalance"])
+                
                 real_balance = float(usdt["availableBalance"])
                 manager.available_balance = min(real_balance, 50.0)
         except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
