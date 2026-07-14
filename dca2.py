@@ -659,7 +659,7 @@ class MartingaleManager:
         try:
             resp = await self.client.place_order(
                 symbol=self.symbol, side=close_side, type="MARKET",
-                quantity=qty, reduceOnly=True,
+                quantity=qty, reduceOnly=true,
             )
             self._order_index[resp["orderId"]] = "close"
             self.position.pending_order_id = resp["orderId"]
