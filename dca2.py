@@ -103,7 +103,7 @@ MAX_DCA_STEPS = 5
 
 # --- Trade management ---------------------------------------------------------
 DCA_TRIGGER_PCT = 0.002
-TAKE_PROFIT_PCT = 0.003        # base / floor TP - used as-is in quiet markets
+TAKE_PROFIT_PCT = 0.002        # base / floor TP - used as-is in quiet markets
 HARD_STOP_PCT = 0.05
 
 # --- Dynamic (volatility-based) Take Profit ----------------------------------
