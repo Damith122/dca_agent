@@ -203,8 +203,26 @@ BRAIN_AUTO_PUSH_INTERVAL_SEC = int(os.environ.get("BRAIN_AUTO_PUSH_INTERVAL_SEC"
 # / minimal loss instead of riding the position down to the stop or, worse,
 # toward liquidation.
 SMART_EXIT_ENABLED = os.environ.get("SMART_EXIT_ENABLED", "true").lower() != "false"
-SMART_EXIT_REVERSAL_THRESHOLD = 0.00025   # last_pred beyond this, against the position, = reversal
+# Baseline threshold, used AS-IS in high-volatility markets. Previously
+# 0.00025 - too close to PREDICTION_DEADBAND (0.00015) to filter out normal
+# single-tick noise, which is what made Smart Exit fire on minor wiggles.
+SMART_EXIT_REVERSAL_THRESHOLD = 0.0006
 SMART_EXIT_MAX_LOSS_PCT = 0.01            # only fires while still in "minor loss" territory
+
+# Dynamic sensitivity: in a quiet market (low realized volatility), the SAME
+# raw prediction magnitude is proportionally much more likely to be noise
+# than signal, so the effective threshold scales UP (more patient) as
+# volatility drops toward TP_VOL_LOW, and relaxes back down to the plain
+# SMART_EXIT_REVERSAL_THRESHOLD ("remain as is") at/above TP_VOL_HIGH. Reuses
+# the same TP_VOL_LOW/TP_VOL_HIGH regime bands as the dynamic take-profit
+# logic so "quiet" and "volatile" mean the same thing everywhere in the bot.
+SMART_EXIT_VOL_PATIENCE_MULT = 3.0    # threshold multiplier applied in the quietest markets
+
+# Confidence / persistence filter: a single noisy tick must never be enough
+# to close a trade. The reversal condition has to hold for a MAJORITY of the
+# last SMART_EXIT_CONFIRM_TICKS predictions, not just the latest one.
+SMART_EXIT_CONFIRM_TICKS = 5
+SMART_EXIT_CONFIRM_RATIO = 0.7        # fraction of the recent window that must agree
 
 # --- Timing -------------------------------------------------------------------
 LISTEN_KEY_KEEPALIVE_SEC = 25 * 60
@@ -750,6 +768,7 @@ class MartingaleManager:
         self.best_bid_qty: float = 0.0
         self.best_ask_qty: float = 0.0
         self.recent_trade_outcomes: deque[float] = deque(maxlen=RECENT_TRADE_WINDOW)
+        self._recent_predictions: deque[float] = deque(maxlen=SMART_EXIT_CONFIRM_TICKS)
 
         # --- Cloud-Sync Brain --------------------------------------------
         self.github_sync = GithubBrainSync(
@@ -933,6 +952,54 @@ class MartingaleManager:
             dtype=float,
         )
 
+    def get_dynamic_smart_exit_threshold(self) -> float:
+        """Volatility-based dynamic Smart Exit sensitivity.
+
+        - Quiet/sideways market (recent tick-return std <= TP_VOL_LOW): the
+          threshold is scaled UP by SMART_EXIT_VOL_PATIENCE_MULT - the bot is
+          more patient, because in a quiet market the same raw prediction
+          magnitude is much more likely to just be noise.
+        - High volatility (std >= TP_VOL_HIGH): threshold relaxes back down
+          to the plain SMART_EXIT_REVERSAL_THRESHOLD - sensitivity "remains
+          as is", since real trend changes are more plausible here and a
+          large move is already underway.
+        - In between: linear interpolation, same shape as
+          get_dynamic_take_profit_pct(), and reusing the same TP_VOL_LOW/
+          TP_VOL_HIGH bands so "quiet" and "volatile" mean the same thing
+          everywhere in the bot.
+        """
+        vol = self._recent_tick_volatility()
+
+        if vol <= TP_VOL_LOW:
+            return SMART_EXIT_REVERSAL_THRESHOLD * SMART_EXIT_VOL_PATIENCE_MULT
+        if vol >= TP_VOL_HIGH:
+            return SMART_EXIT_REVERSAL_THRESHOLD
+
+        vol_range = TP_VOL_HIGH - TP_VOL_LOW
+        ratio = (vol - TP_VOL_LOW) / vol_range if vol_range > 0 else 0.0
+        # ratio goes 0 -> 1 as vol goes TP_VOL_LOW -> TP_VOL_HIGH, and the
+        # multiplier should go SMART_EXIT_VOL_PATIENCE_MULT -> 1.0 over that
+        # same span, so interpolate on (1 - ratio).
+        multiplier = 1.0 + (1.0 - ratio) * (SMART_EXIT_VOL_PATIENCE_MULT - 1.0)
+        return SMART_EXIT_REVERSAL_THRESHOLD * multiplier
+
+    def smart_exit_confirmed(self, side: str, dynamic_threshold: float) -> bool:
+        """Confidence / persistence filter: true only if a MAJORITY of the
+        last SMART_EXIT_CONFIRM_TICKS live predictions both exceed the
+        dynamic threshold AND agree on direction against `side`. A single
+        noisy tick - even a large one - can never satisfy this alone; it
+        takes a sustained run of predictions to confirm a real reversal."""
+        history = self._recent_predictions
+        if len(history) < SMART_EXIT_CONFIRM_TICKS:
+            return False  # not enough recent ticks yet to have any confidence at all
+
+        if side == "LONG":
+            agreeing = sum(1 for p in history if p <= -dynamic_threshold)
+        else:
+            agreeing = sum(1 for p in history if p >= dynamic_threshold)
+
+        return (agreeing / len(history)) >= SMART_EXIT_CONFIRM_RATIO
+
     def _recent_tick_volatility(self) -> float:
         """Std-dev of tick-to-tick returns over the recent price_history window.
         Kept as its own small method (separate from get_features) so the
@@ -1114,7 +1181,8 @@ class MartingaleManager:
         # generate_entry_signal) so Smart Exit sees a live reversal signal
         # while a trade is OPEN, not a stale prediction from before entry.
         if self.brain.is_ready():
-            self.brain.predict(features)
+            pred = self.brain.predict(features)
+            self._recent_predictions.append(pred)
 
         if self.position.status == "FLAT":
             if time.time() - self.last_trade_action_ts < TRADE_COOLDOWN_SEC:
@@ -1176,17 +1244,30 @@ class MartingaleManager:
         # hard stop (or, in a fast-moving 40x market, toward liquidation).
         # Still gated by held_long_enough - a reversal prediction seconds
         # after entry is far more likely noise than a real regime change.
+        #
+        # Two extra filters on top of that, both aimed at the same problem
+        # (firing on ordinary noise instead of a real reversal):
+        #   - dynamic_threshold widens in quiet markets (more patient) and
+        #     relaxes to the baseline in volatile ones (as-is sensitivity).
+        #   - smart_exit_confirmed() requires a MAJORITY of the last several
+        #     predictions to agree, not just the latest single tick.
         last_pred = self.brain.last_prediction
         if SMART_EXIT_ENABLED and held_long_enough and self.brain.is_ready() and last_pred is not None:
+            dynamic_threshold = self.get_dynamic_smart_exit_threshold()
             reversal_against_position = (
-                (self.position.side == "LONG" and last_pred <= -SMART_EXIT_REVERSAL_THRESHOLD)
-                or (self.position.side == "SHORT" and last_pred >= SMART_EXIT_REVERSAL_THRESHOLD)
+                (self.position.side == "LONG" and last_pred <= -dynamic_threshold)
+                or (self.position.side == "SHORT" and last_pred >= dynamic_threshold)
             )
-            if reversal_against_position and pct_move > -SMART_EXIT_MAX_LOSS_PCT:
+            if (
+                reversal_against_position
+                and pct_move > -SMART_EXIT_MAX_LOSS_PCT
+                and self.smart_exit_confirmed(self.position.side, dynamic_threshold)
+            ):
                 await self.close_position(
-                    f"SMART EXIT: brain predicts reversal against {self.position.side} "
-                    f"(last_pred={last_pred:+.5f}) at {pct_move*100:.2f}% - exiting at "
-                    f"breakeven/minimal loss instead of risking further adverse move"
+                    f"SMART EXIT: brain confirms reversal against {self.position.side} over "
+                    f"the last {SMART_EXIT_CONFIRM_TICKS} ticks (last_pred={last_pred:+.5f}, "
+                    f"dynamic_threshold={dynamic_threshold:+.5f}) at {pct_move*100:.2f}% - "
+                    f"exiting at breakeven/minimal loss instead of risking further adverse move"
                 )
                 return
 
