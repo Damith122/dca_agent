@@ -119,7 +119,58 @@ TP_VOL_HIGH = 0.0012            # tick-return std at/above this -> max TP expans
 # --- Simple entry signal (warmup/fallback only, see BRAIN_* below) ----------
 SIGNAL_LOOKBACK_TICKS = 20
 SIGNAL_DEADBAND_PCT = 0.0005
-POST_EXIT_COOLDOWN_SEC = 15
+
+# --- Over-trading guardrails --------------------------------------------------
+# Root cause of "rapid-fire" churn: nothing previously stopped a fresh entry
+# the instant the bot went FLAT again, and nothing stopped a discretionary
+# (non-emergency) exit the instant it became even marginally profitable -
+# so on a choppy tape the bot could open/close within seconds, paying taker
+# fees on both legs each time. These two knobs fix that directly:
+#   1. TRADE_COOLDOWN_SEC gates any NEW trade (entry, DCA add, or a
+#      discretionary close) for this long after the LAST trade action of
+#      any kind - tracked in MartingaleManager.last_trade_action_ts, not
+#      just PositionState.last_close_time (which only covered re-entries).
+#   2. MIN_HOLD_SEC_BEFORE_EXIT additionally requires a position to have
+#      been open at least this long before take-profit/smart-exit are
+#      allowed to fire - hard stop and max-DCA-exhausted emergency closes
+#      always bypass BOTH of these, on purpose: safety exits must never be
+#      delayed by a cooldown meant to stop over-trading.
+TRADE_COOLDOWN_SEC = int(os.environ.get("TRADE_COOLDOWN_SEC", "60"))
+MIN_HOLD_SEC_BEFORE_EXIT = int(os.environ.get("MIN_HOLD_SEC_BEFORE_EXIT", "60"))
+
+# --- Fee-aware profit threshold ----------------------------------------------
+# A take-profit (or smart-exit) that only just covers the round-trip taker
+# fee is a losing trade after costs. Require net PnL, after an estimated
+# round-trip fee, to clear a minimum before a DISCRETIONARY close fires.
+# Emergency closes (hard stop, max-DCA-exhausted) ignore this - safety
+# always takes priority over a fee-optimal exit.
+TAKER_FEE_RATE = float(os.environ.get("TAKER_FEE_RATE", "0.0005"))   # per fill, on notional; check your actual VIP tier
+MIN_NET_PROFIT_USDT = float(os.environ.get("MIN_NET_PROFIT_USDT", "0.05"))
+
+# --- Liquidation-price sanity check -------------------------------------------
+# liquidationPrice comes straight from Binance's own /fapi/v2/positionRisk -
+# this bot does not compute it. But on Cross margin, a tiny position sitting
+# on top of a much larger wallet balance can legitimately produce a
+# liquidation price that is mathematically valid yet absurdly far from the
+# mark price (or, on testnet, backed by inflated fake balances). Rather than
+# reimplement Binance's tiered maintenance-margin formula ourselves (a
+# guaranteed source of NEW bugs), we sanity-check the reported value against
+# mark price and refuse to trust/display/act on anything outside a plausible
+# band.
+LIQUIDATION_SANITY_MIN_RATIO = 0.2   # liq price below 20% of mark = implausible, discard
+LIQUIDATION_SANITY_MAX_RATIO = 5.0   # liq price above 5x mark = implausible, discard
+LIQUIDATION_WARNING_BUFFER_PCT = float(os.environ.get("LIQUIDATION_WARNING_BUFFER_PCT", "0.15"))
+
+# --- State reconciliation grace period ----------------------------------------
+# A market order can fill in milliseconds, but Binance's positionRisk
+# snapshot (polled every POSITION_RISK_POLL_SEC) can lag the fill by a beat.
+# Without a grace window, that lag race let initialize_sync() see "exchange
+# still flat" for an order that was, in fact, already filling, force-reset
+# local state to FLAT, and let on_price_tick() open a SECOND, duplicate
+# entry right on top of the first - a direct cause of rapid-fire duplicate
+# trades. Skip forced resets on a still-pending order/close until this many
+# seconds have passed since it was placed.
+SYNC_PENDING_GRACE_SEC = int(os.environ.get("SYNC_PENDING_GRACE_SEC", "8"))
 
 # --- Online Learning Brain (SGDRegressor, partial_fit only, no stored data) --
 FEATURE_SHORT_LOOKBACK = 5
@@ -667,6 +718,8 @@ class PositionState:
     total_qty: float = 0.0
     pending_order_id: Optional[int] = None
     pending_role: Optional[str] = None
+    pending_order_ts: float = 0.0    # when the current pending order/close was placed - sync grace period
+    opened_at: float = 0.0           # when the position first went OPEN - minimum-hold-time gate
     last_close_time: float = 0.0
 
 
@@ -685,6 +738,7 @@ class MartingaleManager:
         self.price_history: List[float] = []
         self.trade_count = 0
         self.realized_pnl_total = 0.0
+        self.last_trade_action_ts: float = 0.0  # last entry/DCA/close placement - drives TRADE_COOLDOWN_SEC
 
         self.brain = OnlineBrain(N_FEATURES)
         self._feature_buffer: deque[Tuple[float, np.ndarray]] = deque(
@@ -784,6 +838,29 @@ class MartingaleManager:
     def notional_for_step(self, step: int) -> float:
         margin = INITIAL_ENTRY_USDT if step == 0 else INITIAL_ENTRY_USDT * (DCA_MULTIPLIER ** step)
         return margin * self.leverage
+
+    def estimate_round_trip_fee_usdt(self, qty: float, entry_price: float, exit_price: float) -> float:
+        """Taker fee is charged on notional value on EACH fill (entry and
+        exit), independent of leverage - so at 40x this is a much bigger
+        bite out of margin than the headline rate suggests."""
+        entry_notional = qty * entry_price
+        exit_notional = qty * exit_price
+        return TAKER_FEE_RATE * (entry_notional + exit_notional)
+
+    def estimate_net_pnl_usdt(self, exit_price: float) -> float:
+        """Gross PnL at `exit_price` on the current position, minus the
+        estimated round-trip taker fee. Used to gate discretionary
+        (non-emergency) closes so the bot doesn't lock in a "profit" that
+        fees would immediately eat."""
+        p = self.position
+        if not p.avg_entry_price or p.total_qty <= 0:
+            return 0.0
+        if p.side == "LONG":
+            gross = (exit_price - p.avg_entry_price) * p.total_qty
+        else:
+            gross = (p.avg_entry_price - exit_price) * p.total_qty
+        fees = self.estimate_round_trip_fee_usdt(p.total_qty, p.avg_entry_price, exit_price)
+        return gross - fees
 
     def update_price_history(self, price: float) -> None:
         self.price_history.append(price)
@@ -964,8 +1041,10 @@ class MartingaleManager:
             self._order_index[fake_id] = role
             self.position.pending_order_id = fake_id
             self.position.pending_role = role
+            self.position.pending_order_ts = time.time()
             self.position.side = side_signal
             self.position.status = "ENTERING" if step == 0 else "DCA_PENDING"
+            self.last_trade_action_ts = time.time()
             return
 
         try:
@@ -975,8 +1054,10 @@ class MartingaleManager:
             self._order_index[resp["orderId"]] = role
             self.position.pending_order_id = resp["orderId"]
             self.position.pending_role = role
+            self.position.pending_order_ts = time.time()
             self.position.side = side_signal
             self.position.status = "ENTERING" if step == 0 else "DCA_PENDING"
+            self.last_trade_action_ts = time.time()
             print(color(
                 f"{now_str()} {step_label} PLACED  {order_side} {qty} {self.symbol} "
                 f"@ market (notional=${notional:.2f}, orderId={resp['orderId']})",
@@ -996,6 +1077,8 @@ class MartingaleManager:
             RED if emergency else GREEN,
         ))
         self.position.status = "CLOSING"
+        self.position.pending_order_ts = time.time()
+        self.last_trade_action_ts = time.time()
 
         if DRY_RUN:
             fake_id = -(int(time.time() * 1000) % 1_000_000) - 900000
@@ -1034,7 +1117,7 @@ class MartingaleManager:
             self.brain.predict(features)
 
         if self.position.status == "FLAT":
-            if time.time() - self.position.last_close_time < POST_EXIT_COOLDOWN_SEC:
+            if time.time() - self.last_trade_action_ts < TRADE_COOLDOWN_SEC:
                 return
             signal = self.generate_entry_signal(features)
             if signal is not None:
@@ -1051,27 +1134,50 @@ class MartingaleManager:
 
         pct_move = (price - avg) / avg if self.position.side == "LONG" else (avg - price) / avg
 
+        # Hard stop is a safety exit - it always fires immediately,
+        # regardless of cooldowns, hold-time, or profit thresholds.
         if pct_move <= -HARD_STOP_PCT:
             await self.close_position(
                 f"hard stop: {pct_move*100:.2f}% adverse move on average entry", emergency=True
             )
             return
 
+        # Over-trading guardrail: take-profit and smart-exit are
+        # DISCRETIONARY closes, so both are held back until the position
+        # has been open at least MIN_HOLD_SEC_BEFORE_EXIT. This is what
+        # stops a noisy tick from flipping the position open->closed within
+        # a couple of seconds. Hard stop above, and the max-DCA-exhausted
+        # emergency exit below, are safety exits and deliberately bypass
+        # this - a reversal that's actually blowing through the stop must
+        # never be delayed by a cooldown meant to curb over-trading.
+        held_long_enough = (time.time() - self.position.opened_at) >= MIN_HOLD_SEC_BEFORE_EXIT
+
         dynamic_tp_pct = self.get_dynamic_take_profit_pct()
-        if pct_move >= dynamic_tp_pct:
-            await self.close_position(
-                f"take-profit: {pct_move*100:.2f}% favorable move "
-                f"(dynamic TP={dynamic_tp_pct*100:.3f}%, base={TAKE_PROFIT_PCT*100:.2f}%)"
-            )
-            return
+        if pct_move >= dynamic_tp_pct and held_long_enough:
+            # Fee-aware profit threshold: only take profit if the estimated
+            # NET pnl (after the round-trip taker fee) clears a minimum -
+            # otherwise a "profitable" 0.3% move that fees eat entirely was
+            # exactly what was causing losses on rapid churn.
+            net_pnl = self.estimate_net_pnl_usdt(price)
+            if net_pnl >= MIN_NET_PROFIT_USDT:
+                await self.close_position(
+                    f"take-profit: {pct_move*100:.2f}% favorable move "
+                    f"(dynamic TP={dynamic_tp_pct*100:.3f}%, base={TAKE_PROFIT_PCT*100:.2f}%, "
+                    f"est. net pnl=${net_pnl:+.4f} after fees)"
+                )
+                return
+            # Move clears the raw TP% but not the fee-aware floor yet - hold
+            # and let it run rather than closing into a fee-losing "profit".
 
         # --- Smart Exit / Damage Control ------------------------------------
         # If the brain's live prediction has flipped hard against the
         # position's own side before HARD_STOP_PCT is ever reached, get out
         # now at breakeven/minimal loss rather than riding it down to the
         # hard stop (or, in a fast-moving 40x market, toward liquidation).
+        # Still gated by held_long_enough - a reversal prediction seconds
+        # after entry is far more likely noise than a real regime change.
         last_pred = self.brain.last_prediction
-        if SMART_EXIT_ENABLED and self.brain.is_ready() and last_pred is not None:
+        if SMART_EXIT_ENABLED and held_long_enough and self.brain.is_ready() and last_pred is not None:
             reversal_against_position = (
                 (self.position.side == "LONG" and last_pred <= -SMART_EXIT_REVERSAL_THRESHOLD)
                 or (self.position.side == "SHORT" and last_pred >= SMART_EXIT_REVERSAL_THRESHOLD)
@@ -1125,6 +1231,8 @@ class MartingaleManager:
         self.position.total_qty = total_qty
         if role == "dca":
             self.position.dca_step += 1
+        else:
+            self.position.opened_at = time.time()  # first fill only - marks the start of the hold-time clock
         self.position.status = "OPEN"
         self.position.pending_order_id = None
         self.position.pending_role = None
@@ -1229,6 +1337,25 @@ async def initialize_sync(
         # manual) or the entry never actually filled while we were
         # disconnected - either way, waiting on a fill event that already
         # happened (or never will) is exactly how the bot gets stuck.
+        #
+        # BUT: a market order can fill in milliseconds while Binance's own
+        # positionRisk snapshot can lag that fill by a beat. Without this
+        # grace window, a poll landing in that gap would see "exchange
+        # still flat" for an order that is, in fact, already filling, force
+        # local state back to FLAT, and let on_price_tick() immediately
+        # open a SECOND entry on top of the first the very next tick - a
+        # direct cause of rapid-fire duplicate trades. So a freshly-placed
+        # pending order/close gets SYNC_PENDING_GRACE_SEC to actually show
+        # up before we trust "flat" enough to reset.
+        if p.status in ("ENTERING", "DCA_PENDING", "CLOSING"):
+            age = time.time() - p.pending_order_ts
+            if age < SYNC_PENDING_GRACE_SEC:
+                print(color(
+                    f"{now_str()} [sync:{context}] exchange shows flat but a {p.status} order "
+                    f"was placed only {age:.1f}s ago (< {SYNC_PENDING_GRACE_SEC}s grace) - waiting "
+                    f"for the fill event instead of resetting early.", GRAY,
+                ))
+                return
         if p.status != "FLAT":
             print(color(
                 f"{now_str()} [sync:{context}] exchange reports NO open position, but local "
@@ -1438,7 +1565,19 @@ async def position_risk_poller(client: RestClient, manager: MartingaleManager) -
     cycle, calls initialize_sync() with the same fetched rows - this is
     what guarantees the bot self-heals from a stuck ENTERING/DCA_PENDING
     state within ~POSITION_RISK_POLL_SEC seconds, even independent of any
-    websocket reconnect event."""
+    websocket reconnect event.
+
+    Liquidation-price note: `liquidationPrice` is Binance's own computed
+    field from /fapi/v2/positionRisk - this bot never calculates it itself.
+    On Cross margin, a small position sitting on a much larger wallet
+    balance (very common on testnet, which grants large fake balances) can
+    legitimately produce a liquidation price that is mathematically valid
+    but absurdly far from the mark price (e.g. millions of dollars away on
+    BTCUSDT). Rather than re-deriving Binance's tiered maintenance-margin
+    formula ourselves - a near-guaranteed source of new bugs - every value
+    is sanity-checked against mark price before being trusted, displayed,
+    or acted on. An implausible reading is now treated as "unavailable"
+    (None) instead of being surfaced as if it were real."""
     while True:
         if DRY_RUN:
             await asyncio.sleep(POSITION_RISK_POLL_SEC)
@@ -1447,12 +1586,50 @@ async def position_risk_poller(client: RestClient, manager: MartingaleManager) -
             rows = await client.get_position_risk(SYMBOL)
             row = next((r for r in rows if float(r.get("positionAmt", 0)) != 0), None)
             if row:
-                manager.liquidation_price = float(row.get("liquidationPrice", 0) or 0)
-                print(color(
-                    f"{now_str()} [risk] LIQUIDATION PRICE: {manager.liquidation_price:.2f}  "
-                    f"(mark={float(row.get('markPrice', 0)):.2f}, "
-                    f"positionAmt={row.get('positionAmt')})", MAGENTA
-                ))
+                mark_price = float(row.get("markPrice", 0) or 0)
+                raw_liq = float(row.get("liquidationPrice", 0) or 0)
+
+                plausible = (
+                    mark_price > 0
+                    and raw_liq > 0
+                    and LIQUIDATION_SANITY_MIN_RATIO <= (raw_liq / mark_price) <= LIQUIDATION_SANITY_MAX_RATIO
+                )
+
+                if plausible:
+                    manager.liquidation_price = raw_liq
+                    print(color(
+                        f"{now_str()} [risk] LIQUIDATION PRICE: {manager.liquidation_price:.2f}  "
+                        f"(mark={mark_price:.2f}, positionAmt={row.get('positionAmt')})", MAGENTA
+                    ))
+
+                    # Genuine early-warning safety exit - but ONLY on a
+                    # value that passed the plausibility check above, so a
+                    # bogus multi-million reading can never trigger this.
+                    side = "LONG" if float(row["positionAmt"]) > 0 else "SHORT"
+                    distance_pct = (
+                        abs(mark_price - manager.liquidation_price) / mark_price if mark_price else 1.0
+                    )
+                    if distance_pct <= LIQUIDATION_WARNING_BUFFER_PCT and manager.position.status == "OPEN":
+                        print(color(
+                            f"{now_str()} [risk] mark price is within "
+                            f"{distance_pct*100:.2f}% of liquidation ({manager.liquidation_price:.2f}) - "
+                            f"triggering emergency close before the exchange forces it.", RED,
+                        ))
+                        await manager.close_position(
+                            f"liquidation buffer breached: mark {mark_price:.2f} within "
+                            f"{distance_pct*100:.2f}% of liq {manager.liquidation_price:.2f}",
+                            emergency=True,
+                        )
+                else:
+                    manager.liquidation_price = None
+                    if raw_liq > 0 and mark_price > 0:
+                        print(color(
+                            f"{now_str()} [risk] ignoring implausible liquidationPrice="
+                            f"{raw_liq:.2f} vs mark={mark_price:.2f} (outside "
+                            f"{LIQUIDATION_SANITY_MIN_RATIO}x-{LIQUIDATION_SANITY_MAX_RATIO}x band) - "
+                            f"likely a Cross-margin/testnet over-collateralization artifact, not a real risk reading.",
+                            YELLOW,
+                        ))
             else:
                 manager.liquidation_price = None
             await initialize_sync(client, manager, context="periodic poll", rows=rows)
