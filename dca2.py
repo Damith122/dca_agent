@@ -51,10 +51,12 @@ REQUIRED SETUP
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
 import os
+import pickle
 import sys
 import time
 import traceback
@@ -124,7 +126,34 @@ FEATURE_SHORT_LOOKBACK = 5
 LABEL_HORIZON_TICKS = 10
 BRAIN_WARMUP_UPDATES = 50
 PREDICTION_DEADBAND = 0.00015
-N_FEATURES = 6
+# Features: momentum_short, momentum_long, volatility, side_encoded,
+# unrealized_pnl, dca_ratio, price_velocity, order_book_imbalance,
+# recent_win_rate - see MartingaleManager.get_features().
+N_FEATURES = 9
+RECENT_TRADE_WINDOW = 20   # trailing window used for the "historical success pattern" feature
+
+# --- Persistent Adaptive Learning (Cloud-Sync Brain) -------------------------
+# Railway's filesystem is ephemeral - anything not pushed off-box is lost on
+# every redeploy/restart. brain.pkl is the on-disk snapshot of the online
+# model (weights + running feature-normalizer stats); it is written locally
+# after every trade / at a fixed interval, then best-effort pushed to a
+# GitHub repo so a fresh container can pull it back down instead of starting
+# from a cold, unwarmed model every time it restarts.
+BRAIN_LOCAL_PATH = os.environ.get("BRAIN_LOCAL_PATH", "brain.pkl")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")           # fine-grained PAT, "Contents: read/write"
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "")             # "your-username/your-repo"
+GITHUB_BRAIN_PATH = os.environ.get("GITHUB_BRAIN_PATH", "brain.pkl")  # path *inside* that repo
+GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
+BRAIN_AUTO_PUSH_INTERVAL_SEC = int(os.environ.get("BRAIN_AUTO_PUSH_INTERVAL_SEC", "300"))
+
+# --- Smart Exit / Damage Control (brain-driven early exit) -------------------
+# If the brain's own live prediction flips hard against an open position
+# before HARD_STOP_PCT is ever reached, this exits immediately at breakeven
+# / minimal loss instead of riding the position down to the stop or, worse,
+# toward liquidation.
+SMART_EXIT_ENABLED = os.environ.get("SMART_EXIT_ENABLED", "true").lower() != "false"
+SMART_EXIT_REVERSAL_THRESHOLD = 0.00025   # last_pred beyond this, against the position, = reversal
+SMART_EXIT_MAX_LOSS_PCT = 0.01            # only fires while still in "minor loss" territory
 
 # --- Timing -------------------------------------------------------------------
 LISTEN_KEY_KEEPALIVE_SEC = 25 * 60
@@ -463,6 +492,165 @@ class OnlineBrain:
     def is_ready(self) -> bool:
         return self.fitted and self.update_count >= self.warmup_updates
 
+    # -- persistence ("brain.pkl") --------------------------------------------
+    # Only plain, picklable state is captured here - the sklearn model plus
+    # the running mean/variance normalizer stats. This is what lets the bot
+    # resume warmed-up instead of cold after a Railway restart.
+    def to_state(self) -> dict:
+        return {
+            "n_features": self.n_features,
+            "warmup_updates": self.warmup_updates,
+            "model": self.model,
+            "fitted": self.fitted,
+            "update_count": self.update_count,
+            "last_prediction": self.last_prediction,
+            "_n_seen": self._n_seen,
+            "_mean": self._mean,
+            "_m2": self._m2,
+        }
+
+    def load_state(self, state: dict) -> None:
+        self.model = state["model"]
+        self.fitted = state["fitted"]
+        self.update_count = state["update_count"]
+        self.last_prediction = state.get("last_prediction")
+        self._n_seen = state["_n_seen"]
+        self._mean = state["_mean"]
+        self._m2 = state["_m2"]
+
+    def to_bytes(self) -> bytes:
+        return pickle.dumps(self.to_state(), protocol=pickle.HIGHEST_PROTOCOL)
+
+    @classmethod
+    def from_bytes(cls, data: bytes, n_features: int, warmup_updates: int) -> "OnlineBrain":
+        """Builds a brain from a serialized snapshot. Falls back to a fresh
+        (cold) brain on any corruption or feature-shape mismatch - a bad or
+        stale brain.pkl must never prevent the bot from starting."""
+        brain = cls(n_features, warmup_updates)
+        try:
+            state = pickle.loads(data)
+            if state.get("n_features") != n_features:
+                print(color(
+                    f"[brain] snapshot has n_features={state.get('n_features')}, code expects "
+                    f"{n_features} - discarding snapshot and starting a fresh brain.", YELLOW,
+                ))
+                return brain
+            brain.load_state(state)
+        except Exception as e:  # noqa: BLE001 - corrupted/incompatible snapshot must not crash startup
+            print(color(f"[brain] failed to deserialize snapshot ({e}), starting fresh.", YELLOW))
+            return cls(n_features, warmup_updates)
+        return brain
+
+
+# ============================================================================
+# CLOUD-SYNC BRAIN (push/pull brain.pkl to GitHub across ephemeral restarts)
+# ============================================================================
+
+
+class GithubBrainSync:
+    """Best-effort sync of brain.pkl to a GitHub repo via the Contents API.
+
+    Deliberately fails soft everywhere: any network/auth/API error is caught,
+    logged, and swallowed - trading must never stop because GitHub is
+    unreachable or misconfigured. If GITHUB_TOKEN/GITHUB_REPO aren't set,
+    `enabled` is False and every method becomes a no-op, so the bot still
+    runs fine on brain.pkl local-disk state alone (just without cross-
+    restart persistence on a fully ephemeral host).
+    """
+
+    def __init__(self, token: str, repo: str, path: str, branch: str):
+        self.token = token
+        self.repo = repo
+        self.path = path
+        self.branch = branch
+        self.enabled = bool(token and repo)
+        self.session: Optional[aiohttp.ClientSession] = None
+        self._last_sha: Optional[str] = None
+
+    async def start(self) -> None:
+        if not self.enabled:
+            print(color(
+                "[brain-sync] GITHUB_TOKEN / GITHUB_REPO not set - brain.pkl will persist "
+                "locally only (lost on next ephemeral restart). Set both env vars to enable "
+                "cross-restart cloud sync.", YELLOW,
+            ))
+            return
+        self.session = aiohttp.ClientSession(headers={
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        })
+
+    async def close(self) -> None:
+        if self.session:
+            await self.session.close()
+
+    def _url(self) -> str:
+        return f"https://api.github.com/repos/{self.repo}/contents/{self.path}"
+
+    async def download(self) -> Optional[bytes]:
+        """Fetches the current brain.pkl bytes from GitHub, or None if it
+        doesn't exist yet / sync is disabled / the call fails."""
+        if not self.enabled or self.session is None:
+            return None
+        try:
+            async with self.session.get(
+                self._url(), params={"ref": self.branch},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status == 404:
+                    return None
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise RuntimeError(f"HTTP {resp.status}: {text[:200]}")
+                data = await resp.json()
+                self._last_sha = data.get("sha")
+                content_b64 = data.get("content", "")
+                if not content_b64:
+                    return None
+                return base64.b64decode(content_b64)
+        except Exception as e:  # noqa: BLE001 - sync must never take the bot down
+            print(color(f"[brain-sync] GitHub download failed (continuing without it): {e}", YELLOW))
+            return None
+
+    async def upload(self, data: bytes, message: str) -> bool:
+        """Pushes brain.pkl bytes to GitHub, creating or updating the file as
+        needed. Returns False (never raises) on any failure so callers can
+        log-and-continue trading regardless of sync health."""
+        if not self.enabled or self.session is None:
+            return False
+        try:
+            sha = self._last_sha
+            if sha is None:
+                async with self.session.get(
+                    self._url(), params={"ref": self.branch},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status == 200:
+                        existing = await resp.json()
+                        sha = existing.get("sha")
+
+            payload = {
+                "message": message,
+                "content": base64.b64encode(data).decode("ascii"),
+                "branch": self.branch,
+            }
+            if sha:
+                payload["sha"] = sha
+
+            async with self.session.put(
+                self._url(), json=payload, timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                if resp.status not in (200, 201):
+                    text = await resp.text()
+                    raise RuntimeError(f"HTTP {resp.status}: {text[:200]}")
+                result = await resp.json()
+                self._last_sha = (result.get("content") or {}).get("sha")
+                return True
+        except Exception as e:  # noqa: BLE001 - sync must never take the bot down
+            print(color(f"[brain-sync] GitHub push failed (bot keeps trading): {e}", YELLOW))
+            return False
+
 
 # ============================================================================
 # POSITION STATE + MARTINGALE DCA MANAGER (the core strategy state machine)
@@ -504,8 +692,94 @@ class MartingaleManager:
         )
         self._entry_feature_snapshot: Optional[np.ndarray] = None
 
+        # --- real-time feature ingestion inputs ---------------------------
+        self.best_bid_qty: float = 0.0
+        self.best_ask_qty: float = 0.0
+        self.recent_trade_outcomes: deque[float] = deque(maxlen=RECENT_TRADE_WINDOW)
+
+        # --- Cloud-Sync Brain --------------------------------------------
+        self.github_sync = GithubBrainSync(
+            GITHUB_TOKEN, GITHUB_REPO, GITHUB_BRAIN_PATH, GITHUB_BRANCH
+        )
+        self._brain_dirty = False
+        self.last_brain_sync_ts: Optional[float] = None
+
         self._order_index: Dict[int, str] = {}
         self._rp_accum: Dict[int, float] = {}
+
+    # -- Persistent Adaptive Learning: startup load / ongoing persistence ----
+
+    async def load_or_init_brain(self) -> None:
+        """Startup logic: local brain.pkl wins if present (fastest, and
+        reflects this exact container's own most recent state); otherwise
+        pull the latest snapshot down from GitHub; otherwise fall back to
+        the fresh OnlineBrain already created in __init__. Any failure at
+        any stage just falls through to the next option / a cold brain -
+        this must never prevent the bot from starting."""
+        if os.path.exists(BRAIN_LOCAL_PATH):
+            try:
+                with open(BRAIN_LOCAL_PATH, "rb") as f:
+                    data = f.read()
+                self.brain = OnlineBrain.from_bytes(data, N_FEATURES, BRAIN_WARMUP_UPDATES)
+                print(color(
+                    f"[brain] loaded local {BRAIN_LOCAL_PATH} "
+                    f"(updates={self.brain.update_count}, ready={self.brain.is_ready()})", MAGENTA,
+                ))
+                return
+            except Exception as e:  # noqa: BLE001 - corrupt local file must not block startup
+                print(color(f"[brain] local {BRAIN_LOCAL_PATH} unreadable ({e}), trying GitHub ...", YELLOW))
+
+        await self.github_sync.start()
+        remote = await self.github_sync.download()
+        if remote:
+            try:
+                with open(BRAIN_LOCAL_PATH, "wb") as f:
+                    f.write(remote)
+            except Exception as e:  # noqa: BLE001 - disk write failure shouldn't block using the brain
+                print(color(f"[brain] could not cache downloaded brain to disk: {e}", YELLOW))
+            self.brain = OnlineBrain.from_bytes(remote, N_FEATURES, BRAIN_WARMUP_UPDATES)
+            print(color(
+                f"[brain] restored from GitHub ({GITHUB_REPO}/{GITHUB_BRAIN_PATH}) "
+                f"(updates={self.brain.update_count}, ready={self.brain.is_ready()})", MAGENTA,
+            ))
+            return
+
+        print(color(
+            "[brain] no local or remote snapshot found - starting a fresh (cold) model.", GRAY
+        ))
+
+    async def persist_brain(self, reason: str) -> None:
+        """Writes brain.pkl to local disk, then best-effort pushes it to
+        GitHub. Called after every closed trade and on a fixed interval.
+        Every failure mode here is caught and logged - a broken sync must
+        never stop the bot from trading."""
+        try:
+            data = self.brain.to_bytes()
+        except Exception as e:  # noqa: BLE001 - serialization must never crash the trading loop
+            print(color(f"[brain] failed to serialize brain state ({e}), skipping persist.", RED))
+            return
+
+        try:
+            tmp_path = f"{BRAIN_LOCAL_PATH}.tmp"
+            with open(tmp_path, "wb") as f:
+                f.write(data)
+            os.replace(tmp_path, BRAIN_LOCAL_PATH)  # atomic on POSIX - never a half-written file
+        except Exception as e:  # noqa: BLE001
+            print(color(f"[brain] failed to write {BRAIN_LOCAL_PATH} locally: {e}", RED))
+
+        try:
+            pushed = await self.github_sync.upload(
+                data, message=f"brain sync: {reason} (updates={self.brain.update_count})"
+            )
+            if pushed:
+                self.last_brain_sync_ts = time.time()
+                print(color(
+                    f"{now_str()} [brain-sync] pushed brain.pkl to GitHub ({reason}, "
+                    f"updates={self.brain.update_count})", MAGENTA,
+                ))
+        except Exception as e:  # noqa: BLE001 - belt-and-suspenders; upload() already catches internally
+            print(color(f"[brain-sync] unexpected error during push (bot keeps trading): {e}", RED))
+        self._brain_dirty = False
 
     def notional_for_step(self, step: int) -> float:
         margin = INITIAL_ENTRY_USDT if step == 0 else INITIAL_ENTRY_USDT * (DCA_MULTIPLIER ** step)
@@ -553,8 +827,32 @@ class MartingaleManager:
             )
             dca_ratio = p.dca_step / MAX_DCA_STEPS
 
+        # --- Price Velocity: instantaneous tick-to-tick rate of change, as
+        # distinct from the multi-tick momentum_short/momentum_long above.
+        price_velocity = 0.0
+        if len(hist) >= 2 and hist[-2]:
+            price_velocity = (hist[-1] - hist[-2]) / hist[-2]
+
+        # --- Order Book Imbalance: skew between resting bid/ask size at the
+        # top of book, from the same bookTicker feed already driving price.
+        # +1 => all resting size is on the bid (buy pressure), -1 => all on
+        # the ask (sell pressure), 0 => balanced / no data yet.
+        bid_qty, ask_qty = self.best_bid_qty, self.best_ask_qty
+        book_total = bid_qty + ask_qty
+        order_book_imbalance = (bid_qty - ask_qty) / book_total if book_total > 0 else 0.0
+
+        # --- Historical success pattern: rolling win-rate over the last
+        # RECENT_TRADE_WINDOW closed trades. 0.5 (neutral prior) until the
+        # bot has actually closed any trades.
+        recent_win_rate = (
+            float(np.mean(self.recent_trade_outcomes)) if self.recent_trade_outcomes else 0.5
+        )
+
         return np.array(
-            [momentum_short, momentum_long, volatility, side_encoded, unrealized_pnl, dca_ratio],
+            [
+                momentum_short, momentum_long, volatility, side_encoded, unrealized_pnl,
+                dca_ratio, price_velocity, order_book_imbalance, recent_win_rate,
+            ],
             dtype=float,
         )
 
@@ -635,6 +933,7 @@ class MartingaleManager:
             if old_price:
                 realized_forward_return = (price - old_price) / old_price
                 self.brain.learn(old_features, realized_forward_return)
+                self._brain_dirty = True
         self._feature_buffer.append((price, features.copy()))
 
     async def _place_step_order(self, step: int, side_signal: str) -> None:
@@ -728,6 +1027,12 @@ class MartingaleManager:
         features = self.get_features()
         self._learn_from_tick(features)
 
+        # Refresh last_prediction on every tick (not just while FLAT via
+        # generate_entry_signal) so Smart Exit sees a live reversal signal
+        # while a trade is OPEN, not a stale prediction from before entry.
+        if self.brain.is_ready():
+            self.brain.predict(features)
+
         if self.position.status == "FLAT":
             if time.time() - self.position.last_close_time < POST_EXIT_COOLDOWN_SEC:
                 return
@@ -759,6 +1064,25 @@ class MartingaleManager:
                 f"(dynamic TP={dynamic_tp_pct*100:.3f}%, base={TAKE_PROFIT_PCT*100:.2f}%)"
             )
             return
+
+        # --- Smart Exit / Damage Control ------------------------------------
+        # If the brain's live prediction has flipped hard against the
+        # position's own side before HARD_STOP_PCT is ever reached, get out
+        # now at breakeven/minimal loss rather than riding it down to the
+        # hard stop (or, in a fast-moving 40x market, toward liquidation).
+        last_pred = self.brain.last_prediction
+        if SMART_EXIT_ENABLED and self.brain.is_ready() and last_pred is not None:
+            reversal_against_position = (
+                (self.position.side == "LONG" and last_pred <= -SMART_EXIT_REVERSAL_THRESHOLD)
+                or (self.position.side == "SHORT" and last_pred >= SMART_EXIT_REVERSAL_THRESHOLD)
+            )
+            if reversal_against_position and pct_move > -SMART_EXIT_MAX_LOSS_PCT:
+                await self.close_position(
+                    f"SMART EXIT: brain predicts reversal against {self.position.side} "
+                    f"(last_pred={last_pred:+.5f}) at {pct_move*100:.2f}% - exiting at "
+                    f"breakeven/minimal loss instead of risking further adverse move"
+                )
+                return
 
         if pct_move <= -DCA_TRIGGER_PCT:
             if self.position.dca_step >= MAX_DCA_STEPS:
@@ -825,11 +1149,14 @@ class MartingaleManager:
             pnl_color,
         ))
 
+        self.recent_trade_outcomes.append(1.0 if total_rp >= 0 else 0.0)
+
         if self._entry_feature_snapshot is not None:
             invested_notional = sum(p * q for p, q in self.position.entries) or None
             if invested_notional:
                 realized_trade_return = total_rp / invested_notional
                 self.brain.learn(self._entry_feature_snapshot, realized_trade_return)
+                self._brain_dirty = True
                 print(color(
                     f"{now_str()} [brain] reinforced entry decision with realized "
                     f"trade outcome (label={realized_trade_return:+.5f}, "
@@ -838,6 +1165,12 @@ class MartingaleManager:
             self._entry_feature_snapshot = None
 
         self.position = PositionState(last_close_time=time.time())
+
+        # Auto-Persistence: push the updated brain after every trade. Fired
+        # as a background task so a slow/failed GitHub call never delays the
+        # next tick's trading decisions; persist_brain() itself catches and
+        # logs every failure mode internally.
+        asyncio.create_task(self.persist_brain(reason="trade closed"))
 
 
 # ============================================================================
@@ -982,6 +1315,8 @@ async def market_data_consumer(manager: MartingaleManager) -> None:
                             data = msg.get("data", {})
                             bid = float(data.get("b", 0) or 0)
                             ask = float(data.get("a", 0) or 0)
+                            manager.best_bid_qty = float(data.get("B", 0) or 0)
+                            manager.best_ask_qty = float(data.get("A", 0) or 0)
                             if bid and ask:
                                 price = (bid + ask) / 2
                                 manager.current_price = price
@@ -1126,6 +1461,18 @@ async def position_risk_poller(client: RestClient, manager: MartingaleManager) -
         await asyncio.sleep(POSITION_RISK_POLL_SEC)
 
 
+async def brain_sync_loop(manager: MartingaleManager, interval_sec: int = BRAIN_AUTO_PUSH_INTERVAL_SEC) -> None:
+    """Auto-Persistence on a fixed cadence, independent of trade activity -
+    the per-trade push in _on_close_filled covers the "after each trade"
+    requirement, this covers "at reasonable intervals" for a quiet market
+    where the brain is still learning from ticks but no trade has closed
+    in a while."""
+    while True:
+        await asyncio.sleep(interval_sec)
+        if manager._brain_dirty:
+            await manager.persist_brain(reason="periodic interval")
+
+
 async def status_loop(manager: MartingaleManager, interval_sec: int = 20) -> None:
     while True:
         await asyncio.sleep(interval_sec)
@@ -1138,13 +1485,18 @@ async def status_loop(manager: MartingaleManager, interval_sec: int = 20) -> Non
             f"{manager.brain.last_prediction:+.5f}"
             if manager.brain.last_prediction is not None else "n/a"
         )
+        sync_state = (
+            f"{time.time() - manager.last_brain_sync_ts:.0f}s ago"
+            if manager.last_brain_sync_ts else "never"
+        )
         print(color(
             f"{now_str()} [status] price={manager.current_price}  status={p.status}  "
             f"side={p.side}  dca_step={p.dca_step}/{MAX_DCA_STEPS}  "
             f"avg_entry={p.avg_entry_price}  qty={p.total_qty}  "
             f"liq_price={liq}  balance={manager.available_balance:.2f} USDT  "
             f"trades={manager.trade_count}  session_pnl={manager.realized_pnl_total:+.4f}  "
-            f"brain=[{brain_state}, last_pred={last_pred}]",
+            f"brain=[{brain_state}, last_pred={last_pred}]  "
+            f"github_sync=[{'on' if manager.github_sync.enabled else 'off'}, last_push={sync_state}]",
             BOLD,
         ))
 
@@ -1177,6 +1529,7 @@ async def main() -> None:
     print(color("=" * 78, CYAN))
 
     client = RestClient(API_KEY, API_SECRET, REST_BASE)
+    manager: Optional[MartingaleManager] = None
 
     try:
         await retry_with_backoff(client.start, label="REST client startup / time sync")
@@ -1188,6 +1541,20 @@ async def main() -> None:
             f"[setup] {SYMBOL} filters: tick={filters.tick_size} step={filters.step_size} "
             f"minQty={filters.min_qty} minNotional={filters.min_notional}", GRAY
         ))
+
+        # Cross 40x / DCA sizing sanity check: confirm every one of the 5
+        # martingale steps clears the exchange's minimum notional up front,
+        # rather than discovering a too-small step mid-trade.
+        for step in range(MAX_DCA_STEPS + 1):
+            margin = INITIAL_ENTRY_USDT if step == 0 else INITIAL_ENTRY_USDT * (DCA_MULTIPLIER ** step)
+            step_notional = margin * LEVERAGE
+            ok = step_notional >= filters.min_notional
+            label = "INITIAL" if step == 0 else f"DCA #{step}"
+            print(color(
+                f"[setup]   {label}: margin=${margin:.2f} notional=${step_notional:.2f} "
+                f"{'OK' if ok else 'BELOW MIN_NOTIONAL - will be skipped at runtime!'}",
+                GRAY if ok else RED,
+            ))
 
         if not DRY_RUN:
             await retry_with_backoff(client.set_leverage, SYMBOL, LEVERAGE, label="set_leverage")
@@ -1210,7 +1577,12 @@ async def main() -> None:
 
         book = await retry_with_backoff(client.get_book_ticker, SYMBOL, label="get_book_ticker")
         manager.current_price = (float(book["bidPrice"]) + float(book["askPrice"])) / 2
+        manager.best_bid_qty = float(book.get("bidQty", 0) or 0)
+        manager.best_ask_qty = float(book.get("askQty", 0) or 0)
         print(color(f"[setup] current price: {manager.current_price:.2f}", GRAY))
+
+        # Persistent Adaptive Learning: local brain.pkl -> GitHub -> fresh model.
+        await manager.load_or_init_brain()
 
         await initialize_sync(client, manager, context="startup")
 
@@ -1221,8 +1593,18 @@ async def main() -> None:
             balance_refresher(client, manager),
             position_risk_poller(client, manager),
             status_loop(manager),
+            brain_sync_loop(manager),
         )
     finally:
+        if manager is not None:
+            try:
+                await manager.persist_brain(reason="shutdown")
+            except Exception as e:  # noqa: BLE001 - shutdown persistence is best-effort only
+                print(color(f"[brain] final persist on shutdown failed: {e}", YELLOW))
+            try:
+                await manager.github_sync.close()
+            except Exception:  # noqa: BLE001 - never block shutdown on sync cleanup
+                pass
         await client.close()
 
 
