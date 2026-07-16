@@ -1946,10 +1946,21 @@ class MartingaleManager:
 
     def notional_for_step(self, step: int, size_mult: float = 1.0) -> float:
         margin = INITIAL_ENTRY_USDT if step == 0 else INITIAL_ENTRY_USDT * (DCA_MULTIPLIER ** step)
-        # Dynamic sizing only applies to the INITIAL entry - DCA step sizing
-        # stays purely martingale-deterministic (2x per step) so the
-        # existing, already-safety-checked-at-startup DCA math is untouched.
-        if step == 0:
+        # The initial entry (step 0) ALWAYS uses INITIAL_ENTRY_USDT exactly
+        # as configured - never scaled by confidence/risk/regime. This is a
+        # deliberate guarantee: notional_for_step(0, ...) * leverage must
+        # always equal INITIAL_ENTRY_USDT * LEVERAGE (e.g. $1.5 * 40 = $60),
+        # regardless of what size_mult a caller passes in. Callers on the
+        # entry path enforce this by always passing size_mult=1.0 for step 0
+        # (see on_price_tick); this check is a second, structural guarantee
+        # against that ever regressing.
+        #
+        # Confidence/risk/regime-based dynamic sizing only ever applies to
+        # DCA additions placed AFTER the position is already open (step > 0)
+        # - the martingale 2x-per-step base is still purely deterministic,
+        # just scaled up/down within [SIZE_MIN_MULT, SIZE_MAX_MULT] by how
+        # the Brain currently reads the trade it's already in.
+        if step > 0:
             margin *= size_mult
         return margin * self.leverage
 
@@ -2137,7 +2148,12 @@ class MartingaleManager:
             decision = self.entry_engine.evaluate(self.last_confidence, self.last_regime, volume_z, momentum, features)
             self.last_entry_decision = decision
             if decision.should_enter and decision.side is not None:
-                size_mult = self.confidence_size_multiplier(self.last_confidence, self.last_regime)
+                # Initial entry ALWAYS uses the configured INITIAL_ENTRY_USDT
+                # unscaled - confidence/regime/risk-based sizing only ever
+                # applies to DCA additions placed after the position is
+                # already open (see _manage_open_position). This guarantees
+                # notional_for_step(0, ...) == INITIAL_ENTRY_USDT * LEVERAGE
+                # regardless of how confident the Brain is at entry time.
                 self.position.entry_features = features.copy()
                 self.position.entry_regime = self.last_regime.regime
                 self.position.entry_confidence = self.last_confidence.confidence_score
@@ -2145,7 +2161,7 @@ class MartingaleManager:
                 self.position.entry_success_prob = self.last_confidence.success_probability
                 self.position.entry_tp_hit_prob = self.last_confidence.tp_hit_probability
                 self.position.entry_dynamic_tp_pct = self.get_dynamic_take_profit_pct()
-                await self._place_step_order(step=0, side_signal=decision.side, size_mult=size_mult)
+                await self._place_step_order(step=0, side_signal=decision.side, size_mult=1.0)
         elif self.position.status == "OPEN":
             await self._manage_open_position()
 
@@ -3044,16 +3060,20 @@ async def main() -> None:
         ))
 
         # Cross 40x / DCA sizing sanity check: confirm every one of the 5
-        # martingale steps clears the exchange's minimum notional up front,
-        # using the LARGEST possible size multiplier so a confidence-scaled
-        # initial entry can never silently fall below min_notional either.
+        # martingale steps clears the exchange's minimum notional up front.
+        # Step 0 (the initial entry) is ALWAYS exactly INITIAL_ENTRY_USDT -
+        # it is never confidence/risk/regime-scaled - so it's checked as-is.
+        # DCA steps 1-5 CAN be scaled down by confidence sizing at runtime
+        # (see confidence_size_multiplier / notional_for_step), so those are
+        # checked at their worst case (SIZE_MIN_MULT) to make sure a
+        # low-confidence DCA add can never silently fall below min_notional.
         for step in range(MAX_DCA_STEPS + 1):
             margin = INITIAL_ENTRY_USDT if step == 0 else INITIAL_ENTRY_USDT * (DCA_MULTIPLIER ** step)
-            if step == 0:
-                margin *= SIZE_MIN_MULT  # worst case (smallest allowed) initial size
+            if step > 0:
+                margin *= SIZE_MIN_MULT  # worst case (smallest allowed) DCA add size
             step_notional = margin * LEVERAGE
             ok = step_notional >= filters.min_notional
-            label = "INITIAL (min size)" if step == 0 else f"DCA #{step}"
+            label = "INITIAL" if step == 0 else f"DCA #{step} (min size)"
             print(color(
                 f"[setup]   {label}: margin=${margin:.2f} notional=${step_notional:.2f} "
                 f"{'OK' if ok else 'BELOW MIN_NOTIONAL - will be skipped at runtime!'}",
