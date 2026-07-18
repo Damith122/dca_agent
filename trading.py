@@ -724,6 +724,18 @@ class EntryEngineV2:
             else:
                 score += weight * val
 
+        print(color(
+            f"{now_str()} [entry-debug] brain_confidence={components['brain_confidence']:.4f} "
+            f"trend_confidence={components['trend_confidence']:.4f} "
+            f"volume_confirmation={components['volume_confirmation']:.4f} "
+            f"volatility_fit={components['volatility_fit']:.4f} "
+            f"momentum={components['momentum']:.4f} "
+            f"regime_fit={components['regime_fit']:.4f} "
+            f"risk_score={components['risk_score']:.4f} "
+            f"final_score={score:.4f} threshold={ENTRY_SCORE_THRESHOLD:.4f}",
+            GRAY,
+        ))
+
         should_enter = score >= ENTRY_SCORE_THRESHOLD
         return EntryDecision(should_enter, conf.trend_direction, score, components)
 
@@ -1367,46 +1379,8 @@ class MartingaleManager:
                 volume_z = clamp(safe_div(volumes[-1] - vmean, vstd, 0.0), -4.0, 4.0) if vstd else 0.0
             momentum = float(features[22]) if len(features) > 22 else 0.0  # momentum_short index
 
-            # --- DEBUG: entry decision flow (logging only - no logic here) ---
-            print(color("[ENTRY] Entry evaluation started", GRAY))
-            print(color(f"[ENTRY] Current regime: {self.last_regime.regime}", GRAY))
-            print(color(f"[ENTRY] ATR%: {self.last_regime.atr_pct:.5f}", GRAY))
-            print(color(f"[ENTRY] Brain confidence: {self.last_confidence.confidence_score:.2f}", GRAY))
-            print(color(f"[ENTRY] Success probability: {self.last_confidence.success_probability:.2f}", GRAY))
-            print(color(f"[ENTRY] TP hit probability: {self.last_confidence.tp_hit_probability:.2f}", GRAY))
-            print(color(f"[ENTRY] Risk score: {self.last_confidence.risk_score:.2f}", GRAY))
-            print(color(f"[ENTRY] Entry threshold: {ENTRY_SCORE_THRESHOLD:.2f}", GRAY))
-
             decision = self.entry_engine.evaluate(self.last_confidence, self.last_regime, volume_z, momentum, features)
             self.last_entry_decision = decision
-
-            # --- DEBUG: entry decision flow, continued (logging only) ---
-            has_trend_signal = (
-                self.last_confidence.trend_direction is not None
-                and self.last_confidence.trend_confidence > 0
-            )
-            print(color(
-                f"[ENTRY] Filter 'trend signal present': "
-                f"{'PASS' if has_trend_signal else 'FAIL'}", GRAY,
-            ))
-            score_passes = decision.score >= ENTRY_SCORE_THRESHOLD
-            print(color(
-                f"[ENTRY] Filter 'entry score >= threshold': "
-                f"{'PASS' if score_passes else 'FAIL'}", GRAY,
-            ))
-            if not has_trend_signal:
-                print(color(
-                    f"[ENTRY] Rejected: no trend direction or trend confidence <= 0 "
-                    f"(trend_confidence={self.last_confidence.trend_confidence:.2f})", YELLOW,
-                ))
-            elif not decision.should_enter:
-                print(color(
-                    f"[ENTRY] Rejected: confidence {decision.score:.2f} < "
-                    f"threshold {ENTRY_SCORE_THRESHOLD:.2f}", YELLOW,
-                ))
-            else:
-                print(color("[ENTRY] All filters passed. Opening position.", GREEN))
-
             if decision.should_enter and decision.side is not None:
                 # Initial entry ALWAYS uses the configured INITIAL_ENTRY_USDT
                 # unscaled - confidence/regime/risk-based sizing only ever
