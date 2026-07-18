@@ -1,1 +1,1 @@
-worker: python -u dca2.py
+worker: python -u main.py
