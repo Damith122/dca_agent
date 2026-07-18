@@ -311,17 +311,17 @@ class MarketRegimeEngine:
             regime = REGIME_WEAK_TREND
         else:
             regime = REGIME_SIDEWAYS
-         
+
         print(color(
-        f"{now_str()} [regime-debug] atr={atr:.6f} atr_ratio={atr_ratio:.4f} "
-        f"slope={slope:.6f} ema_fast={ema_fast:.4f} ema_slow={ema_slow:.4f} "
-        f"regime={regime} "
-        f"REGIME_ATR_HIGH_MULT={REGIME_ATR_HIGH_MULT:.4f} "
-        f"REGIME_ATR_LOW_MULT={REGIME_ATR_LOW_MULT:.4f} "
-        f"REGIME_TREND_SLOPE_STRONG={REGIME_TREND_SLOPE_STRONG:.6f} "
-        f"REGIME_TREND_SLOPE_WEAK={REGIME_TREND_SLOPE_WEAK:.6f}",
-        GRAY,
-        )) 
+            f"{now_str()} [regime-debug] atr={atr:.6f} atr_ratio={atr_ratio:.4f} "
+            f"slope={slope:.6f} ema_fast={ema_fast:.4f} ema_slow={ema_slow:.4f} "
+            f"regime={regime} "
+            f"REGIME_ATR_HIGH_MULT={REGIME_ATR_HIGH_MULT:.4f} "
+            f"REGIME_ATR_LOW_MULT={REGIME_ATR_LOW_MULT:.4f} "
+            f"REGIME_TREND_SLOPE_STRONG={REGIME_TREND_SLOPE_STRONG:.6f} "
+            f"REGIME_TREND_SLOPE_WEAK={REGIME_TREND_SLOPE_WEAK:.6f}",
+            GRAY,
+        ))
 
         return RegimeReading(
             regime=regime, trend_slope=slope, atr_pct=atr_pct, atr_ratio=atr_ratio,
