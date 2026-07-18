@@ -88,8 +88,8 @@ ROLLING_RETURN_WINDOWS = (5, 15, 30)
 # --- Market Regime Engine -----------------------------------------------------
 REGIME_ATR_HIGH_MULT = 1.6     # current ATR vs its own rolling mean -> HIGH_VOL
 REGIME_ATR_LOW_MULT = 0.6      # current ATR vs its own rolling mean -> LOW_VOL
-REGIME_TREND_SLOPE_STRONG = 0.0009   # EMA_FAST slope (pct/candle) -> STRONG_TREND
-REGIME_TREND_SLOPE_WEAK = 0.0003     # EMA_FAST slope (pct/candle) -> WEAK_TREND
+REGIME_TREND_SLOPE_STRONG = 0.00060   # EMA_FAST slope (pct/candle) -> STRONG_TREND
+REGIME_TREND_SLOPE_WEAK   = 0.00020     # EMA_FAST slope (pct/candle) -> WEAK_TREND
 REGIME_LOOKBACK_CANDLES = 30
 
 # --- Brain V2 --------------------------------------------------------------
