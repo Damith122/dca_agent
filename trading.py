@@ -277,6 +277,12 @@ class MarketRegimeEngine:
 
     def evaluate(self, candles: List[Candle]) -> RegimeReading:
         if len(candles) < max(EMA_SLOW, ATR_PERIOD) + 2:
+            print(color(
+                f"{now_str()} [regime-debug] insufficient candles "
+                f"({len(candles)} < {max(EMA_SLOW, ATR_PERIOD) + 2}) - "
+                f"returning default RegimeReading (regime=SIDEWAYS)",
+                GRAY,
+            ))
             return RegimeReading()
 
         closes = [c.close for c in candles]
