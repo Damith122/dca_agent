@@ -1253,14 +1253,25 @@ class MartingaleManager:
     def on_book_ticker(self, bid: float, ask: float, bid_qty: float, ask_qty: float) -> None:
         self.prev_prev_price = self.prev_price
         self.prev_price = self.current_price
+    
         price = (bid + ask) / 2
         self.current_price = price
+    
+        print(
+            f"[DEBUG][on_book_ticker] "
+            f"bid={bid:.2f} ask={ask:.2f} "
+            f"price={price:.2f} "
+            f"prev_price={self.prev_price} "
+            f"current_price={self.current_price}"
+        )
+    
         self.best_bid_price, self.best_ask_price = bid, ask
         self.best_bid_qty, self.best_ask_qty = bid_qty, ask_qty
+    
         self.update_price_history(price)
         self.candles.on_price(price)
         self.feature_builder.update_vwap(price, (bid_qty + ask_qty) / 2.0)
-
+    
     def on_agg_trade(self, qty: float, is_buyer_maker: bool) -> None:
         self.candles.on_trade(qty, is_buyer_maker)
 
