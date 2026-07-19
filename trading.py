@@ -548,6 +548,11 @@ class FeatureBuilderV2:
             vec = np.pad(vec, (0, N_FEATURES_V2 - len(vec)))
         elif len(vec) > N_FEATURES_V2:
             vec = vec[:N_FEATURES_V2]
+
+        print(f"[DEBUG][FeatureBuilderV2.build] momentum_short(local)={momentum_short:.8f} "
+              f"features[22]={vec[22] if len(vec) > 22 else float('nan'):.8f} "
+              f"price={price} prev_price={prev_price}")
+
         return vec
 
 
@@ -692,6 +697,8 @@ class EntryEngineV2:
         momentum: float,
         features: np.ndarray,
     ) -> EntryDecision:
+        print(f"[DEBUG][EntryEngineV2.evaluate] momentum arg received={momentum:.8f}")
+
         if conf.trend_direction is None or conf.trend_confidence <= 0:
             return EntryDecision(False, None, 0.0, {})
 
@@ -710,7 +717,11 @@ class EntryEngineV2:
         else:  # SIDEWAYS
             volatility_fit = 0.4
 
+        _momentum_component_raw = abs(momentum) / 0.002
+        print(f"[DEBUG][EntryEngineV2.evaluate] momentum_component pre-clamp={_momentum_component_raw:.8f} "
+              f"(from momentum={momentum:.8f})")
         momentum_component = clamp((abs(momentum) / 0.002), 0.0, 1.0)  # saturates at 0.2% tick momentum
+        print(f"[DEBUG][EntryEngineV2.evaluate] momentum_component post-clamp={momentum_component:.8f}")
 
         # Regime fit: does the regime's own directional bias (slope sign)
         # agree with the brain's proposed side?
@@ -1361,6 +1372,8 @@ class MartingaleManager:
 
     async def on_price_tick(self) -> None:
         features = self.build_features()
+        print(f"[DEBUG][on_price_tick] features[22] (post build_features)="
+              f"{features[22] if len(features) > 22 else float('nan'):.8f}")
         candles = self.candles.all_candles_incl_live()
         self.last_regime = self.regime_engine.evaluate(candles)
         self._learn_from_tick(features, self.last_regime.atr_pct)
@@ -1395,6 +1408,8 @@ class MartingaleManager:
                 vmean, vstd = float(np.mean(volumes[-30:])), float(np.std(volumes[-30:]))
                 volume_z = clamp(safe_div(volumes[-1] - vmean, vstd, 0.0), -4.0, 4.0) if vstd else 0.0
             momentum = float(features[22]) if len(features) > 22 else 0.0  # momentum_short index
+            print(f"[DEBUG][on_price_tick] momentum extracted from features[22]={momentum:.8f} "
+                  f"len(features)={len(features)}")
 
             decision = self.entry_engine.evaluate(self.last_confidence, self.last_regime, volume_z, momentum, features)
             self.last_entry_decision = decision
