@@ -607,9 +607,9 @@ async def main() -> None:
 
         # Persistent Adaptive Learning: local brain snapshot -> GitHub -> fresh model.
         await manager.load_or_init_brain()
-        # Same GitHub session as the brain - restores trades_log.csv /
-        # performance_stats.csv so trade history and analytics survive an
-        # ephemeral restart exactly like brain.pkl does.
+        # Same GitHub session as the brain - restores trades_log.jsonl /
+        # trades_log.csv / performance_stats.csv so trade history and
+        # analytics survive an ephemeral restart exactly like brain.pkl does.
         await manager.restore_csv_logs_from_github()
 
         await initialize_sync(client, manager, context="startup")
