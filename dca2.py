@@ -463,6 +463,11 @@ async def stats_export_loop(manager: MartingaleManager, interval_sec: int = STAT
             manager.perf_stats.export()
         except Exception as e:  # noqa: BLE001 - stats must never crash the trading loop
             print(color(f"[stats] export loop error: {e}", YELLOW))
+            continue
+        try:
+            await manager.sync_performance_stats_to_github()
+        except Exception as e:  # noqa: BLE001 - GitHub sync must never crash the trading loop
+            print(color(f"[csv-sync] performance_stats.csv sync error: {e}", YELLOW))
 
 
 async def status_loop(manager: MartingaleManager, interval_sec: int = 20) -> None:
@@ -602,6 +607,10 @@ async def main() -> None:
 
         # Persistent Adaptive Learning: local brain snapshot -> GitHub -> fresh model.
         await manager.load_or_init_brain()
+        # Same GitHub session as the brain - restores trades_log.csv /
+        # performance_stats.csv so trade history and analytics survive an
+        # ephemeral restart exactly like brain.pkl does.
+        await manager.restore_csv_logs_from_github()
 
         await initialize_sync(client, manager, context="startup")
 
@@ -625,6 +634,14 @@ async def main() -> None:
             try:
                 manager.perf_stats.export()
             except Exception:  # noqa: BLE001 - never block shutdown on stats export
+                pass
+            try:
+                await manager.sync_trade_log_to_github()
+            except Exception:  # noqa: BLE001 - never block shutdown on sync
+                pass
+            try:
+                await manager.sync_performance_stats_to_github()
+            except Exception:  # noqa: BLE001 - never block shutdown on sync
                 pass
             try:
                 await manager.github_sync.close()
