@@ -46,6 +46,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
 import math
 import os
@@ -274,15 +275,25 @@ class MarketRegimeEngine:
     def __init__(self, lookback: int = REGIME_LOOKBACK_CANDLES):
         self.lookback = lookback
         self.atr_history: Deque[float] = deque(maxlen=lookback * 3)
+        self._last_log_ts: float = 0.0
+        self._log_interval_sec: float = 15.0
+
+    def _should_log(self) -> bool:
+        now = time.time()
+        if now - self._last_log_ts >= self._log_interval_sec:
+            self._last_log_ts = now
+            return True
+        return False
 
     def evaluate(self, candles: List[Candle]) -> RegimeReading:
         if len(candles) < max(EMA_SLOW, ATR_PERIOD) + 2:
-            print(color(
-                f"{now_str()} [regime-debug] insufficient candles "
-                f"({len(candles)} < {max(EMA_SLOW, ATR_PERIOD) + 2}) - "
-                f"returning default RegimeReading (regime=SIDEWAYS)",
-                GRAY,
-            ))
+            if self._should_log():
+                print(color(
+                    f"{now_str()} [regime-debug] insufficient candles "
+                    f"({len(candles)} < {max(EMA_SLOW, ATR_PERIOD) + 2}) - "
+                    f"returning default RegimeReading (regime=SIDEWAYS)",
+                    GRAY,
+                ))
             return RegimeReading()
 
         closes = [c.close for c in candles]
@@ -318,16 +329,17 @@ class MarketRegimeEngine:
         else:
             regime = REGIME_SIDEWAYS
 
-        print(color(
-            f"{now_str()} [regime-debug] atr={atr:.6f} atr_ratio={atr_ratio:.4f} "
-            f"slope={slope:.6f} ema_fast={ema_fast:.4f} ema_slow={ema_slow:.4f} "
-            f"regime={regime} "
-            f"REGIME_ATR_HIGH_MULT={REGIME_ATR_HIGH_MULT:.4f} "
-            f"REGIME_ATR_LOW_MULT={REGIME_ATR_LOW_MULT:.4f} "
-            f"REGIME_TREND_SLOPE_STRONG={REGIME_TREND_SLOPE_STRONG:.6f} "
-            f"REGIME_TREND_SLOPE_WEAK={REGIME_TREND_SLOPE_WEAK:.6f}",
-            GRAY,
-        ))
+        if self._should_log():
+            print(color(
+                f"{now_str()} [regime-debug] atr={atr:.6f} atr_ratio={atr_ratio:.4f} "
+                f"slope={slope:.6f} ema_fast={ema_fast:.4f} ema_slow={ema_slow:.4f} "
+                f"regime={regime} "
+                f"REGIME_ATR_HIGH_MULT={REGIME_ATR_HIGH_MULT:.4f} "
+                f"REGIME_ATR_LOW_MULT={REGIME_ATR_LOW_MULT:.4f} "
+                f"REGIME_TREND_SLOPE_STRONG={REGIME_TREND_SLOPE_STRONG:.6f} "
+                f"REGIME_TREND_SLOPE_WEAK={REGIME_TREND_SLOPE_WEAK:.6f}",
+                GRAY,
+            ))
 
         return RegimeReading(
             regime=regime, trend_slope=slope, atr_pct=atr_pct, atr_ratio=atr_ratio,
@@ -549,10 +561,6 @@ class FeatureBuilderV2:
         elif len(vec) > N_FEATURES_V2:
             vec = vec[:N_FEATURES_V2]
 
-        print(f"[DEBUG][FeatureBuilderV2.build] momentum_short(local)={momentum_short:.8f} "
-              f"features[22]={vec[22] if len(vec) > 22 else float('nan'):.8f} "
-              f"price={price} prev_price={prev_price}")
-
         return vec
 
 
@@ -689,6 +697,17 @@ class EntryDecision:
 
 
 class EntryEngineV2:
+    def __init__(self):
+        self._last_log_ts: float = 0.0
+        self._log_interval_sec: float = 15.0
+
+    def _should_log(self) -> bool:
+        now = time.time()
+        if now - self._last_log_ts >= self._log_interval_sec:
+            self._last_log_ts = now
+            return True
+        return False
+
     def evaluate(
         self,
         conf: ConfidenceReading,
@@ -697,8 +716,6 @@ class EntryEngineV2:
         momentum: float,
         features: np.ndarray,
     ) -> EntryDecision:
-        print(f"[DEBUG][EntryEngineV2.evaluate] momentum arg received={momentum:.8f}")
-
         if conf.trend_direction is None or conf.trend_confidence <= 0:
             return EntryDecision(False, None, 0.0, {})
 
@@ -717,11 +734,7 @@ class EntryEngineV2:
         else:  # SIDEWAYS
             volatility_fit = 0.4
 
-        _momentum_component_raw = abs(momentum) / 0.002
-        print(f"[DEBUG][EntryEngineV2.evaluate] momentum_component pre-clamp={_momentum_component_raw:.8f} "
-              f"(from momentum={momentum:.8f})")
         momentum_component = clamp((abs(momentum) / 0.002), 0.0, 1.0)  # saturates at 0.2% tick momentum
-        print(f"[DEBUG][EntryEngineV2.evaluate] momentum_component post-clamp={momentum_component:.8f}")
 
         # Regime fit: does the regime's own directional bias (slope sign)
         # agree with the brain's proposed side?
@@ -752,17 +765,18 @@ class EntryEngineV2:
             else:
                 score += weight * val
 
-        print(color(
-            f"{now_str()} [entry-debug] brain_confidence={components['brain_confidence']:.4f} "
-            f"trend_confidence={components['trend_confidence']:.4f} "
-            f"volume_confirmation={components['volume_confirmation']:.4f} "
-            f"volatility_fit={components['volatility_fit']:.4f} "
-            f"momentum={components['momentum']:.4f} "
-            f"regime_fit={components['regime_fit']:.4f} "
-            f"risk_score={components['risk_score']:.4f} "
-            f"final_score={score:.4f} threshold={ENTRY_SCORE_THRESHOLD:.4f}",
-            GRAY,
-        ))
+        if self._should_log():
+            print(color(
+                f"{now_str()} [entry-debug] brain_confidence={components['brain_confidence']:.4f} "
+                f"trend_confidence={components['trend_confidence']:.4f} "
+                f"volume_confirmation={components['volume_confirmation']:.4f} "
+                f"volatility_fit={components['volatility_fit']:.4f} "
+                f"momentum={components['momentum']:.4f} "
+                f"regime_fit={components['regime_fit']:.4f} "
+                f"risk_score={components['risk_score']:.4f} "
+                f"final_score={score:.4f} threshold={ENTRY_SCORE_THRESHOLD:.4f}",
+                GRAY,
+            ))
 
         should_enter = score >= ENTRY_SCORE_THRESHOLD
         return EntryDecision(should_enter, conf.trend_direction, score, components)
@@ -1256,15 +1270,7 @@ class MartingaleManager:
     
         price = (bid + ask) / 2
         self.current_price = price
-    
-        print(
-            f"[DEBUG][on_book_ticker] "
-            f"bid={bid:.2f} ask={ask:.2f} "
-            f"price={price:.2f} "
-            f"prev_price={self.prev_price} "
-            f"current_price={self.current_price}"
-        )
-    
+
         self.best_bid_price, self.best_ask_price = bid, ask
         self.best_bid_qty, self.best_ask_qty = bid_qty, ask_qty
     
@@ -1383,8 +1389,6 @@ class MartingaleManager:
 
     async def on_price_tick(self) -> None:
         features = self.build_features()
-        print(f"[DEBUG][on_price_tick] features[22] (post build_features)="
-              f"{features[22] if len(features) > 22 else float('nan'):.8f}")
         candles = self.candles.all_candles_incl_live()
         self.last_regime = self.regime_engine.evaluate(candles)
         self._learn_from_tick(features, self.last_regime.atr_pct)
@@ -1419,8 +1423,6 @@ class MartingaleManager:
                 vmean, vstd = float(np.mean(volumes[-30:])), float(np.std(volumes[-30:]))
                 volume_z = clamp(safe_div(volumes[-1] - vmean, vstd, 0.0), -4.0, 4.0) if vstd else 0.0
             momentum = float(features[22]) if len(features) > 22 else 0.0  # momentum_short index
-            print(f"[DEBUG][on_price_tick] momentum extracted from features[22]={momentum:.8f} "
-                  f"len(features)={len(features)}")
 
             decision = self.entry_engine.evaluate(self.last_confidence, self.last_regime, volume_z, momentum, features)
             self.last_entry_decision = decision
