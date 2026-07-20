@@ -155,6 +155,18 @@ GITHUB_BRAIN_PATH = os.environ.get("GITHUB_BRAIN_PATH", "brain_v2.pkl")
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 BRAIN_AUTO_PUSH_INTERVAL_SEC = int(os.environ.get("BRAIN_AUTO_PUSH_INTERVAL_SEC", "300"))
 
+# CSV analytics sync (same repo/session as brain.pkl - see GithubBrainSync).
+# Default: same directory as GITHUB_BRAIN_PATH, so they live beside brain.pkl.
+_GITHUB_BRAIN_DIR = os.path.dirname(GITHUB_BRAIN_PATH)
+GITHUB_TRADES_LOG_CSV_PATH = os.environ.get(
+    "GITHUB_TRADES_LOG_CSV_PATH",
+    "/".join(p for p in (_GITHUB_BRAIN_DIR, "trades_log.csv") if p),
+)
+GITHUB_STATS_CSV_PATH = os.environ.get(
+    "GITHUB_STATS_CSV_PATH",
+    "/".join(p for p in (_GITHUB_BRAIN_DIR, "performance_stats.csv") if p),
+)
+
 # --- Timing -------------------------------------------------------------------
 LISTEN_KEY_KEEPALIVE_SEC = 25 * 60
 BALANCE_REFRESH_SEC = 60
@@ -257,6 +269,8 @@ __all__ = [
     "GITHUB_REPO",
     "GITHUB_BRAIN_PATH",
     "GITHUB_BRANCH",
+    "GITHUB_TRADES_LOG_CSV_PATH",
+    "GITHUB_STATS_CSV_PATH",
     "BRAIN_AUTO_PUSH_INTERVAL_SEC",
     "LISTEN_KEY_KEEPALIVE_SEC",
     "BALANCE_REFRESH_SEC",
