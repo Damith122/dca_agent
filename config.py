@@ -166,6 +166,10 @@ GITHUB_STATS_CSV_PATH = os.environ.get(
     "GITHUB_STATS_CSV_PATH",
     "/".join(p for p in (_GITHUB_BRAIN_DIR, "performance_stats.csv") if p),
 )
+GITHUB_TRADES_LOG_JSON_PATH = os.environ.get(
+    "GITHUB_TRADES_LOG_JSON_PATH",
+    "/".join(p for p in (_GITHUB_BRAIN_DIR, "trades_log.jsonl") if p),
+)
 
 # --- Timing -------------------------------------------------------------------
 LISTEN_KEY_KEEPALIVE_SEC = 25 * 60
@@ -271,6 +275,7 @@ __all__ = [
     "GITHUB_BRANCH",
     "GITHUB_TRADES_LOG_CSV_PATH",
     "GITHUB_STATS_CSV_PATH",
+    "GITHUB_TRADES_LOG_JSON_PATH",
     "BRAIN_AUTO_PUSH_INTERVAL_SEC",
     "LISTEN_KEY_KEEPALIVE_SEC",
     "BALANCE_REFRESH_SEC",
