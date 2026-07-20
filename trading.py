@@ -127,6 +127,7 @@ from config import (
     GITHUB_BRANCH,
     GITHUB_TRADES_LOG_CSV_PATH,
     GITHUB_STATS_CSV_PATH,
+    GITHUB_TRADES_LOG_JSON_PATH,
 )
 from indicators import clamp, safe_div, ema_series, round_step
 from exchange import BinanceApiError, RestClient, SymbolFilters
@@ -1222,24 +1223,26 @@ class MartingaleManager:
             print(color(f"[brain-sync] unexpected error during push (bot keeps trading): {e}", RED))
         self._brain_dirty = False
 
-    # -- CSV analytics persistence (trades_log.csv / performance_stats.csv) --
+    # -- Trade log / analytics persistence (trades_log.jsonl, trades_log.csv, --
+    # -- performance_stats.csv) --------------------------------------------
     # Reuses self.github_sync (same GitHub client/session/token/repo/branch
     # as brain.pkl) via its path= parameter - no second client is created.
-    # Fail-soft throughout: any GitHub error just leaves local CSV state as
+    # Fail-soft throughout: any GitHub error just leaves local state as
     # the working copy and trading continues normally.
 
     async def restore_csv_logs_from_github(self) -> None:
-        """Startup: downloads trades_log.csv / performance_stats.csv from
-        GitHub if present, so they survive an ephemeral restart the same
-        way brain.pkl does. If a local copy already exists (e.g. a
-        persistent volume) it is left alone - GitHub is only used to
-        rehydrate an empty/missing local file. If neither a local nor a
-        remote copy exists, nothing is created here: TradeLogger /
+        """Startup: downloads trades_log.jsonl / trades_log.csv /
+        performance_stats.csv from GitHub if present, so they survive an
+        ephemeral restart the same way brain.pkl does. If a local copy
+        already exists (e.g. a persistent volume) it is left alone - GitHub
+        is only used to rehydrate an empty/missing local file. If neither a
+        local nor a remote copy exists, nothing is created here: TradeLogger /
         PerformanceStats already create the file with proper headers
         automatically on their first natural write (unchanged behavior)."""
         for local_path, remote_path, label in (
             (TRADE_LOG_CSV_PATH, GITHUB_TRADES_LOG_CSV_PATH, "trades_log.csv"),
             (STATS_CSV_PATH, GITHUB_STATS_CSV_PATH, "performance_stats.csv"),
+            (TRADE_LOG_JSON_PATH, GITHUB_TRADES_LOG_JSON_PATH, "trades_log.jsonl"),
         ):
             if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
                 continue  # local copy already present - don't clobber it
@@ -1265,6 +1268,7 @@ class MartingaleManager:
         # but-unchanged file isn't immediately re-uploaded for no reason.
         self._last_synced_csv_hash[GITHUB_TRADES_LOG_CSV_PATH] = self._file_sha256(TRADE_LOG_CSV_PATH)
         self._last_synced_csv_hash[GITHUB_STATS_CSV_PATH] = self._file_sha256(STATS_CSV_PATH)
+        self._last_synced_csv_hash[GITHUB_TRADES_LOG_JSON_PATH] = self._file_sha256(TRADE_LOG_JSON_PATH)
 
     @staticmethod
     def _file_sha256(path: str) -> Optional[str]:
@@ -1302,6 +1306,7 @@ class MartingaleManager:
 
     async def sync_trade_log_to_github(self) -> None:
         await self._sync_csv_to_github(TRADE_LOG_CSV_PATH, GITHUB_TRADES_LOG_CSV_PATH, "trades_log.csv")
+        await self._sync_csv_to_github(TRADE_LOG_JSON_PATH, GITHUB_TRADES_LOG_JSON_PATH, "trades_log.jsonl")
 
     async def sync_performance_stats_to_github(self) -> None:
         await self._sync_csv_to_github(STATS_CSV_PATH, GITHUB_STATS_CSV_PATH, "performance_stats.csv")
