@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import json
 import math
 import os
@@ -124,6 +125,8 @@ from config import (
     GITHUB_REPO,
     GITHUB_BRAIN_PATH,
     GITHUB_BRANCH,
+    GITHUB_TRADES_LOG_CSV_PATH,
+    GITHUB_STATS_CSV_PATH,
 )
 from indicators import clamp, safe_div, ema_series, round_step
 from exchange import BinanceApiError, RestClient, SymbolFilters
@@ -872,6 +875,14 @@ class TradeLogger:
         self.csv_path = csv_path
         self._csv_header_written = os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
 
+    def mark_header_present(self) -> None:
+        """Re-checks csv_path on disk and refreshes the cached header-written
+        flag. Needed because TradeLogger is constructed (and caches this
+        flag) before an async GitHub restore can write a downloaded CSV to
+        csv_path - without this, the next log_trade() would re-write a
+        header into the middle of the restored file."""
+        self._csv_header_written = os.path.exists(self.csv_path) and os.path.getsize(self.csv_path) > 0
+
     def log_trade(self, record: dict) -> None:
         try:
             with open(self.json_path, "a", encoding="utf-8") as f:
@@ -1138,6 +1149,7 @@ class MartingaleManager:
         )
         self._brain_dirty = False
         self.last_brain_sync_ts: Optional[float] = None
+        self._last_synced_csv_hash: Dict[str, Optional[str]] = {}
 
         self._order_index: Dict[int, str] = {}
         self._rp_accum: Dict[int, float] = {}
@@ -1145,6 +1157,11 @@ class MartingaleManager:
     # -- Persistent Adaptive Learning: startup load / ongoing persistence ----
 
     async def load_or_init_brain(self) -> None:
+        # Start (or reuse) the single shared GitHub session up front, so it's
+        # available for the CSV log/stats restore that runs right after this,
+        # regardless of which branch below actually loads the brain from.
+        await self.github_sync.start()
+
         if os.path.exists(BRAIN_LOCAL_PATH):
             try:
                 with open(BRAIN_LOCAL_PATH, "rb") as f:
@@ -1158,7 +1175,6 @@ class MartingaleManager:
             except Exception as e:  # noqa: BLE001 - corrupt local file must not block startup
                 print(color(f"[brain] local {BRAIN_LOCAL_PATH} unreadable ({e}), trying GitHub ...", YELLOW))
 
-        await self.github_sync.start()
         remote = await self.github_sync.download()
         if remote:
             try:
@@ -1205,6 +1221,90 @@ class MartingaleManager:
         except Exception as e:  # noqa: BLE001 - belt-and-suspenders; upload() already catches internally
             print(color(f"[brain-sync] unexpected error during push (bot keeps trading): {e}", RED))
         self._brain_dirty = False
+
+    # -- CSV analytics persistence (trades_log.csv / performance_stats.csv) --
+    # Reuses self.github_sync (same GitHub client/session/token/repo/branch
+    # as brain.pkl) via its path= parameter - no second client is created.
+    # Fail-soft throughout: any GitHub error just leaves local CSV state as
+    # the working copy and trading continues normally.
+
+    async def restore_csv_logs_from_github(self) -> None:
+        """Startup: downloads trades_log.csv / performance_stats.csv from
+        GitHub if present, so they survive an ephemeral restart the same
+        way brain.pkl does. If a local copy already exists (e.g. a
+        persistent volume) it is left alone - GitHub is only used to
+        rehydrate an empty/missing local file. If neither a local nor a
+        remote copy exists, nothing is created here: TradeLogger /
+        PerformanceStats already create the file with proper headers
+        automatically on their first natural write (unchanged behavior)."""
+        for local_path, remote_path, label in (
+            (TRADE_LOG_CSV_PATH, GITHUB_TRADES_LOG_CSV_PATH, "trades_log.csv"),
+            (STATS_CSV_PATH, GITHUB_STATS_CSV_PATH, "performance_stats.csv"),
+        ):
+            if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+                continue  # local copy already present - don't clobber it
+            try:
+                data = await self.github_sync.download(path=remote_path)
+            except Exception as e:  # noqa: BLE001 - restore must never block startup
+                print(color(f"[csv-sync] failed to check GitHub for {label}: {e}", YELLOW))
+                continue
+            if not data:
+                continue  # nothing on GitHub yet - created fresh on first write, as before
+            try:
+                with open(local_path, "wb") as f:
+                    f.write(data)
+                print(color(f"[csv-sync] restored {label} from GitHub ({len(data)} bytes).", MAGENTA))
+            except Exception as e:  # noqa: BLE001 - disk write failure shouldn't block startup
+                print(color(f"[csv-sync] could not write restored {label} to disk: {e}", YELLOW))
+
+        # TradeLogger cached its header-written flag at construction time,
+        # before this restore could have written a file to disk - refresh it
+        # so the next trade close appends instead of duplicating a header.
+        self.trade_logger.mark_header_present()
+        # Seed the dedup hashes with whatever is on disk now, so a restored-
+        # but-unchanged file isn't immediately re-uploaded for no reason.
+        self._last_synced_csv_hash[GITHUB_TRADES_LOG_CSV_PATH] = self._file_sha256(TRADE_LOG_CSV_PATH)
+        self._last_synced_csv_hash[GITHUB_STATS_CSV_PATH] = self._file_sha256(STATS_CSV_PATH)
+
+    @staticmethod
+    def _file_sha256(path: str) -> Optional[str]:
+        try:
+            with open(path, "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+        except Exception:  # noqa: BLE001 - missing/unreadable file just means "nothing to sync"
+            return None
+
+    async def _sync_csv_to_github(self, local_path: str, remote_path: str, label: str) -> None:
+        """Pushes local_path to remote_path (same shared GitHub client as
+        brain.pkl) ONLY if its content changed since the last successful
+        push - avoids uploading on every tick / every stats export when
+        nothing new actually happened. Never raises."""
+        if not self.github_sync.enabled:
+            return
+        new_hash = self._file_sha256(local_path)
+        if new_hash is None:
+            return  # file doesn't exist yet / unreadable - nothing to sync
+        if self._last_synced_csv_hash.get(remote_path) == new_hash:
+            return  # unchanged since the last successful push - skip the API call
+        try:
+            with open(local_path, "rb") as f:
+                data = f.read()
+        except Exception as e:  # noqa: BLE001
+            print(color(f"[csv-sync] could not read {label} for sync: {e}", YELLOW))
+            return
+        try:
+            pushed = await self.github_sync.upload(data, message=f"{label} sync", path=remote_path)
+            if pushed:
+                self._last_synced_csv_hash[remote_path] = new_hash
+                print(color(f"{now_str()} [csv-sync] pushed {label} to GitHub.", MAGENTA))
+        except Exception as e:  # noqa: BLE001 - belt-and-suspenders; upload() already catches internally
+            print(color(f"[csv-sync] unexpected error pushing {label} (bot keeps trading): {e}", RED))
+
+    async def sync_trade_log_to_github(self) -> None:
+        await self._sync_csv_to_github(TRADE_LOG_CSV_PATH, GITHUB_TRADES_LOG_CSV_PATH, "trades_log.csv")
+
+    async def sync_performance_stats_to_github(self) -> None:
+        await self._sync_csv_to_github(STATS_CSV_PATH, GITHUB_STATS_CSV_PATH, "performance_stats.csv")
 
     # -- sizing / fees -----------------------------------------------------------
 
@@ -1932,6 +2032,7 @@ class MartingaleManager:
         self.position = PositionState(last_close_time=time.time())
 
         asyncio.create_task(self.persist_brain(reason="trade closed"))
+        asyncio.create_task(self.sync_trade_log_to_github())
 
 
 # ============================================================================
