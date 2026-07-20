@@ -338,6 +338,7 @@ from trading import (
     PositionState,
     MartingaleManager,
     initialize_sync,
+    BrainV2,
 )
 
 
@@ -504,6 +505,13 @@ async def main() -> None:
     print(color("=" * 78, CYAN))
     print(color(" Martingale DCA Scalper - Binance USD-M Futures  [Brain V2]", BOLD))
     print(color(f" Symbol: {SYMBOL}   Testnet: {USE_TESTNET}   Dry-run: {DRY_RUN}", GRAY))
+    if USE_TESTNET:
+        print(color(
+            " *** TESTNET market data is thin/illiquid - bid/ask (and therefore "
+            "momentum/ATR/candle formation) can stay flat for extended real-world "
+            "stretches. That is expected testnet behavior, not a pipeline bug. "
+            "Set USE_TESTNET=false for live mainnet market data. ***", YELLOW,
+        ))
     print(color(
         f" Leverage: {LEVERAGE}x (cap {MAX_ALLOWED_LEVERAGE}x)   Margin: {MARGIN_TYPE}   "
         f"Initial entry: ${INITIAL_ENTRY_USDT}   DCA x{DCA_MULTIPLIER}   Max steps: {MAX_DCA_STEPS}",
