@@ -611,6 +611,11 @@ async def main() -> None:
         # trades_log.csv / performance_stats.csv so trade history and
         # analytics survive an ephemeral restart exactly like brain.pkl does.
         await manager.restore_csv_logs_from_github()
+        # Restores the trade-log reconciliation cursor (see
+        # reconcile_trade_history_from_exchange) the same way, so a Railway
+        # restart resumes catching up on Binance trade history from where
+        # it left off instead of re-scanning (or missing) anything.
+        await manager.load_trade_sync_cursor()
 
         await initialize_sync(client, manager, context="startup")
 
