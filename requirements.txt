@@ -1,4 +1,0 @@
-aiohttp>=3.9,<4
-websockets>=12.0,<13
-scikit-learn>=1.4,<2
-numpy>=1.26,<2
