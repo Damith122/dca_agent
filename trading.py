@@ -959,18 +959,38 @@ class PerformanceStats:
         self.json_path = json_path
         self.csv_path = csv_path
 
+    @staticmethod
+    def _safe_float(value, default: float = 0.0) -> float:
+        """float(t.get(key, default)) only falls back to `default` when
+        `key` is absent - if the key is PRESENT but explicitly None (as
+        several analytics-only fields are on reconciled/recovered trades;
+        see reconcile_trade_history_from_exchange()'s record dict, which
+        can't know entry_confidence/entry_regime/mfe_pct/mae_pct etc. since
+        those were never observed live), float(None) still raises
+        TypeError. This treats None the same as "missing" - falls back to
+        `default` - and is otherwise a no-op passthrough to float(), so
+        every existing calculation on well-formed (non-None) fields is
+        unchanged."""
+        if value is None:
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
     def compute(self) -> dict:
         trades = self.logger.load_all()
         n = len(trades)
         if n == 0:
             return {"trade_count": 0, "generated_at": now_str()}
 
-        net_pnls = [float(t.get("net_pnl_usdt", 0.0)) for t in trades]
+        sf = self._safe_float
+        net_pnls = [sf(t.get("net_pnl_usdt"), 0.0) for t in trades]
         wins = [p for p in net_pnls if p > 0]
         losses = [p for p in net_pnls if p <= 0]
         gross_profit = sum(wins)
         gross_loss = abs(sum(losses))
-        total_fees = sum(float(t.get("fees_usdt", 0.0)) for t in trades)
+        total_fees = sum(sf(t.get("fees_usdt"), 0.0) for t in trades)
         net_profit = sum(net_pnls)
 
         win_rate = safe_div(len(wins), n, 0.0)
@@ -980,12 +1000,12 @@ class PerformanceStats:
         avg_loss = safe_div(gross_loss, len(losses), 0.0)
         expectancy = win_rate * avg_win - loss_rate * avg_loss
 
-        hold_times = [float(t.get("holding_time_sec", 0.0)) for t in trades]
-        dca_counts = [float(t.get("dca_count", 0.0)) for t in trades]
+        hold_times = [sf(t.get("holding_time_sec"), 0.0) for t in trades]
+        dca_counts = [sf(t.get("dca_count"), 0.0) for t in trades]
 
         def _side_stats(side: str) -> dict:
             side_trades = [t for t in trades if t.get("side") == side]
-            side_pnls = [float(t.get("net_pnl_usdt", 0.0)) for t in side_trades]
+            side_pnls = [sf(t.get("net_pnl_usdt"), 0.0) for t in side_trades]
             return {
                 "count": len(side_trades),
                 "win_rate": safe_div(len([p for p in side_pnls if p > 0]), len(side_trades), 0.0),
@@ -997,14 +1017,20 @@ class PerformanceStats:
             regime_trades = [t for t in trades if t.get("entry_regime") == regime_name]
             if not regime_trades:
                 continue
-            regime_pnls = [float(t.get("net_pnl_usdt", 0.0)) for t in regime_trades]
+            regime_pnls = [sf(t.get("net_pnl_usdt"), 0.0) for t in regime_trades]
             by_regime[regime_name] = {
                 "count": len(regime_trades),
                 "win_rate": safe_div(len([p for p in regime_pnls if p > 0]), len(regime_trades), 0.0),
                 "net_profit": sum(regime_pnls),
             }
 
-        confidences = [float(t.get("entry_confidence", 0.0)) for t in trades]
+        # entry_confidence is None on recovered trades (never observed live)
+        # - excluded from the distribution entirely rather than counted as
+        # a fabricated 0.0, so recovered trades don't silently skew the
+        # mean/percentiles of a metric they never actually had.
+        confidences = [
+            sf(t.get("entry_confidence"), 0.0) for t in trades if t.get("entry_confidence") is not None
+        ]
         confidence_dist = {
             "mean": float(np.mean(confidences)) if confidences else 0.0,
             "p25": float(np.percentile(confidences, 25)) if confidences else 0.0,
@@ -1018,8 +1044,9 @@ class PerformanceStats:
             day_key = str(close_time)[:10] if close_time else "unknown"
             d = daily.setdefault(day_key, {"count": 0, "net_profit": 0.0, "wins": 0})
             d["count"] += 1
-            d["net_profit"] += float(t.get("net_pnl_usdt", 0.0))
-            if float(t.get("net_pnl_usdt", 0.0)) > 0:
+            pnl = sf(t.get("net_pnl_usdt"), 0.0)
+            d["net_profit"] += pnl
+            if pnl > 0:
                 d["wins"] += 1
         for d in daily.values():
             d["win_rate"] = safe_div(d["wins"], d["count"], 0.0)
