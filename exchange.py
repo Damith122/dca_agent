@@ -143,6 +143,25 @@ class RestClient:
             "GET", "/fapi/v2/positionRisk", {"symbol": symbol}, signed=True
         )
 
+    async def get_user_trades(
+        self, symbol: str, from_id: Optional[int] = None,
+        start_time_ms: Optional[int] = None, limit: int = 1000,
+    ) -> list:
+        """Actual executed fills for `symbol` (Binance's own account trade
+        history - the source of truth for what really happened, independent
+        of whatever the local process's in-memory state or the user-data
+        websocket stream did or didn't see). Read-only; used only by the
+        trade-log reconciliation safety net, never by the live strategy.
+        `from_id` and `start_time_ms` are mutually exclusive per Binance's
+        API - `from_id` (incremental cursor) takes priority when both are
+        given."""
+        params = {"symbol": symbol, "limit": limit}
+        if from_id is not None:
+            params["fromId"] = from_id
+        elif start_time_ms is not None:
+            params["startTime"] = start_time_ms
+        return await self._request("GET", "/fapi/v1/userTrades", params, signed=True)
+
     # --- signed trading endpoints -------------------------------------------
     async def place_order(self, **kwargs) -> dict:
         return await self._request("POST", "/fapi/v1/order", kwargs, signed=True)
