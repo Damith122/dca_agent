@@ -152,7 +152,18 @@ BRAIN_LOCAL_PATH = os.environ.get("BRAIN_LOCAL_PATH", "brain_v2.pkl")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
 GITHUB_BRAIN_PATH = os.environ.get("GITHUB_BRAIN_PATH", "brain_v2.pkl")
-GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
+# IMPORTANT (Railway deploy-loop fix): runtime state (brain.pkl, trade logs,
+# performance stats, sync cursor) is committed by the bot itself while it is
+# running. Railway's GitHub integration redeploys on every push to the branch
+# it is connected to (normally "main"). If GITHUB_BRANCH == that branch, each
+# runtime commit triggers a redeploy -> restart -> another commit -> infinite
+# deploy loop. To break that loop, runtime commits go to a DEDICATED branch
+# (default "brain-state") that Railway is never connected to, while Railway
+# keeps deploying only from "main" on real code pushes. GithubBrainSync will
+# auto-create this branch on first use if it doesn't exist yet - no manual
+# GitHub setup required. Do not set this to the same branch Railway deploys
+# from.
+GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "brain-state")
 BRAIN_AUTO_PUSH_INTERVAL_SEC = int(os.environ.get("BRAIN_AUTO_PUSH_INTERVAL_SEC", "300"))
 
 # CSV analytics sync (same repo/session as brain.pkl - see GithubBrainSync).

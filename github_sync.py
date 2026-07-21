@@ -83,6 +83,11 @@ class GithubBrainSync:
         self.enabled = bool(token and repo)
         self.session: Optional[aiohttp.ClientSession] = None
         self._last_sha: dict = {}
+        # Tri-state cache for _ensure_branch(): None = not checked yet,
+        # True = confirmed to exist (or created), False = check/create
+        # failed this run (upload() will still attempt and fail soft).
+        # Checked/created at most once per process, not once per file.
+        self._branch_ready: Optional[bool] = None
 
     async def start(self) -> None:
         if not self.enabled:
@@ -132,10 +137,73 @@ class GithubBrainSync:
             print(color(f"[brain-sync] GitHub download failed for {p} (continuing without it): {e}", YELLOW))
             return None
 
+    async def _ensure_branch(self) -> None:
+        """Makes sure self.branch exists on the remote before the first
+        commit is pushed to it, creating it off the repo's default branch
+        if needed. This is what lets GITHUB_BRANCH point at a brand-new
+        dedicated runtime-state branch (e.g. "brain-state") with zero
+        manual GitHub setup - the branch is created automatically on first
+        use. Checked once per process (cached in self._branch_ready);
+        fails soft like every other method here - if this can't confirm
+        or create the branch, upload() is still attempted and will simply
+        fail (and log) the same way a network error would."""
+        if self._branch_ready is not None or self.session is None:
+            return
+        base = f"https://api.github.com/repos/{self.repo}"
+        try:
+            async with self.session.get(
+                f"{base}/git/ref/heads/{self.branch}",
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status == 200:
+                    self._branch_ready = True
+                    return
+                if resp.status != 404:
+                    text = await resp.text()
+                    raise RuntimeError(f"HTTP {resp.status}: {text[:200]}")
+            # Branch doesn't exist yet - create it off the repo's default
+            # branch so runtime state has somewhere to live that Railway
+            # (deploying from the default/code branch) never watches.
+            async with self.session.get(
+                base, timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise RuntimeError(f"HTTP {resp.status}: {text[:200]}")
+                default_branch = (await resp.json()).get("default_branch", "main")
+            async with self.session.get(
+                f"{base}/git/ref/heads/{default_branch}",
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise RuntimeError(f"HTTP {resp.status}: {text[:200]}")
+                base_sha = (await resp.json())["object"]["sha"]
+            async with self.session.post(
+                f"{base}/git/refs",
+                json={"ref": f"refs/heads/{self.branch}", "sha": base_sha},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status not in (200, 201):
+                    text = await resp.text()
+                    raise RuntimeError(f"HTTP {resp.status}: {text[:200]}")
+            print(color(
+                f"[brain-sync] created dedicated runtime-state branch "
+                f"'{self.branch}' off '{default_branch}' (one-time setup).", YELLOW,
+            ))
+            self._branch_ready = True
+        except Exception as e:  # noqa: BLE001 - sync must never take the bot down
+            print(color(
+                f"[brain-sync] could not confirm/create branch '{self.branch}' "
+                f"(will still attempt uploads): {e}", YELLOW,
+            ))
+            self._branch_ready = False
+
     async def upload(self, data: bytes, message: str, path: Optional[str] = None) -> bool:
         p = path if path is not None else self.path
         if not self.enabled or self.session is None:
             return False
+        await self._ensure_branch()
         try:
             sha = self._last_sha.get(p)
             if sha is None:
