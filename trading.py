@@ -128,6 +128,9 @@ from config import (
     GITHUB_TRADES_LOG_CSV_PATH,
     GITHUB_STATS_CSV_PATH,
     GITHUB_TRADES_LOG_JSON_PATH,
+    TRADE_SYNC_CURSOR_PATH,
+    GITHUB_TRADE_SYNC_CURSOR_PATH,
+    TRADE_RECONCILE_BACKFILL_FROM_ID,
 )
 from indicators import clamp, safe_div, ema_series, round_step
 from exchange import BinanceApiError, RestClient, SymbolFilters
@@ -922,6 +925,27 @@ class TradeLogger:
             print(color(f"[trade-log] failed to read JSONL for stats: {e}", YELLOW))
         return records
 
+    def logged_binance_order_ids(self) -> set:
+        """Every Binance order id already represented in trades_log.jsonl
+        (populated via the `binance_order_ids` field written by both the
+        live fill path and the reconciliation safety net - see
+        MartingaleManager._on_close_filled / reconcile_trade_history_from_exchange).
+        Used purely for duplicate-prevention: if any fill belonging to a
+        candidate Binance trade lifecycle is already in this set, that
+        lifecycle is treated as already logged and skipped. Records logged
+        before this field existed simply contribute nothing here, which is
+        fine - they are not re-processed by reconciliation because it only
+        ever looks forward from a persisted trade-id cursor, never back
+        over old history it hasn't already been told to touch."""
+        ids: set = set()
+        for record in self.load_all():
+            for oid in record.get("binance_order_ids") or []:
+                try:
+                    ids.add(int(oid))
+                except (TypeError, ValueError):
+                    continue
+        return ids
+
 
 # ============================================================================
 # PERFORMANCE STATISTICS - computed continuously from the trade log and
@@ -1155,6 +1179,15 @@ class MartingaleManager:
         self._order_index: Dict[int, str] = {}
         self._rp_accum: Dict[int, float] = {}
 
+        # --- Trade-log reconciliation (Binance is the source of truth) ----
+        # In-memory high-water-mark of the highest Binance trade id ("t" on
+        # ORDER_TRADE_UPDATE) this process has itself seen live, plus the
+        # durable cursor loaded from disk/GitHub in load_trade_sync_cursor().
+        # Both exist purely to make reconcile_trade_history_from_exchange()
+        # idempotent - neither is read by any entry/exit/DCA/risk logic.
+        self._last_live_trade_id: int = 0
+        self._trade_sync_cursor: int = 0
+
     # -- Persistent Adaptive Learning: startup load / ongoing persistence ----
 
     async def load_or_init_brain(self) -> None:
@@ -1310,6 +1343,223 @@ class MartingaleManager:
 
     async def sync_performance_stats_to_github(self) -> None:
         await self._sync_csv_to_github(STATS_CSV_PATH, GITHUB_STATS_CSV_PATH, "performance_stats.csv")
+
+    # -- Trade-log reconciliation (Binance is the source of truth) -----------
+    # Root-cause fix for trades that go missing from trades_log.jsonl/csv:
+    # the ONLY path that ever wrote a trade record was a live fill event on
+    # the user-data websocket. Any close that happened while that stream
+    # was disconnected, or while the process wasn't running at all, was
+    # never seen and never logged - and initialize_sync()'s existing
+    # exchange-flat-but-local-still-open branch just reset local state
+    # without recording anything. This section closes that gap by treating
+    # Binance's own executed-trade history as the source of truth and
+    # reconciling it into the log, using a persisted per-account trade-id
+    # cursor so every fill is processed exactly once. It never touches
+    # PositionState, entry/exit/DCA/TP/SL decisions, Brain V2, the
+    # confidence engine, or the risk engine - it only appends rows to
+    # trades_log.jsonl/csv that would otherwise be missing.
+
+    async def load_trade_sync_cursor(self) -> None:
+        """Startup: restores the persisted 'last confirmed Binance trade id'
+        cursor from local disk, falling back to GitHub (same shared
+        github_sync session as brain.pkl / the CSV logs) - same
+        local-then-GitHub pattern as restore_csv_logs_from_github(). Leaves
+        the cursor at 0 ('unknown / first run') if neither is found;
+        reconcile_trade_history_from_exchange() treats that as a signal to
+        seed forward from *now* rather than guess at history."""
+        try:
+            if os.path.exists(TRADE_SYNC_CURSOR_PATH):
+                with open(TRADE_SYNC_CURSOR_PATH, "r", encoding="utf-8") as f:
+                    self._trade_sync_cursor = int(json.load(f).get("last_trade_id", 0) or 0)
+                    return
+        except Exception as e:  # noqa: BLE001 - corrupt/missing local file must not block startup
+            print(color(f"[reconcile] could not read local trade-sync cursor: {e}", YELLOW))
+        try:
+            data = await self.github_sync.download(path=GITHUB_TRADE_SYNC_CURSOR_PATH)
+            if data:
+                self._trade_sync_cursor = int(json.loads(data.decode("utf-8")).get("last_trade_id", 0) or 0)
+                print(color(
+                    f"[reconcile] restored trade-sync cursor from GitHub "
+                    f"(last_trade_id={self._trade_sync_cursor}).", MAGENTA,
+                ))
+        except Exception as e:  # noqa: BLE001 - restore must never block startup
+            print(color(f"[reconcile] could not check GitHub for trade-sync cursor: {e}", YELLOW))
+
+    async def _persist_trade_sync_cursor(self, trade_id: int, reason: str) -> None:
+        """Writes the cursor locally (atomic replace) and pushes it via the
+        same shared github_sync client used for brain.pkl / the CSV+JSONL
+        logs - no second GitHub client. Fail-soft: any error here just
+        means the next reconciliation pass re-checks a slightly wider
+        range next time, never a crash or a blocked trading loop."""
+        if trade_id <= self._trade_sync_cursor:
+            return
+        self._trade_sync_cursor = trade_id
+        payload = json.dumps({"last_trade_id": trade_id}).encode("utf-8")
+        try:
+            tmp_path = f"{TRADE_SYNC_CURSOR_PATH}.tmp"
+            with open(tmp_path, "wb") as f:
+                f.write(payload)
+            os.replace(tmp_path, TRADE_SYNC_CURSOR_PATH)
+        except Exception as e:  # noqa: BLE001
+            print(color(f"[reconcile] failed to write trade-sync cursor locally: {e}", YELLOW))
+        try:
+            await self.github_sync.upload(
+                payload, message=f"trade-sync cursor: {reason} (id={trade_id})",
+                path=GITHUB_TRADE_SYNC_CURSOR_PATH,
+            )
+        except Exception as e:  # noqa: BLE001 - belt-and-suspenders; upload() already catches internally
+            print(color(f"[reconcile] unexpected error pushing trade-sync cursor: {e}", RED))
+
+    async def reconcile_trade_history_from_exchange(self, context: str = "reconcile") -> None:
+        """Fetches executed fills for `self.symbol` from Binance starting
+        just after the persisted cursor (or the optional explicit backfill
+        id on true first run - see TRADE_RECONCILE_BACKFILL_FROM_ID),
+        reconstructs any flat->open->flat position lifecycle Binance
+        reports, and logs any such lifecycle that isn't already in
+        trades_log.jsonl (deduped by Binance order id via
+        TradeLogger.logged_binance_order_ids()). Safe to call frequently -
+        it is a no-op (single cheap REST call, empty result) once caught
+        up. Never raises; never touches PositionState or any strategy
+        state - purely a logging safety net."""
+        if DRY_RUN or self.client is None:
+            return
+
+        first_run = self._trade_sync_cursor <= 0 and self._last_live_trade_id <= 0
+        from_id: Optional[int] = None
+        if first_run and TRADE_RECONCILE_BACKFILL_FROM_ID:
+            try:
+                from_id = int(TRADE_RECONCILE_BACKFILL_FROM_ID)
+            except ValueError:
+                print(color(
+                    f"[reconcile:{context}] TRADE_RECONCILE_BACKFILL_FROM_ID="
+                    f"{TRADE_RECONCILE_BACKFILL_FROM_ID!r} is not a valid trade id - ignoring.", YELLOW,
+                ))
+        elif not first_run:
+            from_id = max(self._trade_sync_cursor, self._last_live_trade_id) + 1
+
+        try:
+            fills = await self.client.get_user_trades(self.symbol, from_id=from_id, limit=1000)
+        except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+            print(color(f"[reconcile:{context}] could not fetch Binance trade history "
+                        f"(continuing without it): {e}", YELLOW))
+            return
+        except Exception as e:  # noqa: BLE001 - reconciliation must never take the bot down
+            print(color(f"[reconcile:{context}] unexpected error fetching trade history: {e}", RED))
+            return
+
+        if not fills:
+            if first_run:
+                # No cursor anywhere and no explicit backfill id: seed the
+                # cursor at the current latest trade so future gaps (from
+                # now on) are caught, without guessing at old history.
+                try:
+                    latest = await self.client.get_user_trades(self.symbol, limit=1)
+                    if latest:
+                        await self._persist_trade_sync_cursor(
+                            int(latest[-1]["id"]), reason="seed cursor (no prior state found)"
+                        )
+                except Exception as e:  # noqa: BLE001
+                    print(color(f"[reconcile:{context}] could not seed initial cursor: {e}", YELLOW))
+            return
+
+        fills = sorted(fills, key=lambda t: int(t.get("id", 0)))
+        max_id_seen = max(int(t["id"]) for t in fills)
+
+        # Reconstruct each flat -> open -> flat position lifecycle from the
+        # running signed position size (BUY=+qty, SELL=-qty; this bot only
+        # ever runs in one-way mode - see close_position()/_place_step_order(),
+        # which always use plain BUY/SELL with no positionSide). A lifecycle
+        # still open at the end of the fetched window is the CURRENT live
+        # position and is skipped - it hasn't closed yet.
+        lifecycles: List[dict] = []
+        running = 0.0
+        current: Optional[dict] = None
+        eps = 1e-9
+        for t in fills:
+            signed_qty = float(t["qty"]) * (1.0 if t["side"] == "BUY" else -1.0)
+            was_flat = abs(running) < eps
+            running += signed_qty
+            if was_flat and abs(running) > eps:
+                current = {"open_side": "LONG" if running > 0 else "SHORT", "fills": [], "open_time": int(t["time"])}
+            if current is not None:
+                current["fills"].append(t)
+            if not was_flat and abs(running) < eps and current is not None:
+                current["close_time"] = int(t["time"])
+                lifecycles.append(current)
+                current = None
+
+        recorded = 0
+        if lifecycles:
+            try:
+                already_order_ids = self.trade_logger.logged_binance_order_ids()
+            except Exception as e:  # noqa: BLE001
+                print(color(f"[reconcile:{context}] failed to read existing trade log for dedup: {e}", YELLOW))
+                already_order_ids = set()
+
+            for lc in lifecycles:
+                order_ids = {int(t["orderId"]) for t in lc["fills"]}
+                if order_ids & already_order_ids:
+                    continue  # at least one fill already logged by the live path - skip, avoid a duplicate
+                entry_fills = [t for t in lc["fills"] if (t["side"] == "BUY") == (lc["open_side"] == "LONG")]
+                exit_fills = [t for t in lc["fills"] if t not in entry_fills]
+                if not exit_fills:
+                    continue  # defensive: running==0 implies a close happened, but be safe
+                entry_notional = sum(float(t["qty"]) * float(t["price"]) for t in entry_fills)
+                entry_qty = sum(float(t["qty"]) for t in entry_fills)
+                exit_qty = sum(float(t["qty"]) for t in exit_fills)
+                fees = sum(float(t.get("commission", 0.0)) for t in lc["fills"])
+                net_pnl = sum(float(t.get("realizedPnl", 0.0)) for t in lc["fills"])
+                avg_entry = safe_div(entry_notional, entry_qty, 0.0)
+                avg_exit = safe_div(sum(float(t["qty"]) * float(t["price"]) for t in exit_fills), exit_qty, 0.0)
+                close_dt = datetime.fromtimestamp(lc["close_time"] / 1000, tz=timezone.utc)
+
+                record = {
+                    "close_time": close_dt.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    "symbol": self.symbol,
+                    "side": lc["open_side"],
+                    "entry_price": avg_entry or None,
+                    "exit_price": avg_exit or None,
+                    "qty": exit_qty or entry_qty,
+                    "invested_notional": entry_notional,
+                    "gross_pnl_usdt": net_pnl + fees,
+                    "fees_usdt": fees,
+                    "net_pnl_usdt": net_pnl,
+                    "net_pnl_pct": safe_div(net_pnl, entry_notional, 0.0),
+                    "dca_count": max(len(entry_fills) - 1, 0),
+                    "holding_time_sec": max((lc["close_time"] - lc["open_time"]) / 1000.0, 0.0),
+                    "mfe_pct": None,
+                    "mae_pct": None,
+                    "exit_reason": "reconciled_from_exchange",
+                    "tp_hit": None,
+                    "smart_exit": None,
+                    "manual_exit": None,
+                    "hard_stop": None,
+                    "entry_regime": None,
+                    "exit_regime": None,
+                    "entry_confidence": None,
+                    "entry_risk_score": None,
+                    "entry_success_prob": None,
+                    "entry_tp_hit_prob": None,
+                    "reward": None,
+                    "final_outcome": "win" if net_pnl > 0 else "loss",
+                    "binance_order_ids": sorted(order_ids),
+                    "recovered": True,
+                }
+                self.trade_logger.log_trade(record)
+                recorded += 1
+
+        await self._persist_trade_sync_cursor(max_id_seen, reason=f"{context} (+{recorded} recovered)")
+
+        if recorded:
+            print(color(
+                f"{now_str()} [reconcile:{context}] recovered {recorded} trade(s) that Binance shows "
+                f"closed but were missing from local logs.", MAGENTA,
+            ))
+            asyncio.create_task(self.sync_trade_log_to_github())
+            try:
+                self.perf_stats.export()
+            except Exception as e:  # noqa: BLE001
+                print(color(f"[reconcile:{context}] failed to refresh performance stats after recovery: {e}", YELLOW))
 
     # -- sizing / fees -----------------------------------------------------------
 
@@ -1899,6 +2149,17 @@ class MartingaleManager:
         if rp:
             self._rp_accum[order_id] = self._rp_accum.get(order_id, 0.0) + rp
 
+        # Record-keeping only (not used by any entry/exit/DCA/risk decision):
+        # tracks the highest Binance trade id this process has itself
+        # observed live, so the reconciliation safety net below never
+        # re-fetches/re-logs a fill this process just handled.
+        trade_id = o.get("t")
+        if trade_id is not None:
+            try:
+                self._last_live_trade_id = max(self._last_live_trade_id, int(trade_id))
+            except (TypeError, ValueError):
+                pass
+
         status = o.get("X")
         if status != "FILLED":
             return
@@ -1913,7 +2174,7 @@ class MartingaleManager:
         elif role == "partial_close":
             await self._apply_partial_close(fill_qty, fill_price)
         elif role == "close":
-            await self._on_close_filled(fill_price, total_rp)
+            await self._on_close_filled(fill_price, total_rp, order_id=order_id)
 
     async def _on_entry_filled(self, role: str, fill_price: float, fill_qty: float) -> None:
         self.position.entries.append((fill_price, fill_qty))
@@ -1942,7 +2203,7 @@ class MartingaleManager:
             side_color,
         ))
 
-    async def _on_close_filled(self, fill_price: float, total_rp: float) -> None:
+    async def _on_close_filled(self, fill_price: float, total_rp: float, order_id: Optional[int] = None) -> None:
         p = self.position
         self.realized_pnl_total += total_rp
         self.trade_count += 1
@@ -2031,6 +2292,7 @@ class MartingaleManager:
             "entry_tp_hit_prob": p.entry_tp_hit_prob,
             "reward": reward,
             "final_outcome": "win" if was_success else "loss",
+            "binance_order_ids": [int(order_id)] if order_id is not None else [],
         }
         self.trade_logger.log_trade(record)
 
@@ -2038,6 +2300,10 @@ class MartingaleManager:
 
         asyncio.create_task(self.persist_brain(reason="trade closed"))
         asyncio.create_task(self.sync_trade_log_to_github())
+        if self._last_live_trade_id:
+            asyncio.create_task(self._persist_trade_sync_cursor(
+                self._last_live_trade_id, reason="live close"
+            ))
 
 
 # ============================================================================
@@ -2060,6 +2326,12 @@ async def initialize_sync(
     their dataclass defaults automatically via PositionState())."""
     if DRY_RUN:
         return  # nothing real to sync against
+
+    # Trade-log reliability safety net - see reconcile_trade_history_from_exchange()
+    # docstring. Runs on every startup / websocket-reconnect / periodic poll that
+    # already calls this function, so no new timer is introduced. Independent of
+    # the position-sync logic below: never touches PositionState.
+    await manager.reconcile_trade_history_from_exchange(context=context)
 
     if rows is None:
         try:
