@@ -171,6 +171,23 @@ GITHUB_TRADES_LOG_JSON_PATH = os.environ.get(
     "/".join(p for p in (_GITHUB_BRAIN_DIR, "trades_log.jsonl") if p),
 )
 
+# --- Trade-log reconciliation (Binance trade history is the source of
+# truth; recovers any closed trade the live websocket stream missed) -------
+TRADE_SYNC_CURSOR_PATH = os.environ.get("TRADE_SYNC_CURSOR_PATH", "trade_sync_cursor.json")
+GITHUB_TRADE_SYNC_CURSOR_PATH = os.environ.get(
+    "GITHUB_TRADE_SYNC_CURSOR_PATH",
+    "/".join(p for p in (_GITHUB_BRAIN_DIR, "trade_sync_cursor.json") if p),
+)
+# Only used the very FIRST time the bot ever runs with no cursor file found
+# locally or on GitHub. Left unset (None), the bot seeds the cursor at the
+# current latest Binance trade id and only auto-recovers gaps from that
+# point forward - it will NOT retroactively rewrite already-logged history.
+# Set this to a specific Binance trade id (an integer, as a string) to
+# explicitly opt in to a one-time historical backfill starting at that id;
+# recovered rows are tagged "recovered": true / exit_reason
+# "reconciled_from_exchange" so they're easy to identify and audit.
+TRADE_RECONCILE_BACKFILL_FROM_ID = os.environ.get("TRADE_RECONCILE_BACKFILL_FROM_ID", "") or None
+
 # --- Timing -------------------------------------------------------------------
 LISTEN_KEY_KEEPALIVE_SEC = 25 * 60
 BALANCE_REFRESH_SEC = 60
@@ -276,6 +293,9 @@ __all__ = [
     "GITHUB_TRADES_LOG_CSV_PATH",
     "GITHUB_STATS_CSV_PATH",
     "GITHUB_TRADES_LOG_JSON_PATH",
+    "TRADE_SYNC_CURSOR_PATH",
+    "GITHUB_TRADE_SYNC_CURSOR_PATH",
+    "TRADE_RECONCILE_BACKFILL_FROM_ID",
     "BRAIN_AUTO_PUSH_INTERVAL_SEC",
     "LISTEN_KEY_KEEPALIVE_SEC",
     "BALANCE_REFRESH_SEC",
