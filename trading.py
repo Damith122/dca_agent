@@ -726,6 +726,16 @@ class EntryEngineV2:
         if conf.trend_direction is None or conf.trend_confidence <= 0:
             return EntryDecision(False, None, 0.0, {})
 
+        # --- Regime gate (2026-07 profitability fix) ---------------------------
+        # SIDEWAYS/HIGH_VOL/LOW_VOL entries had no measurable directional edge
+        # and were a major source of losing trades. Only trending regimes -
+        # where there is an actual directional bias to align with - are
+        # allowed to open fresh entries. This is a hard block, not a score
+        # discount: a blocked regime can never reach should_enter=True
+        # regardless of how high the rest of the score comes in.
+        allowed_regimes = (REGIME_STRONG_TREND, REGIME_WEAK_TREND)
+        regime_blocked = regime.regime not in allowed_regimes
+
         volume_confirmation = clamp((volume_z + 2.0) / 4.0, 0.0, 1.0)  # z in [-2,2] -> [0,1]
 
         # Volatility fit: entries are best in LOW/normal-to-moderate vol and
@@ -774,7 +784,9 @@ class EntryEngineV2:
 
         if self._should_log():
             print(color(
-                f"{now_str()} [entry-debug] brain_confidence={components['brain_confidence']:.4f} "
+                f"{now_str()} [entry-debug] regime={regime.regime} "
+                f"regime_blocked={regime_blocked} "
+                f"brain_confidence={components['brain_confidence']:.4f} "
                 f"trend_confidence={components['trend_confidence']:.4f} "
                 f"volume_confirmation={components['volume_confirmation']:.4f} "
                 f"volatility_fit={components['volatility_fit']:.4f} "
@@ -785,7 +797,7 @@ class EntryEngineV2:
                 GRAY,
             ))
 
-        should_enter = score >= ENTRY_SCORE_THRESHOLD
+        should_enter = (not regime_blocked) and score >= ENTRY_SCORE_THRESHOLD
         return EntryDecision(should_enter, conf.trend_direction, score, components)
 
 
@@ -1182,6 +1194,7 @@ class MartingaleManager:
         self.realized_pnl_total = 0.0
         self.last_trade_action_ts: float = 0.0
         self.last_trade_open_ts: float = 0.0
+        self._last_warmup_skip_log_ts: float = 0.0  # throttles the pre-warmup "no entry" log line
 
         # --- Brain V2 stack -----------------------------------------------------
         self.candles = CandleAggregator()
@@ -1779,6 +1792,13 @@ class MartingaleManager:
             return "SHORT"
         return None
 
+    def _should_log_warmup_skip(self, interval_sec: float = 30.0) -> bool:
+        now = time.time()
+        if now - self._last_warmup_skip_log_ts >= interval_sec:
+            self._last_warmup_skip_log_ts = now
+            return True
+        return False
+
     # -- learning from ticks --------------------------------------------------------
 
     def _learn_from_tick(self, features: np.ndarray, atr_pct_now: float) -> None:
@@ -1830,9 +1850,21 @@ class MartingaleManager:
             if time.time() - self.last_trade_action_ts < TRADE_COOLDOWN_SEC:
                 return
             if not self.brain.is_ready():
-                signal = self._static_momentum_signal()
-                if signal is not None:
-                    await self._place_step_order(step=0, side_signal=signal, size_mult=1.0)
+                # (2026-07 profitability fix) The static tick-momentum
+                # fallback traded a deadband smaller than normal BTC
+                # bid/ask jitter and completely bypassed EntryEngineV2's
+                # score threshold and regime gate - it was a major source
+                # of low-quality, no-edge entries. No fresh trades are
+                # opened until Brain V2 has enough updates to be ready;
+                # DCA/exit management for any already-open position is
+                # untouched and continues to run normally below.
+                if self._should_log_warmup_skip():
+                    print(color(
+                        f"{now_str()} [entry-skip] brain not ready "
+                        f"(updates={self.brain.update_count}/{self.brain.warmup_updates}) - "
+                        f"fallback momentum entries disabled, no new trades opened",
+                        GRAY,
+                    ))
                 return
 
             volumes = [c.volume for c in candles]
