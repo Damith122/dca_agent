@@ -1590,6 +1590,25 @@ class MartingaleManager:
                     "recovered": True,
                 }
                 self.trade_logger.log_trade(record)
+                # DIAGNOSTIC (no effect on `record` or on what gets logged -
+                # this runs after log_trade() and only prints): for
+                # correlating against [fill-trace] lines from
+                # handle_order_update() above, to see whether a given
+                # order_id ever appeared there as untracked_order_id
+                # (never reached _on_close_filled()) versus never appearing
+                # there at all (missed entirely while the user-data
+                # websocket was disconnected/reconnecting - Binance does
+                # not replay missed stream messages, so that gap is
+                # expected and this reconciliation pass is the only way to
+                # ever recover it).
+                exit_trade_ids = sorted(int(t["id"]) for t in exit_fills if "id" in t)
+                print(color(
+                    f"{now_str()} [reconcile-trace] path=reconciliation({context}) "
+                    f"order_id={sorted(order_ids)} trade_id={exit_trade_ids} "
+                    f"close_time={record['close_time']} "
+                    f"reason=not_found_in_local_trade_log (never seen by _on_close_filled(); "
+                    f"recovered via REST /fapi/v1/userTrades)", MAGENTA,
+                ))
                 recorded += 1
 
         await self._persist_trade_sync_cursor(max_id_seen, reason=f"{context} (+{recorded} recovered)")
@@ -2186,7 +2205,34 @@ class MartingaleManager:
     async def handle_order_update(self, event: dict) -> None:
         o = event.get("o", {})
         order_id = o.get("i")
+        # --- diagnostics only (read-only peek, no state mutated here) ------
+        # Used only to log which path a FILLED event took; does not affect
+        # the original control flow below, which is unchanged.
+        _diag_status = o.get("X")
+        _diag_trade_id = o.get("t")
+        _diag_event_ms = o.get("T") or event.get("E")
+        _diag_close_time = (
+            trade_log_close_time_str(_diag_event_ms / 1000.0) if _diag_event_ms else trade_log_close_time_str()
+        )
+        # ---------------------------------------------------------------------
         if order_id not in self._order_index:
+            # DIAGNOSTIC (see class docstring note on fill-path tracing below):
+            # this is the exact point where a live fill can be silently lost -
+            # order_id isn't in this process's in-memory _order_index (never
+            # persisted across restarts), so a FILLED event that genuinely
+            # arrived over the connected user-data websocket still can't be
+            # routed to _on_close_filled(). Only reconcile_trade_history_from_
+            # exchange() will ever pick this fill up, on its next run. Logging
+            # only - the `return` below is unchanged.
+            if _diag_status == "FILLED":
+                print(color(
+                    f"{now_str()} [fill-trace] path=live_user_websocket order_id={order_id} "
+                    f"trade_id={_diag_trade_id} close_time={_diag_close_time} "
+                    f"reason=untracked_order_id (order_id not in local _order_index - not placed "
+                    f"by this process instance, e.g. a restart happened between order placement "
+                    f"and this fill; _on_close_filled() will NOT run for this fill, only "
+                    f"reconciliation will eventually recover it)", YELLOW,
+                ))
             return
 
         rp = float(o.get("rp") or 0.0)
@@ -2218,7 +2264,17 @@ class MartingaleManager:
         elif role == "partial_close":
             await self._apply_partial_close(fill_qty, fill_price)
         elif role == "close":
+            # DIAGNOSTIC: confirms this close IS being routed through the
+            # live path, for direct comparison against [fill-trace] lines
+            # from the untracked-order_id branch above and against
+            # [reconcile-trace] lines below.
+            print(color(
+                f"{now_str()} [fill-trace] path=live_user_websocket order_id={order_id} "
+                f"trade_id={trade_id} close_time={_diag_close_time} "
+                f"reason=matched_local_order_index (role=close) -> routing to _on_close_filled()", CYAN,
+            ))
             await self._on_close_filled(fill_price, total_rp, order_id=order_id)
+
 
     async def _on_entry_filled(self, role: str, fill_price: float, fill_qty: float) -> None:
         self.position.entries.append((fill_price, fill_qty))
