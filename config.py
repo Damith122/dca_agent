@@ -40,17 +40,17 @@ MARGIN_TYPE = "CROSSED"
 
 # --- Position sizing (Fixed Amount base, Martingale, now confidence-scaled) -
 INITIAL_ENTRY_USDT = 1.5
-DCA_MULTIPLIER = 2.0
-MAX_DCA_STEPS = 5
+DCA_MULTIPLIER = 1.6            # reduced from 2.0 (2026-07 profitability fix) - less notional/fee blowup per DCA rung
+MAX_DCA_STEPS = 3               # reduced from 5 (2026-07 profitability fix) - caps worst-case martingale depth
 
 # --- Trade management ---------------------------------------------------------
 DCA_TRIGGER_PCT = 0.002          # floor / fallback DCA spacing (also used if ATR unavailable)
-TAKE_PROFIT_PCT = 0.002          # base / floor TP - used as-is in quiet markets
-HARD_STOP_PCT = 0.05
+TAKE_PROFIT_PCT = 0.0035         # raised from 0.002 (2026-07 profitability fix) - clears round-trip fee floor with real margin
+HARD_STOP_PCT = 0.02            # tightened from 0.05 (2026-07 profitability fix) - fixes stop:TP risk/reward skew
 
 # --- Dynamic (volatility-based) Take Profit ----------------------------------
 DYNAMIC_TP_ENABLED = True
-TAKE_PROFIT_MAX_PCT = 0.006      # hard ceiling - TP will never expand past this
+TAKE_PROFIT_MAX_PCT = 0.010      # raised from 0.006 (2026-07 profitability fix) - lets winners run further in trend/high-vol
 TP_VOL_LOW = 0.0003              # tick-return std at/below this -> quiet -> base TP
 TP_VOL_HIGH = 0.0012             # tick-return std at/above this -> max TP expansion
 
@@ -101,7 +101,7 @@ RECENT_TRADE_WINDOW = 20
 TP_HIT_LOOKAHEAD_CANDLES = 8      # how far ahead we check "did price reach TP-ish move"
 
 # --- Entry Engine V2 ---------------------------------------------------------
-ENTRY_SCORE_THRESHOLD = float(os.environ.get("ENTRY_SCORE_THRESHOLD", "0.60"))
+ENTRY_SCORE_THRESHOLD = float(os.environ.get("ENTRY_SCORE_THRESHOLD", "0.75"))  # raised from 0.60 (2026-07 profitability fix)
 ENTRY_WEIGHTS = {
     "brain_confidence": 0.30,
     "trend_confidence": 0.20,
@@ -130,7 +130,7 @@ SIZE_MIN_MULT = float(os.environ.get("SIZE_MIN_MULT", "0.5"))
 SIZE_MAX_MULT = float(os.environ.get("SIZE_MAX_MULT", "1.5"))
 
 # --- Partial TP / breakeven / trailing stop -----------------------------------
-PARTIAL_TP_ENABLED = os.environ.get("PARTIAL_TP_ENABLED", "true").lower() != "false"
+PARTIAL_TP_ENABLED = os.environ.get("PARTIAL_TP_ENABLED", "false").lower() != "false"  # disabled by default (2026-07 profitability fix) - was truncating winners; trailing stop remains active
 PARTIAL_TP_FRACTION = float(os.environ.get("PARTIAL_TP_FRACTION", "0.5"))
 PARTIAL_TP_TRIGGER_RATIO = float(os.environ.get("PARTIAL_TP_TRIGGER_RATIO", "0.6"))  # of dynamic TP distance
 BREAKEVEN_AFTER_PARTIAL = os.environ.get("BREAKEVEN_AFTER_PARTIAL", "true").lower() != "false"
