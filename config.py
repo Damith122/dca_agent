@@ -136,6 +136,21 @@ PARTIAL_TP_TRIGGER_RATIO = float(os.environ.get("PARTIAL_TP_TRIGGER_RATIO", "0.6
 BREAKEVEN_AFTER_PARTIAL = os.environ.get("BREAKEVEN_AFTER_PARTIAL", "true").lower() != "false"
 TRAILING_STOP_ENABLED = os.environ.get("TRAILING_STOP_ENABLED", "true").lower() != "false"
 TRAILING_STOP_ATR_MULT = float(os.environ.get("TRAILING_STOP_ATR_MULT", "1.0"))
+# Floor on the ATR-based trailing distance (as a pct of price) so a very
+# quiet/low-ATR market never produces an ultra-tight trailing stop that gets
+# shaken out by normal tick noise. The trail distance used at runtime is
+# max(atr_pct * TRAILING_STOP_ATR_MULT, TRAILING_STOP_MIN_PCT) * price.
+TRAILING_STOP_MIN_PCT = float(os.environ.get("TRAILING_STOP_MIN_PCT", "0.0015"))
+
+# --- Profit-lock arm (independent of Partial TP) -----------------------------
+# A second, independent trigger for arming the fee-aware breakeven/trailing
+# protection introduced below - it does NOT require PARTIAL_TP_ENABLED or a
+# partial fill to have happened. Arms once favorable move reaches this
+# fraction of the current dynamic TP distance AND estimated net profit (after
+# fees) clears MIN_NET_PROFIT_USDT by PROFIT_LOCK_FEE_SAFETY_MULT, so it never
+# arms on a move that's barely covering the round-trip fee.
+PROFIT_LOCK_TP_RATIO = float(os.environ.get("PROFIT_LOCK_TP_RATIO", "0.5"))
+PROFIT_LOCK_FEE_SAFETY_MULT = float(os.environ.get("PROFIT_LOCK_FEE_SAFETY_MULT", "1.5"))
 
 # --- Trade logging / offline dataset / performance stats ---------------------
 TRADE_LOG_JSON_PATH = os.environ.get("TRADE_LOG_JSON_PATH", "trades_log.jsonl")
@@ -290,6 +305,9 @@ __all__ = [
     "BREAKEVEN_AFTER_PARTIAL",
     "TRAILING_STOP_ENABLED",
     "TRAILING_STOP_ATR_MULT",
+    "TRAILING_STOP_MIN_PCT",
+    "PROFIT_LOCK_TP_RATIO",
+    "PROFIT_LOCK_FEE_SAFETY_MULT",
     "TRADE_LOG_JSON_PATH",
     "TRADE_LOG_CSV_PATH",
     "STATS_JSON_PATH",
