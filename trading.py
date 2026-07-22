@@ -855,6 +855,23 @@ class RewardCalculator:
 # future offline retraining and for the Performance Stats module below.
 # ============================================================================
 
+
+def trade_log_close_time_str(ts: Optional[float] = None) -> str:
+    """Full UTC timestamp for the trades_log.csv / trades_log.jsonl
+    'close_time' field: "YYYY-MM-DD HH:MM:SS UTC". This is the one and
+    only place both the live-close path and
+    reconcile_trade_history_from_exchange() should build that field from,
+    so they always agree on format. Deliberately kept separate from
+    now_str() (short "HH:MM:SS", used only for console/log print prefixes
+    elsewhere in this file) - this keeps the fix scoped to trade-log
+    serialization and doesn't touch anything now_str() is used for.
+    `ts` is an optional Unix timestamp (as reconciliation already has, from
+    the exchange's trade history); omitted for the live-close path, which
+    means "now"."""
+    dt = datetime.fromtimestamp(ts, tz=timezone.utc) if ts is not None else datetime.now(timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
 TRADE_LOG_FIELDS = [
     "close_time", "symbol", "side", "entry_price", "exit_price", "qty",
     "invested_notional", "gross_pnl_usdt", "fees_usdt", "net_pnl_usdt",
@@ -2291,7 +2308,7 @@ class MartingaleManager:
 
         # --- permanent training dataset -------------------------------------------
         record = {
-            "close_time": now_str(),
+            "close_time": trade_log_close_time_str(),
             "symbol": self.symbol,
             "side": p.side,
             "entry_price": p.avg_entry_price,
