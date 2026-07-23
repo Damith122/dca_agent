@@ -54,6 +54,17 @@
       activate instead of racing it to close the trade first.
    3. SMART_EXIT_MIN_AGREE raised from 4 to 5 (see config.py) - now needs a
       stronger majority of the six independent signals to agree.
+
+ 2026-07 DCA state recovery fix: when initialize_sync() rebuilds
+ PositionState from Binance's reported position (i.e. local state didn't
+ match), dca_step is no longer hardcoded to 0. A new helper,
+ _recover_dca_step_from_exchange(), replays Binance's own executed-trade
+ history to reconstruct the still-open lifecycle and count prior DCA
+ fills. If that can't be determined with confidence, dca_step is set to
+ MAX_DCA_STEPS (fail-safe: blocks further DCA) rather than assumed to be
+ 0, which previously risked exceeding MAX_DCA_STEPS worth of real DCA
+ exposure after a restart. Scoped entirely to initialize_sync() - no
+ other logic touched.
 ================================================================================
 """
 
@@ -2501,6 +2512,56 @@ class MartingaleManager:
 # ============================================================================
 
 
+async def _recover_dca_step_from_exchange(
+    client: RestClient, symbol: str, side: str
+) -> Optional[int]:
+    """Best-effort recovery of dca_step for a position that is CURRENTLY
+    open on the exchange, by replaying Binance's own executed-trade
+    history (source of truth) and reconstructing the still-open lifecycle
+    from a flat->open crossing forward - same reconstruction technique as
+    reconcile_trade_history_from_exchange(), but looking for the OPEN
+    lifecycle instead of already-closed ones. Only fills on the position's
+    opening side (BUY for LONG, SELL for SHORT) count as entry/DCA steps;
+    opposite-side fills (e.g. partial TP) are excluded so they don't
+    inflate the count. Returns None - NEVER 0 - if the open lifecycle's
+    start isn't visible in the fetched window or the side doesn't match;
+    callers must fail safe rather than assume dca_step=0 in that case."""
+    try:
+        fills = await client.get_user_trades(symbol, limit=1000)
+    except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+        print(color(f"[sync] could not fetch trade history to recover dca_step: {e}", YELLOW))
+        return None
+    except Exception as e:  # noqa: BLE001 - recovery must never crash startup/sync
+        print(color(f"[sync] unexpected error recovering dca_step: {e}", RED))
+        return None
+
+    if not fills:
+        return None
+
+    fills = sorted(fills, key=lambda t: int(t.get("id", 0)))
+    running = 0.0
+    eps = 1e-9
+    current: Optional[dict] = None
+
+    for t in fills:
+        signed_qty = float(t["qty"]) * (1.0 if t["side"] == "BUY" else -1.0)
+        was_flat = abs(running) < eps
+        running += signed_qty
+        if was_flat and abs(running) > eps:
+            current = {"open_side": "LONG" if running > 0 else "SHORT", "entry_fills": 0}
+        if current is not None:
+            expected_entry_side = "BUY" if current["open_side"] == "LONG" else "SELL"
+            if t["side"] == expected_entry_side:
+                current["entry_fills"] += 1
+        if not was_flat and abs(running) < eps:
+            current = None  # this lifecycle closed within the window - reset for the next one
+
+    if current is None or current["open_side"] != side:
+        return None  # no open lifecycle visible in this window, or it disagrees with live state
+
+    return min(max(current["entry_fills"] - 1, 0), MAX_DCA_STEPS)
+
+
 async def initialize_sync(
     client: RestClient,
     manager: MartingaleManager,
@@ -2513,7 +2574,12 @@ async def initialize_sync(
     original design notes carried over from the previous build. Unchanged
     in behavior; only the PositionState fields being (re)built have grown
     (partial-TP/breakeven/trailing/entry-snapshot fields all reset to
-    their dataclass defaults automatically via PositionState())."""
+    their dataclass defaults automatically via PositionState()).
+
+    2026-07 DCA state recovery fix: dca_step is no longer hardcoded to 0
+    on a resync - see _recover_dca_step_from_exchange() above. If recovery
+    fails, dca_step is set to MAX_DCA_STEPS (fail-safe: blocks further DCA
+    on this position) instead of being assumed to be 0."""
     if DRY_RUN:
         return  # nothing real to sync against
 
@@ -2570,19 +2636,39 @@ async def initialize_sync(
     if already_synced:
         return
 
+    # Recover the true dca_step from Binance's own trade history rather
+    # than assuming 0 - see _recover_dca_step_from_exchange() docstring.
+    # A wrong "0" here would let the bot re-DCA past MAX_DCA_STEPS worth
+    # of real exposure after a restart, which is the exact bug being fixed.
+    recovered_dca_step = await _recover_dca_step_from_exchange(client, SYMBOL, side)
+    if recovered_dca_step is not None:
+        dca_step = recovered_dca_step
+        print(color(
+            f"{now_str()} [sync:{context}] recovered dca_step={dca_step} for the resynced "
+            f"{side} position from Binance trade history.", MAGENTA,
+        ))
+    else:
+        dca_step = MAX_DCA_STEPS
+        print(color(
+            f"{now_str()} [sync:{context}] could NOT recover dca_step from Binance trade "
+            f"history (insufficient/ambiguous history in window) - failing SAFE by setting "
+            f"dca_step={MAX_DCA_STEPS} (blocks further DCA on this position) rather than "
+            f"assuming 0. Review manually if the true DCA depth matters for your risk tolerance.",
+            RED,
+        ))
+
     print(color(
         f"{now_str()} [sync:{context}] *** RESYNCING TO MATCH EXCHANGE *** "
         f"exchange shows side={side} qty={qty} avg_entry={entry_price:.2f}; local state "
         f"was status={p.status} side={p.side} avg_entry={p.avg_entry_price}. Rebuilding "
         f"local state so take-profit / hard-stop / DCA logic resumes managing this trade "
-        f"(dca_step reset to 0 - the exact prior step count isn't recoverable from this "
-        f"endpoint; review manually if that matters for your risk tolerance).",
+        f"(dca_step recovered from exchange history where possible - see above).",
         YELLOW,
     ))
     manager.position = PositionState(
         side=side,
         status="OPEN",
-        dca_step=0,
+        dca_step=dca_step,
         entries=[(entry_price, qty)],
         avg_entry_price=entry_price,
         total_qty=qty,
