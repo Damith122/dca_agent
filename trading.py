@@ -40,6 +40,20 @@
  of dca2.py's now_str()/color()/color-constants (same reasoning as in
  brain.py/websocket.py/github_sync.py: avoids a circular import back to
  dca2.py for two tiny formatting helpers).
+
+ 2026-07 Smart Exit fix: three gating changes to Smart Exit V2 in
+ _manage_open_position(), scoped to that section only - no other logic
+ (Entry, Brain, TP, DCA sizing, Hard Stop) was touched:
+   1. Smart Exit is no longer evaluated at all until the position is at
+      least SMART_EXIT_MIN_LOSS_PCT (-0.10%) adverse - it previously could
+      fire even while still in profit as long as pct_move was above
+      -SMART_EXIT_MAX_LOSS_PCT.
+   2. If the current adverse move is already within
+      SMART_EXIT_DCA_PROXIMITY_RATIO (90%) of the ATR-adaptive DCA trigger
+      distance, Smart Exit is blocked outright so the DCA branch below can
+      activate instead of racing it to close the trade first.
+   3. SMART_EXIT_MIN_AGREE raised from 4 to 5 (see config.py) - now needs a
+      stronger majority of the six independent signals to agree.
 ================================================================================
 """
 
@@ -103,9 +117,11 @@ from config import (
     ENTRY_WEIGHTS,
     SMART_EXIT_ENABLED,
     SMART_EXIT_MAX_LOSS_PCT,
+    SMART_EXIT_MIN_LOSS_PCT,
     SMART_EXIT_MIN_AGREE,
     SMART_EXIT_CONFIDENCE_DROP,
     SMART_EXIT_ATR_MOVE_MULT,
+    SMART_EXIT_DCA_PROXIMITY_RATIO,
     DCA_ATR_MULTIPLIER,
     DCA_MIN_DISTANCE_PCT,
     DCA_MAX_DISTANCE_PCT,
@@ -2169,8 +2185,31 @@ class MartingaleManager:
                     )
                     return
 
+        # --- ATR-adaptive DCA distance (computed here so Smart Exit's
+        # proximity gate below can reference the same value the DCA branch
+        # further down uses) ---------------------------------------------------
+        dca_distance_pct = self.get_dynamic_dca_distance_pct()
+
         # --- Smart Exit V2: requires a MAJORITY of independent signals to agree -------
-        if SMART_EXIT_ENABLED and held_long_enough and pct_move > -SMART_EXIT_MAX_LOSS_PCT:
+        # 2026-07 Smart Exit fix (three gates, in order):
+        #   1. Never evaluated until the position is at least
+        #      SMART_EXIT_MIN_LOSS_PCT (-0.10%) adverse.
+        #   2. Blocked outright once the adverse move is already within
+        #      SMART_EXIT_DCA_PROXIMITY_RATIO (90%) of the DCA trigger
+        #      distance, so DCA gets to activate instead of racing Smart
+        #      Exit to close the trade first.
+        #   3. SMART_EXIT_MIN_AGREE raised to 5/6 (see config.py).
+        smart_exit_loss_gate = pct_move <= -SMART_EXIT_MIN_LOSS_PCT
+        smart_exit_near_dca = (
+            dca_distance_pct > 0
+            and (-pct_move) >= dca_distance_pct * SMART_EXIT_DCA_PROXIMITY_RATIO
+        )
+        if (
+            SMART_EXIT_ENABLED and held_long_enough
+            and smart_exit_loss_gate
+            and pct_move > -SMART_EXIT_MAX_LOSS_PCT
+            and not smart_exit_near_dca
+        ):
             signals = self._smart_exit_v2_signals(pct_move, dynamic_tp_pct)
             agree_count = sum(1 for v in signals.values() if v)
             if agree_count >= SMART_EXIT_MIN_AGREE:
@@ -2183,7 +2222,6 @@ class MartingaleManager:
                 return
 
         # --- ATR-adaptive DCA -----------------------------------------------------------
-        dca_distance_pct = self.get_dynamic_dca_distance_pct()
         if pct_move <= -dca_distance_pct:
             if p.dca_step >= MAX_DCA_STEPS:
                 await self.close_position(
