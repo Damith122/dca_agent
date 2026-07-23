@@ -1532,6 +1532,7 @@ class MartingaleManager:
 
         fills = sorted(fills, key=lambda t: int(t.get("id", 0)))
         max_id_seen = max(int(t["id"]) for t in fills)
+        cursor_cap = max_id_seen
 
         # Reconstruct each flat -> open -> flat position lifecycle from the
         # running signed position size (BUY=+qty, SELL=-qty; this bot only
@@ -1555,6 +1556,14 @@ class MartingaleManager:
                 current["close_time"] = int(t["time"])
                 lifecycles.append(current)
                 current = None
+
+        if current is not None:
+            # Position still open at the end of this fetch window: do not
+            # advance the cursor past its entry fill(s). Advancing here would
+            # mean the next reconciliation pass fetches only the eventual
+            # close fill with no matching entry, reconstructs it as an
+            # unclosed lifecycle, and silently drops it forever.
+            cursor_cap = min(int(t["id"]) for t in current["fills"]) - 1
 
         recorded = 0
         if lifecycles:
@@ -1635,7 +1644,7 @@ class MartingaleManager:
                 ))
                 recorded += 1
 
-        await self._persist_trade_sync_cursor(max_id_seen, reason=f"{context} (+{recorded} recovered)")
+        await self._persist_trade_sync_cursor(cursor_cap, reason=f"{context} (+{recorded} recovered)")
 
         if recorded:
             print(color(
