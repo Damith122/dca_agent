@@ -99,6 +99,7 @@ from config import (
     LABEL_HORIZON_TICKS,
     RECENT_TRADE_WINDOW,
     ENTRY_SCORE_THRESHOLD,
+    SIDEWAYS_ENTRY_SCORE_THRESHOLD,
     ENTRY_WEIGHTS,
     SMART_EXIT_ENABLED,
     SMART_EXIT_MAX_LOSS_PCT,
@@ -786,6 +787,12 @@ class EntryEngineV2:
             else:
                 score += weight * val
 
+        active_threshold = (
+            SIDEWAYS_ENTRY_SCORE_THRESHOLD
+            if regime.regime == REGIME_SIDEWAYS
+            else ENTRY_SCORE_THRESHOLD
+        )
+
         if self._should_log():
             print(color(
                 f"{now_str()} [entry-debug] regime={regime.regime} "
@@ -797,11 +804,11 @@ class EntryEngineV2:
                 f"momentum={components['momentum']:.4f} "
                 f"regime_fit={components['regime_fit']:.4f} "
                 f"risk_score={components['risk_score']:.4f} "
-                f"final_score={score:.4f} threshold={ENTRY_SCORE_THRESHOLD:.4f}",
+                f"final_score={score:.4f} threshold={active_threshold:.4f}",
                 GRAY,
             ))
 
-        should_enter = (not regime_blocked) and score >= ENTRY_SCORE_THRESHOLD
+        should_enter = (not regime_blocked) and score >= active_threshold
         return EntryDecision(should_enter, conf.trend_direction, score, components)
 
 
