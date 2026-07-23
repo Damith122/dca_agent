@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 ================================================================================
@@ -259,6 +258,37 @@ class GithubBrainSync:
                 async with self.session.put(
                     self._url(p), json=payload, timeout=aiohttp.ClientTimeout(total=20),
                 ) as resp:
+                    if resp.status == 409:
+                        # Stale sha - someone else (or a prior process) updated
+                        # this file since we last cached its sha. Refetch the
+                        # current sha and retry the PUT exactly once with it,
+                        # rather than failing the whole upload outright.
+                        print(color(
+                            f"[brain-sync] GitHub push for {p} got 409 (stale sha) - "
+                            f"refetching latest sha and retrying once.", YELLOW,
+                        ))
+                        async with self.session.get(
+                            self._url(p), params={"ref": self.branch},
+                            timeout=aiohttp.ClientTimeout(total=15),
+                        ) as sha_resp:
+                            if sha_resp.status == 200:
+                                fresh = await sha_resp.json()
+                                payload["sha"] = fresh.get("sha")
+                            else:
+                                payload.pop("sha", None)
+
+                        async with self.session.put(
+                            self._url(p), json=payload, timeout=aiohttp.ClientTimeout(total=20),
+                        ) as retry_resp:
+                            if retry_resp.status not in (200, 201):
+                                text = await retry_resp.text()
+                                raise RuntimeError(
+                                    f"HTTP {retry_resp.status} (after 409 retry): {text[:200]}"
+                                )
+                            result = await retry_resp.json()
+                            self._last_sha[p] = (result.get("content") or {}).get("sha")
+                            return True
+
                     if resp.status not in (200, 201):
                         text = await resp.text()
                         raise RuntimeError(f"HTTP {resp.status}: {text[:200]}")
