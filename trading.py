@@ -116,9 +116,6 @@ from config import (
     BREAKEVEN_AFTER_PARTIAL,
     TRAILING_STOP_ENABLED,
     TRAILING_STOP_ATR_MULT,
-    TRAILING_STOP_MIN_PCT,
-    PROFIT_LOCK_TP_RATIO,
-    PROFIT_LOCK_FEE_SAFETY_MULT,
     TRADE_LOG_JSON_PATH,
     TRADE_LOG_CSV_PATH,
     STATS_JSON_PATH,
@@ -736,7 +733,11 @@ class EntryEngineV2:
         # allowed to open fresh entries. This is a hard block, not a score
         # discount: a blocked regime can never reach should_enter=True
         # regardless of how high the rest of the score comes in.
-        allowed_regimes = (REGIME_STRONG_TREND, REGIME_WEAK_TREND)
+        allowed_regimes = (
+            REGIME_STRONG_TREND,
+            REGIME_WEAK_TREND,
+            REGIME_SIDEWAYS,
+        )
         regime_blocked = regime.regime not in allowed_regimes
 
         volume_confirmation = clamp((volume_z + 2.0) / 4.0, 0.0, 1.0)  # z in [-2,2] -> [0,1]
@@ -1161,14 +1162,11 @@ class PositionState:
 
     # -- partial TP / breakeven / trailing -------------------------------------
     partial_tp_done: bool = False
-    breakeven_armed: bool = False           # armed via Partial TP (BREAKEVEN_AFTER_PARTIAL)
-    breakeven_price: Optional[float] = None  # fee-aware breakeven price, set when breakeven_armed
+    breakeven_armed: bool = False
+    breakeven_price: Optional[float] = None
     trailing_stop_price: Optional[float] = None
     max_favorable_price: Optional[float] = None
     max_adverse_price: Optional[float] = None
-    # -- independent profit-lock (decoupled from Partial TP) -------------------
-    profit_lock_armed: bool = False
-    profit_lock_breakeven_price: Optional[float] = None
 
     # -- entry-time snapshot, for training / logging ---------------------------
     entry_features: Optional[np.ndarray] = None
@@ -1694,28 +1692,6 @@ class MartingaleManager:
         fees = self.estimate_round_trip_fee_usdt(use_qty, p.avg_entry_price, exit_price)
         return gross - fees
 
-    def fee_aware_breakeven_price(self) -> Optional[float]:
-        """The exit price at which closing the current position right now
-        would net ~$0 after estimated round-trip fees (entry-leg fee already
-        implied by avg_entry_price, exit-leg fee at the candidate price) -
-        NOT the raw average entry price, which ignores fees entirely and so
-        would still lock in a small net loss if used as a stop.
-
-        Solved in closed form from estimate_net_pnl_usdt's own formula
-        (gross - TAKER_FEE_RATE * (entry_notional + exit_notional) == 0),
-        which cancels qty out entirely, so this doesn't depend on qty:
-          LONG:  exit = avg * (1 + fee) / (1 - fee)
-          SHORT: exit = avg * (1 - fee) / (1 + fee)
-        Returns None if there's no average entry price to compute from."""
-        p = self.position
-        if not p.avg_entry_price:
-            return None
-        avg = p.avg_entry_price
-        fee = TAKER_FEE_RATE
-        if p.side == "LONG":
-            return avg * (1.0 + fee) / (1.0 - fee)
-        return avg * (1.0 - fee) / (1.0 + fee)
-
     # -- tick plumbing -----------------------------------------------------------
 
     def update_price_history(self, price: float) -> None:
@@ -2075,7 +2051,7 @@ class MartingaleManager:
         self.realized_pnl_total += pnl
         if BREAKEVEN_AFTER_PARTIAL:
             p.breakeven_armed = True
-            p.breakeven_price = self.fee_aware_breakeven_price()
+            p.breakeven_price = p.avg_entry_price
         print(color(
             f"{now_str()} PARTIAL TP FILLED @ {fill_price:.2f}  qty={qty}  "
             f"est_pnl={pnl:+.4f} USDT  remaining_qty={p.total_qty}  "
@@ -2109,6 +2085,22 @@ class MartingaleManager:
             )
             return
 
+        # Breakeven stop (armed only after a partial TP has been taken): if
+        # price falls back through the original average entry, close the
+        # remaining runner instead of letting a locked-in partial win turn
+        # into an overall loss.
+        if p.breakeven_armed and p.breakeven_price is not None:
+            breakeven_hit = (
+                (p.side == "LONG" and price <= p.breakeven_price)
+                or (p.side == "SHORT" and price >= p.breakeven_price)
+            )
+            if breakeven_hit:
+                await self.close_position(
+                    f"breakeven stop after partial TP: price {price:.2f} back through "
+                    f"entry {p.breakeven_price:.2f}", emergency=True, exit_reason_tag="breakeven",
+                )
+                return
+
         held_long_enough = (time.time() - p.opened_at) >= MIN_HOLD_SEC_BEFORE_EXIT
         dynamic_tp_pct = self.get_dynamic_take_profit_pct()
 
@@ -2137,65 +2129,26 @@ class MartingaleManager:
                 )
                 return
 
-        # --- Independent profit-lock arm (decoupled from Partial TP) -----------------
-        # Arms a fee-aware breakeven floor on its own once favorable move
-        # reaches PROFIT_LOCK_TP_RATIO of the current dynamic TP AND the
-        # estimated net profit clears fees with a safety margin - does not
-        # require PARTIAL_TP_ENABLED or a partial fill. This is what lets
-        # trailing/breakeven protection activate even when Partial TP is off.
-        if not p.profit_lock_armed and held_long_enough and dynamic_tp_pct > 0:
-            if pct_move >= dynamic_tp_pct * PROFIT_LOCK_TP_RATIO:
-                net_pnl_now = self.estimate_net_pnl_usdt(price)
-                if net_pnl_now >= MIN_NET_PROFIT_USDT * PROFIT_LOCK_FEE_SAFETY_MULT:
-                    p.profit_lock_armed = True
-                    p.profit_lock_breakeven_price = self.fee_aware_breakeven_price()
-                    print(color(
-                        f"{now_str()} [profit-lock] armed @ {price:.2f}  pct_move={pct_move*100:.2f}% "
-                        f"(>= {PROFIT_LOCK_TP_RATIO*100:.0f}% of dynamic TP {dynamic_tp_pct*100:.3f}%)  "
-                        f"est_net_pnl=${net_pnl_now:+.4f}  fee_aware_breakeven="
-                        f"{p.profit_lock_breakeven_price:.2f}", GREEN,
-                    ))
-
-        # --- Merged fee-aware breakeven + ATR trailing stop -------------------------
-        # Either lock - the Partial-TP breakeven (p.breakeven_armed) or the
-        # independent profit-lock above (p.profit_lock_armed) - activates this
-        # block; trailing no longer depends on Partial TP being enabled. The
-        # ATR trailing distance is unchanged (atr_pct * TRAILING_STOP_ATR_MULT)
-        # except it's now floored by TRAILING_STOP_MIN_PCT so a near-zero ATR
-        # reading can't produce an ultra-tight trail that gets shaken out by
-        # ordinary tick noise. Whichever of {breakeven price(s), trailing
-        # price} is currently more protective (closer to locking in profit)
-        # is used as the single effective stop.
-        if p.breakeven_armed or p.profit_lock_armed:
-            if TRAILING_STOP_ENABLED and held_long_enough and self.last_regime.atr_pct > 0:
-                raw_trail_distance = price * self.last_regime.atr_pct * TRAILING_STOP_ATR_MULT
-                min_trail_distance = price * TRAILING_STOP_MIN_PCT
-                trail_distance = max(raw_trail_distance, min_trail_distance)
-                if p.side == "LONG":
-                    candidate = (p.max_favorable_price or price) - trail_distance
-                    p.trailing_stop_price = candidate if p.trailing_stop_price is None else max(p.trailing_stop_price, candidate)
-                else:
-                    candidate = (p.max_favorable_price or price) + trail_distance
-                    p.trailing_stop_price = candidate if p.trailing_stop_price is None else min(p.trailing_stop_price, candidate)
-
-            stop_candidates = [bp for bp in (p.breakeven_price, p.profit_lock_breakeven_price) if bp is not None]
-            if p.trailing_stop_price is not None:
-                stop_candidates.append(p.trailing_stop_price)
-
-            if stop_candidates and held_long_enough:
-                if p.side == "LONG":
-                    effective_stop = max(stop_candidates)
-                    triggered = price <= effective_stop
-                else:
-                    effective_stop = min(stop_candidates)
-                    triggered = price >= effective_stop
-                if triggered and pct_move > 0:
+        # --- Trailing stop on the runner (after partial TP armed breakeven) ----------
+        if TRAILING_STOP_ENABLED and p.breakeven_armed and held_long_enough and self.last_regime.atr_pct > 0:
+            trail_distance = price * self.last_regime.atr_pct * TRAILING_STOP_ATR_MULT
+            if p.side == "LONG":
+                candidate = (p.max_favorable_price or price) - trail_distance
+                p.trailing_stop_price = candidate if p.trailing_stop_price is None else max(p.trailing_stop_price, candidate)
+                if price <= p.trailing_stop_price and pct_move > 0:
                     await self.close_position(
-                        f"profit-lock stop: price {price:.2f} "
-                        f"{'<=' if p.side == 'LONG' else '>='} effective stop {effective_stop:.2f} "
-                        f"(breakeven_candidates={[f'{c:.2f}' for c in stop_candidates if c != p.trailing_stop_price]}, "
-                        f"trailing={p.trailing_stop_price if p.trailing_stop_price is None else f'{p.trailing_stop_price:.2f}'}, "
-                        f"{pct_move*100:.2f}% still favorable)",
+                        f"trailing stop: price {price:.2f} <= trail {p.trailing_stop_price:.2f} "
+                        f"(ATR-based, {pct_move*100:.2f}% still favorable)",
+                        exit_reason_tag="trailing_stop",
+                    )
+                    return
+            else:
+                candidate = (p.max_favorable_price or price) + trail_distance
+                p.trailing_stop_price = candidate if p.trailing_stop_price is None else min(p.trailing_stop_price, candidate)
+                if price >= p.trailing_stop_price and pct_move > 0:
+                    await self.close_position(
+                        f"trailing stop: price {price:.2f} >= trail {p.trailing_stop_price:.2f} "
+                        f"(ATR-based, {pct_move*100:.2f}% still favorable)",
                         exit_reason_tag="trailing_stop",
                     )
                     return
