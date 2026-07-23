@@ -116,10 +116,12 @@ ENTRY_WEIGHTS = {
 # --- Smart Exit V2 ------------------------------------------------------------
 SMART_EXIT_ENABLED = os.environ.get("SMART_EXIT_ENABLED", "true").lower() != "false"
 SMART_EXIT_MAX_LOSS_PCT = 0.01
+SMART_EXIT_MIN_LOSS_PCT = 0.0010   # Smart Exit gate: position must already be at least -0.10% adverse before Smart Exit is evaluated at all (2026-07 Smart Exit fix)
 SMART_EXIT_CONFIRM_TICKS = 5
-SMART_EXIT_MIN_AGREE = 4          # of the following 6 signals, how many must agree to exit
+SMART_EXIT_MIN_AGREE = 5          # of the following 6 signals, how many must agree to exit (raised from 4 - 2026-07 Smart Exit fix)
 SMART_EXIT_CONFIDENCE_DROP = 0.18  # confidence_score drop vs entry that counts as "dropped"
 SMART_EXIT_ATR_MOVE_MULT = 0.8     # adverse move >= this * ATR% counts as a signal
+SMART_EXIT_DCA_PROXIMITY_RATIO = 0.9  # if the adverse move is already >= this fraction of the current DCA trigger distance, Smart Exit is blocked so DCA can activate instead (2026-07 Smart Exit fix)
 
 # --- ATR-based Dynamic DCA ----------------------------------------------------
 DCA_ATR_MULTIPLIER = float(os.environ.get("DCA_ATR_MULTIPLIER", "1.2"))
@@ -277,10 +279,12 @@ __all__ = [
     "ENTRY_WEIGHTS",
     "SMART_EXIT_ENABLED",
     "SMART_EXIT_MAX_LOSS_PCT",
+    "SMART_EXIT_MIN_LOSS_PCT",
     "SMART_EXIT_CONFIRM_TICKS",
     "SMART_EXIT_MIN_AGREE",
     "SMART_EXIT_CONFIDENCE_DROP",
     "SMART_EXIT_ATR_MOVE_MULT",
+    "SMART_EXIT_DCA_PROXIMITY_RATIO",
     "DCA_ATR_MULTIPLIER",
     "DCA_MIN_DISTANCE_PCT",
     "DCA_MAX_DISTANCE_PCT",
