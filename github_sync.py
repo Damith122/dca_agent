@@ -90,18 +90,18 @@ class GithubBrainSync:
         # Checked/created at most once per process, not once per file.
         self._branch_ready: Optional[bool] = None
         # One asyncio.Lock per remote path (keyed the same way as
-        # _last_sha). Multiple fire-and-forget sync tasks can legitimately
-        # be in flight at once (e.g. a trade close and the periodic
-        # reconciliation pass both calling upload() around the same time)
-        # - without this, two concurrent uploads to the SAME path both read
-        # the same cached sha before either PUT lands, so the second PUT is
-        # rejected by GitHub with 409 (stale sha) even though nothing was
-        # actually wrong with the data. The lock serializes read-sha ->
-        # PUT -> cache-update per path, so the second call always sees the
-        # sha the first call just wrote. Uploads to DIFFERENT paths (e.g.
-        # brain.pkl vs trades_log.csv) are unaffected and still run
-        # concurrently.
+        # _last_sha). Kept for backward compatibility; no longer used to
+        # gate upload() itself (see _upload_lock below), since a per-path
+        # lock alone doesn't prevent two DIFFERENT files racing for the
+        # same branch HEAD.
         self._path_locks: dict = {}
+        # Single global lock: ALL uploads to this branch must be fully
+        # serialized, not just per-path - the Contents API commits each
+        # PUT against the branch's current HEAD, so two concurrent PUTs
+        # to DIFFERENT files (e.g. brain.pkl + trades_log.csv) on the same
+        # branch can still race for that HEAD and 409, even with correct
+        # per-file shas. A per-path lock alone can't prevent that.
+        self._upload_lock = asyncio.Lock()
 
     async def start(self) -> None:
         if not self.enabled:
@@ -225,17 +225,17 @@ class GithubBrainSync:
         if not self.enabled or self.session is None:
             return False
         await self._ensure_branch()
-        # Serialize the whole read-sha -> PUT -> cache-update sequence per
-        # path. Callers (e.g. a trade close and the periodic reconciliation
-        # pass) can both fire an upload() for the same path around the same
-        # time via asyncio.create_task(); without this lock both would read
-        # the same cached sha and the second PUT would be rejected by
-        # GitHub with 409 once the first PUT lands. The lock guarantees the
-        # second call only proceeds after the first has finished and
-        # refreshed self._last_sha[p], so it always PUTs with the current
-        # sha. Different paths use different locks and are never blocked by
-        # each other.
-        async with self._lock_for(p):
+        # Serialize the whole read-sha -> PUT -> cache-update sequence
+        # across ALL paths on this branch (not just the same path).
+        # Callers (e.g. a trade close, periodic reconciliation, and the
+        # brain-sync loop) can all fire upload() around the same time via
+        # asyncio.create_task(); without a single global lock, concurrent
+        # PUTs to DIFFERENT files still race for the branch's HEAD commit
+        # and GitHub rejects the loser with 409, even with a correct
+        # per-file sha. Serializing every upload here trades a little
+        # throughput for correctness - fine given upload() is already
+        # best-effort/fire-and-forget everywhere it's called.
+        async with self._upload_lock:
             try:
                 sha = self._last_sha.get(p)
                 if sha is None:
