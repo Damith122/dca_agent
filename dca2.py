@@ -113,7 +113,7 @@ import time
 import traceback
 import urllib.parse
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import Deque, Dict, List, Optional, Tuple
@@ -206,6 +206,8 @@ from config import (
     GITHUB_REPO,
     GITHUB_BRAIN_PATH,
     GITHUB_BRANCH,
+    DCA_STATE_PATH,
+    GITHUB_DCA_STATE_PATH,
     BRAIN_AUTO_PUSH_INTERVAL_SEC,
     LISTEN_KEY_KEEPALIVE_SEC,
     BALANCE_REFRESH_SEC,
@@ -354,6 +356,71 @@ from trading import (
 from websocket import market_data_consumer, userdata_consumer, listen_key_keepalive
 import websocket as _websocket_module
 _websocket_module.initialize_sync = initialize_sync
+
+
+# ============================================================================
+# PERSISTENT DCA STATE RECOVERY
+# ============================================================================
+# Startup-only helper: restores a persisted DCA/position state snapshot
+# (local disk first, then GitHub via the SAME shared github_sync client
+# already used for brain.pkl / the CSV logs / the trade-sync cursor - see
+# DCA_STATE_PATH / GITHUB_DCA_STATE_PATH in config.py) so an in-progress
+# DCA position isn't silently forgotten across an ephemeral restart before
+# initialize_sync() ever runs its own exchange-vs-local reconciliation.
+#
+# This does NOT change any trading/DCA/entry/exit logic - it only rebuilds
+# manager.position from whatever was last persisted (if anything), the same
+# way manager.position already starts as a fresh PositionState() by
+# default. initialize_sync() (unchanged, in trading.py) still runs
+# immediately afterward and is still the sole authority that reconciles
+# this rebuilt local state against what Binance actually reports.
+# Fails soft everywhere - any missing/corrupt/incompatible snapshot simply
+# leaves manager.position as its current (flat) default.
+
+
+async def load_dca_state(manager: MartingaleManager) -> None:
+    if DRY_RUN:
+        return  # nothing real to recover DRY_RUN state against
+
+    data: Optional[dict] = None
+    try:
+        if os.path.exists(DCA_STATE_PATH):
+            with open(DCA_STATE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+    except Exception as e:  # noqa: BLE001 - corrupt/missing local file must not block startup
+        print(color(f"[dca-state] could not read local {DCA_STATE_PATH}: {e}", YELLOW))
+        data = None
+
+    if data is None:
+        try:
+            raw = await manager.github_sync.download(path=GITHUB_DCA_STATE_PATH)
+            if raw:
+                data = json.loads(raw.decode("utf-8"))
+        except Exception as e:  # noqa: BLE001 - restore must never block startup
+            print(color(f"[dca-state] could not check GitHub for DCA state: {e}", YELLOW))
+            data = None
+
+    if not data:
+        print(color(
+            "[dca-state] no local or remote DCA state snapshot found - starting flat.", GRAY
+        ))
+        return
+
+    try:
+        valid_fields = {f.name for f in fields(PositionState)}
+        # entry_features is an Optional[np.ndarray] on PositionState - not
+        # something this JSON-based snapshot format carries; leave it at
+        # its dataclass default (None) rather than guessing a reconstruction.
+        kwargs = {k: v for k, v in data.items() if k in valid_fields and k != "entry_features"}
+        if isinstance(kwargs.get("entries"), list):
+            kwargs["entries"] = [tuple(e) for e in kwargs["entries"]]
+        manager.position = PositionState(**kwargs)
+        print(color(
+            f"[dca-state] restored DCA state snapshot (status={manager.position.status}, "
+            f"side={manager.position.side}, dca_step={manager.position.dca_step}).", MAGENTA,
+        ))
+    except Exception as e:  # noqa: BLE001 - corrupted/incompatible snapshot must not crash startup
+        print(color(f"[dca-state] failed to apply DCA state snapshot ({e}), starting flat.", YELLOW))
 
 
 async def balance_refresher(client: RestClient, manager: MartingaleManager) -> None:
@@ -616,6 +683,13 @@ async def main() -> None:
         # restart resumes catching up on Binance trade history from where
         # it left off instead of re-scanning (or missing) anything.
         await manager.load_trade_sync_cursor()
+        # Restores a persisted DCA/position state snapshot (local disk, then
+        # GitHub - see DCA_STATE_PATH / GITHUB_DCA_STATE_PATH) so an
+        # in-progress DCA position survives an ephemeral restart instead of
+        # starting flat. MUST run before initialize_sync() below, so that
+        # initialize_sync()'s own exchange-vs-local reconciliation (unchanged)
+        # has this rebuilt local state to compare against.
+        await load_dca_state(manager)
 
         await initialize_sync(client, manager, context="startup")
 
