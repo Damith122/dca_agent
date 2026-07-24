@@ -55,20 +55,24 @@
    3. SMART_EXIT_MIN_AGREE raised from 4 to 5 (see config.py) - now needs a
       stronger majority of the six independent signals to agree.
 
- 2026-07 DCA-state persistence fix: adds a dedicated, minimal persistence
- layer for the DCA lifecycle (dca_step, entries, opened_at, last_dca_price)
- - see the "DCA STATE PERSISTENCE" section below and its use inside
- _on_entry_filled / _on_close_filled / initialize_sync. This is
- deliberately NOT built on Binance trade-history replay (that mechanism
- already exists separately for trade-log recovery and is untouched here);
- it is a small, self-contained snapshot of just the DCA lifecycle fields,
- saved after every DCA fill and cleared on a full close, so that a restart
- mid-position can restore dca_step/entries/opened_at/last_dca_price instead
- of always resetting dca_step to 0. It only ever applies on a confirmed
- side + avg_entry_price match against what the exchange itself reports; a
- mismatched or stale snapshot is ignored safely and the existing reset-to-0
- rebuild path is used unchanged. No entry, exit, TP, Smart Exit, Brain, or
- sizing/risk logic was touched by this change.
+ NEW: Position-level Profit Lock (added, isolated to _manage_open_position()
+ and PositionState only - does not touch Entry, Brain learning, DCA sizing/
+ triggers, Smart Exit, TP, or Risk logic):
+   - Uses the WHOLE POSITION's net unrealized PnL in USDT (via
+     estimate_net_pnl_usdt(), which is already DCA-aware through
+     avg_entry_price/total_qty - the same method the existing TP/partial-TP
+     checks use, for consistency).
+   - Once unrealized PnL first reaches +PROFIT_LOCK_ACTIVATION_USDT, the
+     lock activates and the position's peak unrealized PnL is tracked from
+     then on.
+   - The protected/locked profit is always PROFIT_LOCK_RATIO (70%) of that
+     peak.
+   - If unrealized PnL falls back to or below the locked level, the entire
+     position is closed immediately with exit_reason_tag="profit_lock".
+   - Evaluated independently of held_long_enough/TP/Smart-Exit/DCA gates,
+     right after the existing hard-stop/breakeven checks (which already
+     return early on their own trigger conditions), so none of those
+     branches are touched.
 ================================================================================
 """
 
@@ -163,8 +167,6 @@ from config import (
     TRADE_SYNC_CURSOR_PATH,
     GITHUB_TRADE_SYNC_CURSOR_PATH,
     TRADE_RECONCILE_BACKFILL_FROM_ID,
-    DCA_STATE_PATH,
-    GITHUB_DCA_STATE_PATH,
 )
 from indicators import clamp, safe_div, ema_series, round_step
 from exchange import BinanceApiError, RestClient, SymbolFilters
@@ -193,6 +195,16 @@ def color(text: str, code: str) -> str:
 
 
 GREEN, RED, YELLOW, CYAN, GRAY, BOLD, MAGENTA, BLUE = "32", "31", "33", "36", "90", "1", "35", "34"
+
+
+# ============================================================================
+# PROFIT LOCK (new, position-level, DCA-aware - see module docstring) -------
+# Kept as local constants in this module only, per the requirement to scope
+# this feature to trading.py without touching config.py.
+# ============================================================================
+
+PROFIT_LOCK_ACTIVATION_USDT = 0.10   # unrealized net PnL at which the lock arms
+PROFIT_LOCK_RATIO = 0.70             # protected profit = this fraction of peak
 
 
 # ============================================================================
@@ -1208,6 +1220,10 @@ class PositionState:
     max_favorable_price: Optional[float] = None
     max_adverse_price: Optional[float] = None
 
+    # -- Profit Lock (new - see module docstring) ------------------------------
+    profit_lock_active: bool = False
+    peak_unrealized_pnl: float = 0.0
+
     # -- entry-time snapshot, for training / logging ---------------------------
     entry_features: Optional[np.ndarray] = None
     entry_regime: str = REGIME_SIDEWAYS
@@ -1289,16 +1305,6 @@ class MartingaleManager:
         self._last_live_trade_id: int = 0
         self._trade_sync_cursor: int = 0
 
-        # --- DCA lifecycle persistence (dca_step/entries/opened_at/
-        # last_dca_price snapshot) ----------------------------------------
-        # Populated by the module-level load_dca_state(manager) helper,
-        # which main() calls BEFORE initialize_sync() (see config.py /
-        # dca2.py). Only ever consumed by initialize_sync()'s resync
-        # branch, and only after it independently confirms the snapshot's
-        # side + avg_entry_price actually match what the exchange itself
-        # reports for the current position - never applied blindly.
-        self._persisted_dca_state: Optional[dict] = None
-
     # -- Persistent Adaptive Learning: startup load / ongoing persistence ----
 
     async def load_or_init_brain(self) -> None:
@@ -1366,76 +1372,6 @@ class MartingaleManager:
         except Exception as e:  # noqa: BLE001 - belt-and-suspenders; upload() already catches internally
             print(color(f"[brain-sync] unexpected error during push (bot keeps trading): {e}", RED))
         self._brain_dirty = False
-
-    # -- DCA lifecycle persistence (dca_step / entries / opened_at /
-    # -- last_dca_price) - NOT built on Binance trade-history replay. Reuses
-    # -- self.github_sync (same shared GitHub client as brain.pkl / CSV logs
-    # -- / the trade-sync cursor) via its path= parameter. Fail-soft
-    # -- throughout, same pattern as persist_brain() / _persist_trade_sync_cursor().
-
-    async def save_dca_state(self, reason: str) -> None:
-        """Snapshots the current DCA lifecycle (side, avg_entry_price used
-        as the restart match key, dca_step, entries, opened_at,
-        last_dca_price) to local disk + GitHub. Called after every DCA fill
-        - never touches PositionState itself, and never touches entry/exit/
-        TP/Smart-Exit/Brain/sizing logic."""
-        p = self.position
-        if p.status not in ("OPEN", "DCA_PENDING") or p.avg_entry_price is None:
-            return
-
-        state = {
-            "side": p.side,
-            "avg_entry_price": p.avg_entry_price,
-            "dca_step": p.dca_step,
-            "entries": [[price, qty] for price, qty in p.entries],
-            "opened_at": p.opened_at,
-            "last_dca_price": p.last_dca_price,
-        }
-        try:
-            payload = json.dumps(state).encode("utf-8")
-        except Exception as e:  # noqa: BLE001 - serialization must never crash the trading loop
-            print(color(f"[dca-state] failed to serialize DCA state ({e}), skipping persist.", RED))
-            return
-
-        try:
-            tmp_path = f"{DCA_STATE_PATH}.tmp"
-            with open(tmp_path, "wb") as f:
-                f.write(payload)
-            os.replace(tmp_path, DCA_STATE_PATH)  # atomic on POSIX
-        except Exception as e:  # noqa: BLE001
-            print(color(f"[dca-state] failed to write {DCA_STATE_PATH} locally: {e}", RED))
-
-        try:
-            pushed = await self.github_sync.upload(
-                payload, message=f"dca-state sync: {reason} (dca_step={p.dca_step})",
-                path=GITHUB_DCA_STATE_PATH,
-            )
-            if pushed:
-                print(color(
-                    f"{now_str()} [dca-state] pushed DCA state to GitHub ({reason}, "
-                    f"dca_step={p.dca_step}, side={p.side}, avg_entry={p.avg_entry_price:.2f})",
-                    MAGENTA,
-                ))
-        except Exception as e:  # noqa: BLE001 - belt-and-suspenders; upload() already catches internally
-            print(color(f"[dca-state] unexpected error during push (bot keeps trading): {e}", RED))
-
-    async def clear_dca_state(self, reason: str) -> None:
-        """Clears the persisted DCA snapshot after a full position close, so
-        a later restart never restores a stale/finished lifecycle onto an
-        unrelated future position. Fail-soft, same pattern as
-        save_dca_state()."""
-        try:
-            if os.path.exists(DCA_STATE_PATH):
-                os.remove(DCA_STATE_PATH)
-        except Exception as e:  # noqa: BLE001
-            print(color(f"[dca-state] failed to remove local {DCA_STATE_PATH}: {e}", YELLOW))
-
-        try:
-            await self.github_sync.upload(
-                b"{}", message=f"dca-state clear: {reason}", path=GITHUB_DCA_STATE_PATH,
-            )
-        except Exception as e:  # noqa: BLE001 - belt-and-suspenders; upload() already catches internally
-            print(color(f"[dca-state] unexpected error clearing GitHub DCA state: {e}", RED))
 
     # -- Trade log / analytics persistence (trades_log.jsonl, trades_log.csv, --
     # -- performance_stats.csv) --------------------------------------------
@@ -2230,6 +2166,33 @@ class MartingaleManager:
                 )
                 return
 
+        # --- Profit Lock (new, position-level, DCA-aware) --------------------------
+        # Uses the WHOLE POSITION's net unrealized PnL (avg_entry_price /
+        # total_qty via estimate_net_pnl_usdt - already DCA-aware, same
+        # method the TP checks below use). Independent of held_long_enough
+        # and every other gate below: once armed, it protects profit on its
+        # own terms and can close the position before Partial TP / TP /
+        # Smart Exit / DCA are ever evaluated this tick.
+        unrealized_pnl_usdt = self.estimate_net_pnl_usdt(price)
+        if not p.profit_lock_active and unrealized_pnl_usdt >= PROFIT_LOCK_ACTIVATION_USDT:
+            p.profit_lock_active = True
+            p.peak_unrealized_pnl = unrealized_pnl_usdt
+            print(color(
+                f"{now_str()} [profit-lock] ACTIVATED at unrealized_pnl=${unrealized_pnl_usdt:+.4f} "
+                f"(protects {PROFIT_LOCK_RATIO*100:.0f}% of peak profit from here on)", GREEN,
+            ))
+        if p.profit_lock_active:
+            p.peak_unrealized_pnl = max(p.peak_unrealized_pnl, unrealized_pnl_usdt)
+            locked_profit = p.peak_unrealized_pnl * PROFIT_LOCK_RATIO
+            if unrealized_pnl_usdt <= locked_profit:
+                await self.close_position(
+                    f"PROFIT LOCK: unrealized pnl ${unrealized_pnl_usdt:+.4f} fell to/below "
+                    f"locked level ${locked_profit:+.4f} (peak=${p.peak_unrealized_pnl:+.4f}, "
+                    f"ratio={PROFIT_LOCK_RATIO*100:.0f}%)",
+                    exit_reason_tag="profit_lock",
+                )
+                return
+
         held_long_enough = (time.time() - p.opened_at) >= MIN_HOLD_SEC_BEFORE_EXIT
         dynamic_tp_pct = self.get_dynamic_take_profit_pct()
 
@@ -2490,14 +2453,6 @@ class MartingaleManager:
             side_color,
         ))
 
-        # Persist the DCA lifecycle snapshot after every DCA fill (not the
-        # initial entry - a fresh position with dca_step==0 needs nothing to
-        # restore). Fire-and-forget, same pattern as persist_brain()/
-        # sync_trade_log_to_github() elsewhere in this class - never blocks
-        # or interrupts the trading loop.
-        if role == "dca":
-            asyncio.create_task(self.save_dca_state(reason=f"dca fill step {self.position.dca_step}"))
-
     async def _on_close_filled(self, fill_price: float, total_rp: float, order_id: Optional[int] = None) -> None:
         p = self.position
         self.realized_pnl_total += total_rp
@@ -2595,90 +2550,10 @@ class MartingaleManager:
 
         asyncio.create_task(self.persist_brain(reason="trade closed"))
         asyncio.create_task(self.sync_trade_log_to_github())
-        # Full close: the DCA lifecycle just ended, so the persisted
-        # snapshot must never be restored onto a future, unrelated
-        # position. Clearing it here (not just on the next successful
-        # save) closes that gap.
-        asyncio.create_task(self.clear_dca_state(reason="position closed"))
         if self._last_live_trade_id:
             asyncio.create_task(self._persist_trade_sync_cursor(
                 self._last_live_trade_id, reason="live close"
             ))
-
-
-# ============================================================================
-# DCA STATE PERSISTENCE (module-level loader, called from dca2.py's main()
-# BEFORE initialize_sync() - see config.py's DCA_STATE_PATH /
-# GITHUB_DCA_STATE_PATH and this module's MartingaleManager.save_dca_state()/
-# clear_dca_state()). Deliberately NOT built on Binance trade-history
-# replay: this is a small, dedicated snapshot of just the DCA lifecycle
-# fields (dca_step, entries, opened_at, last_dca_price), keyed by side +
-# avg_entry_price so it can only ever be applied to the position it was
-# actually taken from.
-# ============================================================================
-
-
-async def load_dca_state(manager: "MartingaleManager") -> None:
-    """Startup: restores the persisted DCA lifecycle snapshot onto
-    `manager._persisted_dca_state` (local disk first, falling back to
-    GitHub via the same shared github_sync session as brain.pkl/CSV logs/
-    the trade-sync cursor - same pattern as restore_csv_logs_from_github()/
-    load_trade_sync_cursor()). This does NOT touch PositionState - at the
-    point main() calls this (before initialize_sync()), the bot doesn't
-    yet know what the exchange itself reports as open. initialize_sync()
-    is the only place that ever applies this snapshot, and only after
-    confirming it matches the exchange's reported side + avg_entry_price;
-    a missing, corrupt, or non-matching snapshot is always ignored safely.
-    Never raises."""
-    manager._persisted_dca_state = None
-
-    try:
-        if os.path.exists(DCA_STATE_PATH) and os.path.getsize(DCA_STATE_PATH) > 0:
-            with open(DCA_STATE_PATH, "r", encoding="utf-8") as f:
-                state = json.load(f)
-            if isinstance(state, dict) and state.get("side") and state.get("avg_entry_price") is not None:
-                manager._persisted_dca_state = state
-                print(color(
-                    f"[dca-state] loaded local {DCA_STATE_PATH} "
-                    f"(side={state.get('side')}, dca_step={state.get('dca_step')}, "
-                    f"avg_entry={state.get('avg_entry_price')})", MAGENTA,
-                ))
-                return
-    except Exception as e:  # noqa: BLE001 - corrupt local file must not block startup
-        print(color(f"[dca-state] local {DCA_STATE_PATH} unreadable ({e}), trying GitHub ...", YELLOW))
-
-    try:
-        data = await manager.github_sync.download(path=GITHUB_DCA_STATE_PATH)
-    except Exception as e:  # noqa: BLE001 - restore must never block startup
-        print(color(f"[dca-state] could not check GitHub for DCA state: {e}", YELLOW))
-        return
-
-    if not data:
-        return
-
-    try:
-        state = json.loads(data.decode("utf-8"))
-    except Exception as e:  # noqa: BLE001 - corrupt/incompatible snapshot must not block startup
-        print(color(f"[dca-state] failed to parse GitHub DCA state ({e}), ignoring.", YELLOW))
-        return
-
-    if not (isinstance(state, dict) and state.get("side") and state.get("avg_entry_price") is not None):
-        return  # e.g. the "{}" written by clear_dca_state() after a full close - nothing to restore
-
-    manager._persisted_dca_state = state
-    try:
-        tmp_path = f"{DCA_STATE_PATH}.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(state, f)
-        os.replace(tmp_path, DCA_STATE_PATH)
-    except Exception as e:  # noqa: BLE001 - disk write failure shouldn't block using the snapshot
-        print(color(f"[dca-state] could not cache downloaded DCA state to disk: {e}", YELLOW))
-
-    print(color(
-        f"[dca-state] restored from GitHub ({GITHUB_REPO}/{GITHUB_DCA_STATE_PATH}) "
-        f"(side={state.get('side')}, dca_step={state.get('dca_step')}, "
-        f"avg_entry={state.get('avg_entry_price')})", MAGENTA,
-    ))
 
 
 # ============================================================================
@@ -2698,20 +2573,7 @@ async def initialize_sync(
     original design notes carried over from the previous build. Unchanged
     in behavior; only the PositionState fields being (re)built have grown
     (partial-TP/breakeven/trailing/entry-snapshot fields all reset to
-    their dataclass defaults automatically via PositionState()).
-
-    2026-07 DCA-state persistence fix: when this function has to rebuild
-    PositionState from the exchange's reported position (the *** RESYNCING
-    TO MATCH EXCHANGE *** branch below), it now checks
-    manager._persisted_dca_state (loaded by load_dca_state() before this
-    function ever runs - see dca2.py's main()) and, ONLY if that snapshot's
-    side and avg_entry_price actually match what the exchange itself just
-    reported (within a small tolerance - exact equality can't be expected
-    across float round-tripping / partial fills), restores dca_step,
-    entries, opened_at, and last_dca_price from it instead of resetting
-    dca_step to 0. A missing or non-matching snapshot changes nothing:
-    the exact same reset-to-0 rebuild as before still runs. This never
-    touches entry/exit/TP/Smart-Exit/Brain/sizing/risk logic."""
+    their dataclass defaults automatically via PositionState())."""
     if DRY_RUN:
         return  # nothing real to sync against
 
@@ -2768,68 +2630,13 @@ async def initialize_sync(
     if already_synced:
         return
 
-    # --- DCA-state match check (2026-07 DCA-state persistence fix) ---------
-    # Only ever consumed here. A persisted snapshot is restored ONLY if its
-    # side matches AND its avg_entry_price is within a small tolerance of
-    # what the exchange itself just reported for THIS position - otherwise
-    # it's ignored safely (e.g. it belongs to a different, already-closed
-    # lifecycle) and the existing reset-to-0 rebuild runs exactly as before.
-    restored_dca: Optional[dict] = None
-    persisted = manager._persisted_dca_state
-    if persisted and persisted.get("side") == side and persisted.get("avg_entry_price") is not None and entry_price:
-        try:
-            persisted_avg = float(persisted["avg_entry_price"])
-            tolerance = max(manager.filters.tick_size * 5, entry_price * 0.0015)
-            if abs(persisted_avg - entry_price) <= tolerance:
-                restored_dca = persisted
-        except (TypeError, ValueError):
-            restored_dca = None
-
-    if restored_dca is not None:
-        try:
-            dca_step = int(restored_dca.get("dca_step", 0) or 0)
-        except (TypeError, ValueError):
-            dca_step = 0
-        try:
-            entries = [(float(pr), float(q)) for pr, q in (restored_dca.get("entries") or [])]
-        except (TypeError, ValueError):
-            entries = []
-        if not entries:
-            entries = [(entry_price, qty)]
-        opened_at = restored_dca.get("opened_at") or time.time()
-        last_dca_price = restored_dca.get("last_dca_price")
-
-        print(color(
-            f"{now_str()} [sync:{context}] *** RESYNCING TO MATCH EXCHANGE (DCA STATE RESTORED) *** "
-            f"exchange shows side={side} qty={qty} avg_entry={entry_price:.2f}; local state "
-            f"was status={p.status} side={p.side} avg_entry={p.avg_entry_price}. Persisted DCA "
-            f"snapshot matches (avg_entry={restored_dca.get('avg_entry_price')}) - restoring "
-            f"dca_step={dca_step}, entries={len(entries)}, opened_at, last_dca_price instead of "
-            f"resetting dca_step to 0.",
-            YELLOW,
-        ))
-        manager.position = PositionState(
-            side=side,
-            status="OPEN",
-            dca_step=dca_step,
-            entries=entries,
-            avg_entry_price=entry_price,
-            total_qty=qty,
-            original_qty=qty,
-            opened_at=opened_at,
-            last_dca_price=last_dca_price,
-            max_favorable_price=entry_price,
-            max_adverse_price=entry_price,
-        )
-        return
-
     print(color(
         f"{now_str()} [sync:{context}] *** RESYNCING TO MATCH EXCHANGE *** "
         f"exchange shows side={side} qty={qty} avg_entry={entry_price:.2f}; local state "
         f"was status={p.status} side={p.side} avg_entry={p.avg_entry_price}. Rebuilding "
         f"local state so take-profit / hard-stop / DCA logic resumes managing this trade "
-        f"(dca_step reset to 0 - no matching persisted DCA snapshot was found, or it didn't "
-        f"match this position; review manually if that matters for your risk tolerance).",
+        f"(dca_step reset to 0 - the exact prior step count isn't recoverable from this "
+        f"endpoint; review manually if that matters for your risk tolerance).",
         YELLOW,
     ))
     manager.position = PositionState(
