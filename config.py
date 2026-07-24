@@ -202,6 +202,13 @@ GITHUB_TRADE_SYNC_CURSOR_PATH = os.environ.get(
 # "reconciled_from_exchange" so they're easy to identify and audit.
 TRADE_RECONCILE_BACKFILL_FROM_ID = os.environ.get("TRADE_RECONCILE_BACKFILL_FROM_ID", "") or None
 
+# --- Persistent DCA state ------------------------------------------------------
+DCA_STATE_PATH = os.environ.get("DCA_STATE_PATH", "dca_state.json")
+GITHUB_DCA_STATE_PATH = os.environ.get(
+    "GITHUB_DCA_STATE_PATH",
+    "/".join(p for p in (_GITHUB_BRAIN_DIR, "dca_state.json") if p),
+)
+
 # --- Timing -------------------------------------------------------------------
 LISTEN_KEY_KEEPALIVE_SEC = 25 * 60
 BALANCE_REFRESH_SEC = 60
@@ -313,6 +320,8 @@ __all__ = [
     "TRADE_SYNC_CURSOR_PATH",
     "GITHUB_TRADE_SYNC_CURSOR_PATH",
     "TRADE_RECONCILE_BACKFILL_FROM_ID",
+    "DCA_STATE_PATH",
+    "GITHUB_DCA_STATE_PATH",
     "BRAIN_AUTO_PUSH_INTERVAL_SEC",
     "LISTEN_KEY_KEEPALIVE_SEC",
     "BALANCE_REFRESH_SEC",
