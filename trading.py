@@ -204,7 +204,7 @@ GREEN, RED, YELLOW, CYAN, GRAY, BOLD, MAGENTA, BLUE = "32", "31", "33", "36", "9
 # ============================================================================
 
 PROFIT_LOCK_ACTIVATION_USDT = 0.10   # unrealized net PnL at which the lock arms
-PROFIT_LOCK_RATIO = 0.70             # protected profit = this fraction of peak
+PROFIT_LOCK_RATIO = 0.50             # protected profit = this fraction of peak
 
 
 # ============================================================================
@@ -2174,24 +2174,33 @@ class MartingaleManager:
         # own terms and can close the position before Partial TP / TP /
         # Smart Exit / DCA are ever evaluated this tick.
         unrealized_pnl_usdt = self.estimate_net_pnl_usdt(price)
-        if not p.profit_lock_active and unrealized_pnl_usdt >= PROFIT_LOCK_ACTIVATION_USDT:
-            p.profit_lock_active = True
-            p.peak_unrealized_pnl = unrealized_pnl_usdt
-            print(color(
-                f"{now_str()} [profit-lock] ACTIVATED at unrealized_pnl=${unrealized_pnl_usdt:+.4f} "
-                f"(protects {PROFIT_LOCK_RATIO*100:.0f}% of peak profit from here on)", GREEN,
-            ))
-        if p.profit_lock_active:
-            p.peak_unrealized_pnl = max(p.peak_unrealized_pnl, unrealized_pnl_usdt)
-            locked_profit = p.peak_unrealized_pnl * PROFIT_LOCK_RATIO
-            if unrealized_pnl_usdt <= locked_profit:
-                await self.close_position(
-                    f"PROFIT LOCK: unrealized pnl ${unrealized_pnl_usdt:+.4f} fell to/below "
-                    f"locked level ${locked_profit:+.4f} (peak=${p.peak_unrealized_pnl:+.4f}, "
-                    f"ratio={PROFIT_LOCK_RATIO*100:.0f}%)",
-                    exit_reason_tag="profit_lock",
-                )
-                return
+        # Hard safety guard (root cause of the previous bug: once armed, the
+        # lock kept comparing against a stale/positive peak even after PnL
+        # dropped to/below zero, which could in theory close a trade that
+        # is no longer profitable at all). A losing or breakeven position
+        # must NEVER be touched by Profit Lock - skip entirely, every tick,
+        # regardless of activation state or any previously tracked peak.
+        if unrealized_pnl_usdt <= 0:
+            pass
+        else:
+            if not p.profit_lock_active and unrealized_pnl_usdt >= PROFIT_LOCK_ACTIVATION_USDT:
+                p.profit_lock_active = True
+                p.peak_unrealized_pnl = unrealized_pnl_usdt
+                print(color(
+                    f"{now_str()} [profit-lock] ACTIVATED at unrealized_pnl=${unrealized_pnl_usdt:+.4f} "
+                    f"(protects {PROFIT_LOCK_RATIO*100:.0f}% of peak profit from here on)", GREEN,
+                ))
+            if p.profit_lock_active:
+                p.peak_unrealized_pnl = max(p.peak_unrealized_pnl, unrealized_pnl_usdt)
+                locked_profit = p.peak_unrealized_pnl * PROFIT_LOCK_RATIO
+                if unrealized_pnl_usdt <= locked_profit:
+                    await self.close_position(
+                        f"PROFIT LOCK: unrealized pnl ${unrealized_pnl_usdt:+.4f} fell to/below "
+                        f"locked level ${locked_profit:+.4f} (peak=${p.peak_unrealized_pnl:+.4f}, "
+                        f"ratio={PROFIT_LOCK_RATIO*100:.0f}%)",
+                        exit_reason_tag="profit_lock",
+                    )
+                    return
 
         held_long_enough = (time.time() - p.opened_at) >= MIN_HOLD_SEC_BEFORE_EXIT
         dynamic_tp_pct = self.get_dynamic_take_profit_pct()
