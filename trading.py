@@ -2171,7 +2171,12 @@ class MartingaleManager:
         if self.position.status not in ("OPEN", "DCA_PENDING") or self.position.total_qty <= 0:
             return
         close_side = "SELL" if self.position.side == "LONG" else "BUY"
-        qty = self.position.total_qty
+        # Normalize to the exchange's stepSize before sending - total_qty can
+        # accumulate float imprecision (e.g. 0.0048000000000000004) across
+        # multiple entry/DCA fills, which Binance rejects with -1111
+        # "Precision is over the maximum defined for this asset." Same
+        # round_step() helper already used for entry/DCA order quantities.
+        qty = round_step(self.position.total_qty, self.filters.step_size)
         label = "EMERGENCY CLOSE" if emergency else "CLOSE (full)"
         print(color(
             f"{now_str()} {label}: {reason} | closing {close_side} {qty} {self.symbol}",
