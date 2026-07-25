@@ -73,6 +73,22 @@
      right after the existing hard-stop/breakeven checks (which already
      return early on their own trigger conditions), so none of those
      branches are touched.
+
+ 2026-07 Profit Lock resync fix (isolated to initialize_sync() only - no
+ other logic touched): profit_lock_active / peak_unrealized_pnl live on
+ PositionState, which initialize_sync() rebuilds from scratch on a
+ websocket reconnect/resync whenever local state doesn't already match
+ what the exchange reports. That rebuild was unconditionally dropping any
+ already-armed Profit Lock state for a trade that was simply continuing
+ across the reconnect. initialize_sync() now captures the OLD position's
+ profit_lock_active/peak_unrealized_pnl immediately before the rebuild and
+ carries them into the new PositionState - but ONLY when the old local
+ state was itself OPEN on the SAME side the exchange now reports (i.e. the
+ same trade continuing, not a stale/closed trade being replaced by an
+ unrelated new position). Any other prior status/side is treated as "no
+ prior lock state to carry forward", exactly as before this fix. Profit
+ Lock's own activation/ratio/close logic in _manage_open_position() is
+ completely unchanged.
 ================================================================================
 """
 
@@ -2582,7 +2598,10 @@ async def initialize_sync(
     original design notes carried over from the previous build. Unchanged
     in behavior; only the PositionState fields being (re)built have grown
     (partial-TP/breakeven/trailing/entry-snapshot fields all reset to
-    their dataclass defaults automatically via PositionState())."""
+    their dataclass defaults automatically via PositionState()) - EXCEPT
+    profit_lock_active/peak_unrealized_pnl, which are now explicitly
+    carried forward on a matching same-side OPEN resync (see 2026-07
+    Profit Lock resync fix in the module docstring)."""
     if DRY_RUN:
         return  # nothing real to sync against
 
@@ -2639,6 +2658,17 @@ async def initialize_sync(
     if already_synced:
         return
 
+    # Preserve Profit Lock state across this resync - ONLY if the local
+    # state being replaced was itself an OPEN position on the SAME side as
+    # what the exchange now reports (i.e. this is the same trade continuing
+    # through a reconnect/resync, not a stale/closed trade being replaced by
+    # an unrelated new position). Any other case (FLAT, ENTERING, opposite
+    # side, etc.) is treated as "no prior lock state to carry forward" and
+    # the rebuilt position starts with Profit Lock inactive, exactly as
+    # PositionState()'s own defaults already specify.
+    preserved_profit_lock_active = p.status == "OPEN" and p.side == side and p.profit_lock_active
+    preserved_peak_unrealized_pnl = p.peak_unrealized_pnl if preserved_profit_lock_active else 0.0
+
     print(color(
         f"{now_str()} [sync:{context}] *** RESYNCING TO MATCH EXCHANGE *** "
         f"exchange shows side={side} qty={qty} avg_entry={entry_price:.2f}; local state "
@@ -2659,4 +2689,11 @@ async def initialize_sync(
         opened_at=time.time(),
         max_favorable_price=entry_price,
         max_adverse_price=entry_price,
+        profit_lock_active=preserved_profit_lock_active,
+        peak_unrealized_pnl=preserved_peak_unrealized_pnl,
     )
+    if preserved_profit_lock_active:
+        print(color(
+            f"{now_str()} [sync:{context}] [profit-lock] preserved across resync "
+            f"(peak_unrealized_pnl=${preserved_peak_unrealized_pnl:+.4f})", MAGENTA,
+        ))
