@@ -183,6 +183,7 @@ from config import (
     TRADE_SYNC_CURSOR_PATH,
     GITHUB_TRADE_SYNC_CURSOR_PATH,
     TRADE_RECONCILE_BACKFILL_FROM_ID,
+    DCA_STATE_PATH,
 )
 from indicators import clamp, safe_div, ema_series, round_step
 from exchange import BinanceApiError, RestClient, SymbolFilters
@@ -1389,6 +1390,55 @@ class MartingaleManager:
             print(color(f"[brain-sync] unexpected error during push (bot keeps trading): {e}", RED))
         self._brain_dirty = False
 
+    # -- DCA state persistence (side/qty/avg_entry_price/dca_step/last_dca_price/
+    # profit_lock_active/peak_unrealized_pnl) - local-disk snapshot only,
+    # written after every entry fill (initial + each DCA add) and deleted once
+    # a position fully closes. Consumed by initialize_sync() to restore
+    # dca_step/last_dca_price/profit_lock_active/peak_unrealized_pnl across a
+    # reconnect/restart, but ONLY when the snapshot's side/qty/avg_entry_price
+    # still match what the exchange itself is reporting - see initialize_sync()
+    # below. Deliberately does not touch any Entry/TP/DCA/Smart-Exit/Brain/Risk
+    # decision logic; this is purely a state-recovery snapshot.
+
+    def _dca_state_snapshot(self) -> dict:
+        p = self.position
+        return {
+            "side": p.side,
+            "qty": p.total_qty,
+            "avg_entry_price": p.avg_entry_price,
+            "dca_step": p.dca_step,
+            "last_dca_price": p.last_dca_price,
+            "profit_lock_active": p.profit_lock_active,
+            "peak_unrealized_pnl": p.peak_unrealized_pnl,
+        }
+
+    async def save_dca_state(self, reason: str) -> None:
+        try:
+            payload = json.dumps(self._dca_state_snapshot()).encode("utf-8")
+            tmp_path = f"{DCA_STATE_PATH}.tmp"
+            with open(tmp_path, "wb") as f:
+                f.write(payload)
+            os.replace(tmp_path, DCA_STATE_PATH)  # atomic on POSIX - never a half-written file
+        except Exception as e:  # noqa: BLE001 - snapshot persistence must never crash the trading loop
+            print(color(f"[dca-state] failed to save snapshot ({reason}): {e}", YELLOW))
+
+    async def load_dca_state_snapshot(self) -> Optional[dict]:
+        try:
+            if os.path.exists(DCA_STATE_PATH):
+                with open(DCA_STATE_PATH, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception as e:  # noqa: BLE001 - corrupt/missing snapshot must not block sync
+            print(color(f"[dca-state] failed to read snapshot: {e}", YELLOW))
+        return None
+
+    async def delete_dca_state(self, reason: str) -> None:
+        try:
+            if os.path.exists(DCA_STATE_PATH):
+                os.remove(DCA_STATE_PATH)
+                print(color(f"[dca-state] snapshot deleted ({reason}).", GRAY))
+        except Exception as e:  # noqa: BLE001 - deletion failure must never crash the trading loop
+            print(color(f"[dca-state] failed to delete snapshot: {e}", YELLOW))
+
     # -- Trade log / analytics persistence (trades_log.jsonl, trades_log.csv, --
     # -- performance_stats.csv) --------------------------------------------
     # Reuses self.github_sync (same GitHub client/session/token/repo/branch
@@ -2478,6 +2528,8 @@ class MartingaleManager:
             side_color,
         ))
 
+        asyncio.create_task(self.save_dca_state(reason=f"{step_label} filled"))
+
     async def _on_close_filled(self, fill_price: float, total_rp: float, order_id: Optional[int] = None) -> None:
         p = self.position
         self.realized_pnl_total += total_rp
@@ -2575,6 +2627,7 @@ class MartingaleManager:
 
         asyncio.create_task(self.persist_brain(reason="trade closed"))
         asyncio.create_task(self.sync_trade_log_to_github())
+        asyncio.create_task(self.delete_dca_state(reason="trade closed"))
         if self._last_live_trade_id:
             asyncio.create_task(self._persist_trade_sync_cursor(
                 self._last_live_trade_id, reason="live close"
@@ -2665,23 +2718,64 @@ async def initialize_sync(
     # an unrelated new position). Any other case (FLAT, ENTERING, opposite
     # side, etc.) is treated as "no prior lock state to carry forward" and
     # the rebuilt position starts with Profit Lock inactive, exactly as
-    # PositionState()'s own defaults already specify.
+    # PositionState()'s own defaults already specify. This covers a resync
+    # WITHIN the same running process (in-memory p is still populated).
     preserved_profit_lock_active = p.status == "OPEN" and p.side == side and p.profit_lock_active
     preserved_peak_unrealized_pnl = p.peak_unrealized_pnl if preserved_profit_lock_active else 0.0
+
+    # DCA state snapshot restore - covers the case the in-memory preservation
+    # above cannot (a full process restart, where `p` above is already a
+    # fresh/default PositionState with nothing to preserve). Validated
+    # strictly against what the exchange is reporting RIGHT NOW: side, qty,
+    # and avg_entry_price must all match (small tolerance) or the snapshot is
+    # treated as stale/unrelated and ignored entirely - only dca_step,
+    # last_dca_price, profit_lock_active, and peak_unrealized_pnl are ever
+    # taken from it; nothing else about position sizing/entries is touched.
+    restored_dca_step = 0
+    restored_last_dca_price: Optional[float] = None
+    snapshot_restored = False
+    snapshot = await manager.load_dca_state_snapshot()
+    if snapshot is not None:
+        snap_side = snapshot.get("side")
+        snap_qty = snapshot.get("qty")
+        snap_avg_entry = snapshot.get("avg_entry_price")
+        qty_tol = max(manager.filters.step_size, 1e-9) * 2
+        qty_ok = snap_qty is not None and abs(float(snap_qty) - qty) <= qty_tol
+        price_ok = (
+            snap_avg_entry is not None and entry_price > 0
+            and abs(float(snap_avg_entry) - entry_price) / entry_price < 0.001
+        )
+        if snap_side == side and qty_ok and price_ok:
+            restored_dca_step = int(snapshot.get("dca_step", 0) or 0)
+            restored_last_dca_price = snapshot.get("last_dca_price")
+            preserved_profit_lock_active = bool(snapshot.get("profit_lock_active", False))
+            preserved_peak_unrealized_pnl = float(snapshot.get("peak_unrealized_pnl", 0.0) or 0.0)
+            snapshot_restored = True
+            print(color(
+                f"{now_str()} [sync:{context}] [dca-state] snapshot matches exchange position "
+                f"(side={side}, qty={qty}, avg_entry={entry_price:.2f}) - restoring dca_step="
+                f"{restored_dca_step}, last_dca_price={restored_last_dca_price}, "
+                f"profit_lock_active={preserved_profit_lock_active}.", MAGENTA,
+            ))
+        else:
+            print(color(
+                f"{now_str()} [sync:{context}] [dca-state] snapshot found but does not match "
+                f"exchange position (side/qty/avg_entry) - ignoring.", YELLOW,
+            ))
 
     print(color(
         f"{now_str()} [sync:{context}] *** RESYNCING TO MATCH EXCHANGE *** "
         f"exchange shows side={side} qty={qty} avg_entry={entry_price:.2f}; local state "
         f"was status={p.status} side={p.side} avg_entry={p.avg_entry_price}. Rebuilding "
         f"local state so take-profit / hard-stop / DCA logic resumes managing this trade "
-        f"(dca_step reset to 0 - the exact prior step count isn't recoverable from this "
-        f"endpoint; review manually if that matters for your risk tolerance).",
+        f"(dca_step {'restored from snapshot' if snapshot_restored else 'reset to 0 - not recoverable'}; "
+        f"review manually if that matters for your risk tolerance).",
         YELLOW,
     ))
     manager.position = PositionState(
         side=side,
         status="OPEN",
-        dca_step=0,
+        dca_step=restored_dca_step,
         entries=[(entry_price, qty)],
         avg_entry_price=entry_price,
         total_qty=qty,
@@ -2689,6 +2783,7 @@ async def initialize_sync(
         opened_at=time.time(),
         max_favorable_price=entry_price,
         max_adverse_price=entry_price,
+        last_dca_price=restored_last_dca_price,
         profit_lock_active=preserved_profit_lock_active,
         peak_unrealized_pnl=preserved_peak_unrealized_pnl,
     )
