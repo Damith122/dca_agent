@@ -964,6 +964,7 @@ TRADE_LOG_FIELDS = [
     "exit_reason", "tp_hit", "smart_exit", "manual_exit", "hard_stop",
     "entry_regime", "exit_regime", "entry_confidence", "entry_risk_score",
     "entry_success_prob", "entry_tp_hit_prob", "reward", "final_outcome",
+    "exit_order_id",
 ]
 
 
@@ -1439,6 +1440,19 @@ class MartingaleManager:
         except Exception as e:  # noqa: BLE001 - deletion failure must never crash the trading loop
             print(color(f"[dca-state] failed to delete snapshot: {e}", YELLOW))
 
+    # -- Trade record logging (single pipeline for both the live fill path and
+    # exchange-history reconciliation) - the ONLY place either path should
+    # ever call trade_logger.log_trade(), so recovered trades (reconciled
+    # from Binance's own trade history) are appended in exactly the same
+    # JSON/CSV shape as a live-closed trade rather than through a second,
+    # divergent code path. Does not compute or infer anything itself -
+    # callers still build their own record dict (live close vs. reconciled
+    # trades legitimately have different data available - e.g. mfe_pct/
+    # entry_confidence are only ever known live); this just centralizes the
+    # actual persistence call.
+    def _log_completed_trade(self, record: dict) -> None:
+        self.trade_logger.log_trade(record)
+
     # -- Trade log / analytics persistence (trades_log.jsonl, trades_log.csv, --
     # -- performance_stats.csv) --------------------------------------------
     # Reuses self.github_sync (same GitHub client/session/token/repo/branch
@@ -1704,6 +1718,10 @@ class MartingaleManager:
                 avg_entry = safe_div(entry_notional, entry_qty, 0.0)
                 avg_exit = safe_div(sum(float(t["qty"]) * float(t["price"]) for t in exit_fills), exit_qty, 0.0)
                 close_dt = datetime.fromtimestamp(lc["close_time"] / 1000, tz=timezone.utc)
+                # exit_order_id: the orderId of the fill that actually closed the
+                # lifecycle (chronologically last exit fill) - exchange data, when
+                # available, same as the live-close path's exit_order_id.
+                exit_order_id = int(exit_fills[-1]["orderId"]) if exit_fills[-1].get("orderId") is not None else None
 
                 record = {
                     "close_time": close_dt.strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -1734,10 +1752,14 @@ class MartingaleManager:
                     "entry_tp_hit_prob": None,
                     "reward": None,
                     "final_outcome": "win" if net_pnl > 0 else "loss",
+                    "exit_order_id": exit_order_id,
                     "binance_order_ids": sorted(order_ids),
                     "recovered": True,
                 }
-                self.trade_logger.log_trade(record)
+                # Same logging pipeline as a live-closed trade (see
+                # _log_completed_trade docstring) - keeps recovered trades in
+                # the exact same JSON/CSV shape as normal closes.
+                self._log_completed_trade(record)
                 # DIAGNOSTIC (no effect on `record` or on what gets logged -
                 # this runs after log_trade() and only prints): for
                 # correlating against [fill-trace] lines from
@@ -2619,9 +2641,10 @@ class MartingaleManager:
             "entry_tp_hit_prob": p.entry_tp_hit_prob,
             "reward": reward,
             "final_outcome": "win" if was_success else "loss",
+            "exit_order_id": int(order_id) if order_id is not None else None,
             "binance_order_ids": [int(order_id)] if order_id is not None else [],
         }
-        self.trade_logger.log_trade(record)
+        self._log_completed_trade(record)
 
         self.position = PositionState(last_close_time=time.time())
 
