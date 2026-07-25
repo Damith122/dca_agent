@@ -980,6 +980,7 @@ class TradeLogger:
     def __init__(self, json_path: str = TRADE_LOG_JSON_PATH, csv_path: str = TRADE_LOG_CSV_PATH):
         self.json_path = json_path
         self.csv_path = csv_path
+        self._migrate_csv_schema_if_needed()
         self._csv_header_written = os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
 
     def mark_header_present(self) -> None:
@@ -988,7 +989,56 @@ class TradeLogger:
         flag) before an async GitHub restore can write a downloaded CSV to
         csv_path - without this, the next log_trade() would re-write a
         header into the middle of the restored file."""
+        self._migrate_csv_schema_if_needed()
         self._csv_header_written = os.path.exists(self.csv_path) and os.path.getsize(self.csv_path) > 0
+
+    def _migrate_csv_schema_if_needed(self) -> None:
+        """Fail-soft schema guard: if csv_path already has a header written
+        under an OLDER version of TRADE_LOG_FIELDS (e.g. before
+        `exit_order_id` was added), DictWriter would keep appending
+        current-schema rows under that stale header - producing a column-
+        count mismatch (28-column header, 29-column rows) that breaks
+        Excel/CSV parsing. If the on-disk header doesn't exactly match the
+        current TRADE_LOG_FIELDS, the whole file is rewritten in place:
+        every existing row is reflowed into the current field set (any
+        newly-added column, e.g. exit_order_id, is filled blank for old
+        rows) under a fresh matching header, so every row - past and
+        future - has exactly the same column count. No-op if the file
+        doesn't exist yet or its header already matches."""
+        if not (os.path.exists(self.csv_path) and os.path.getsize(self.csv_path) > 0):
+            return
+        try:
+            with open(self.csv_path, "r", newline="", encoding="utf-8") as f:
+                existing_header = next(csv.reader(f), None)
+        except Exception as e:  # noqa: BLE001 - a corrupt/unreadable file must not block startup
+            print(color(f"[trade-log] could not inspect CSV header for schema check: {e}", YELLOW))
+            return
+
+        if existing_header == TRADE_LOG_FIELDS:
+            return  # already the current schema - nothing to migrate
+
+        try:
+            with open(self.csv_path, "r", newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+        except Exception as e:  # noqa: BLE001
+            print(color(f"[trade-log] could not read CSV rows for schema migration: {e}", YELLOW))
+            return
+
+        tmp_path = f"{self.csv_path}.tmp"
+        try:
+            with open(tmp_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=TRADE_LOG_FIELDS, extrasaction="ignore", restval="")
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(row)
+            os.replace(tmp_path, self.csv_path)  # atomic on POSIX
+            print(color(
+                f"[trade-log] migrated {self.csv_path} to current CSV schema "
+                f"({len(TRADE_LOG_FIELDS)} columns, {len(rows)} row(s) reflowed; "
+                f"old header had {len(existing_header) if existing_header else 0} columns).", YELLOW,
+            ))
+        except Exception as e:  # noqa: BLE001 - migration must never crash the trading loop
+            print(color(f"[trade-log] CSV schema migration failed: {e}", YELLOW))
 
     def log_trade(self, record: dict) -> None:
         try:
