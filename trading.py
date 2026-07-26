@@ -2862,10 +2862,13 @@ async def initialize_sync(
     # strictly against what the exchange is reporting RIGHT NOW: side, qty,
     # and avg_entry_price must all match (small tolerance) or the snapshot is
     # treated as stale/unrelated and ignored entirely - only dca_step,
-    # last_dca_price, profit_lock_active, and peak_unrealized_pnl are ever
+    # last_dca_price, profit_lock_active, peak_unrealized_pnl, and (for a
+    # pending CLOSE only - see below) pending_order_id/pending_role are ever
     # taken from it; nothing else about position sizing/entries is touched.
     restored_dca_step = 0
     restored_last_dca_price: Optional[float] = None
+    restored_pending_order_id: Optional[int] = None
+    restored_pending_role: Optional[str] = None
     snapshot_restored = False
     snapshot = await manager.load_dca_state_snapshot()
     if snapshot is not None:
@@ -2884,11 +2887,31 @@ async def initialize_sync(
             preserved_profit_lock_active = bool(snapshot.get("profit_lock_active", False))
             preserved_peak_unrealized_pnl = float(snapshot.get("peak_unrealized_pnl", 0.0) or 0.0)
             snapshot_restored = True
+            # Only a pending CLOSE is restored here (not "initial"/"dca") -
+            # those are Entry/DCA order-placement concerns and are left
+            # untouched, exactly as before this fix. A pending close means a
+            # reduceOnly order is already in flight on the exchange for this
+            # exact position: restoring it lets _try_recover_close_fill()
+            # route that order's eventual FILLED event to _on_close_filled()
+            # instead of it falling through to untracked_order_id / exchange
+            # reconciliation, and (via status="CLOSING" below) stops
+            # _manage_open_position() from evaluating this position again and
+            # submitting a second, duplicate close order that would overwrite
+            # this same pending_order_id in the snapshot before the first
+            # order's fill event ever arrives.
+            if snapshot.get("pending_role") == "close" and snapshot.get("pending_order_id") is not None:
+                try:
+                    restored_pending_order_id = int(snapshot["pending_order_id"])
+                    restored_pending_role = "close"
+                except (TypeError, ValueError):
+                    restored_pending_order_id = None
+                    restored_pending_role = None
             print(color(
                 f"{now_str()} [sync:{context}] [dca-state] snapshot matches exchange position "
                 f"(side={side}, qty={qty}, avg_entry={entry_price:.2f}) - restoring dca_step="
                 f"{restored_dca_step}, last_dca_price={restored_last_dca_price}, "
-                f"profit_lock_active={preserved_profit_lock_active}.", MAGENTA,
+                f"profit_lock_active={preserved_profit_lock_active}, "
+                f"pending_close_order_id={restored_pending_order_id}.", MAGENTA,
             ))
         else:
             print(color(
@@ -2905,9 +2928,10 @@ async def initialize_sync(
         f"review manually if that matters for your risk tolerance).",
         YELLOW,
     ))
+    rebuilt_status = "CLOSING" if restored_pending_order_id is not None else "OPEN"
     manager.position = PositionState(
         side=side,
-        status="OPEN",
+        status=rebuilt_status,
         dca_step=restored_dca_step,
         entries=[(entry_price, qty)],
         avg_entry_price=entry_price,
@@ -2919,7 +2943,22 @@ async def initialize_sync(
         last_dca_price=restored_last_dca_price,
         profit_lock_active=preserved_profit_lock_active,
         peak_unrealized_pnl=preserved_peak_unrealized_pnl,
+        pending_order_id=restored_pending_order_id,
+        pending_role=restored_pending_role,
+        pending_order_ts=time.time() if restored_pending_order_id is not None else 0.0,
     )
+    if restored_pending_order_id is not None:
+        # Re-populate the in-memory order index too, so the fill routes
+        # through the normal handle_order_update() path directly - the
+        # persisted-snapshot lookup in _try_recover_close_fill() remains as
+        # a fallback for any case this doesn't cover.
+        manager._order_index[restored_pending_order_id] = "close"
+        print(color(
+            f"{now_str()} [sync:{context}] [dca-state] pending CLOSE order "
+            f"{restored_pending_order_id} restored - position set to CLOSING so "
+            f"management logic will not submit a second close order while its "
+            f"fill is still outstanding.", MAGENTA,
+        ))
     if preserved_profit_lock_active:
         print(color(
             f"{now_str()} [sync:{context}] [profit-lock] preserved across resync "
