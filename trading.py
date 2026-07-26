@@ -109,6 +109,35 @@
  and every other branch of initialize_sync() (already_synced check,
  OPEN/CLOSING position rebuild, DCA-state snapshot restore, Profit Lock
  carry-forward) is unchanged.
+
+ 2026-07 reconcile-backoff fix (isolated to
+ reconcile_trade_history_from_exchange() only - no other logic touched):
+ the pending-close throttle above stops redundant calls while OUR OWN
+ close order is in flight, but it does nothing when Binance's userTrades
+ endpoint itself is unhealthy (returning 502/504) - in that case every
+ caller (startup, every user-ws reconnect, and position_risk_poller every
+ POSITION_RISK_POLL_SEC ~10s) kept re-hitting the same failing endpoint
+ immediately again, forever, which is exactly the repeated
+ "[reconcile:*] could not fetch Binance trade history: HTTP 502" pattern
+ reported in the field. MartingaleManager now tracks a cooldown
+ (`_reconcile_cooldown_until`) and an exponential backoff duration
+ (`_reconcile_backoff_sec`, seeded at RECONCILE_BACKOFF_BASE_SEC and
+ capped at RECONCILE_BACKOFF_MAX_SEC) for this call only:
+   - On entry, if we're still within a previously-set cooldown window,
+     the call is skipped (logged once) and returns immediately - startup/
+     reconnect/poll all continue normally without blocking on it.
+   - On a network/API failure fetching userTrades (BinanceApiError /
+     aiohttp.ClientError / asyncio.TimeoutError - i.e. exactly a 502/504
+     or timeout), the cooldown is (re)armed and the backoff duration is
+     doubled (capped), so repeated instability backs off further with
+     each consecutive failure instead of retrying every ~10s indefinitely.
+   - On any successful fetch (including an empty result), the backoff
+     resets to its base value and the cooldown clears, so recovery is
+     immediate once Binance is healthy again.
+   - This does not change what gets reconciled/recovered, the dedup
+     logic, the trade-sync cursor, or any entry/exit/DCA/risk decision -
+     it only paces how often this one REST call is attempted while it is
+     failing.
 ================================================================================
 """
 
@@ -242,6 +271,17 @@ GREEN, RED, YELLOW, CYAN, GRAY, BOLD, MAGENTA, BLUE = "32", "31", "33", "36", "9
 
 PROFIT_LOCK_ACTIVATION_USDT = 0.10   # unrealized net PnL at which the lock arms
 PROFIT_LOCK_RATIO = 0.50             # protected profit = this fraction of peak
+
+
+# ============================================================================
+# RECONCILE BACKOFF (new - see 2026-07 reconcile-backoff fix in module
+# docstring). Local constants only, scoped to trading.py, governing how
+# reconcile_trade_history_from_exchange() paces retries against Binance's
+# userTrades endpoint while it is returning 502/504 or timing out.
+# ============================================================================
+
+RECONCILE_BACKOFF_BASE_SEC = 30.0     # initial cooldown armed after the first failure
+RECONCILE_BACKOFF_MAX_SEC = 300.0     # cap on the cooldown even after repeated failures
 
 
 # ============================================================================
@@ -1393,6 +1433,15 @@ class MartingaleManager:
         self._last_live_trade_id: int = 0
         self._trade_sync_cursor: int = 0
 
+        # --- Reconcile backoff/cooldown (2026-07 reconcile-backoff fix) ----
+        # Governs ONLY how often reconcile_trade_history_from_exchange()'s
+        # GET /fapi/v1/userTrades call is retried while Binance is returning
+        # 502/504 or timing out - see that method and the module docstring.
+        # Not read by anything else; does not affect entry/exit/DCA/risk
+        # decisions or the trade-sync cursor itself.
+        self._reconcile_backoff_sec: float = RECONCILE_BACKOFF_BASE_SEC
+        self._reconcile_cooldown_until: float = 0.0
+
     # -- Persistent Adaptive Learning: startup load / ongoing persistence ----
 
     async def load_or_init_brain(self) -> None:
@@ -1693,8 +1742,30 @@ class MartingaleManager:
         TradeLogger.logged_binance_order_ids()). Safe to call frequently -
         it is a no-op (single cheap REST call, empty result) once caught
         up. Never raises; never touches PositionState or any strategy
-        state - purely a logging safety net."""
+        state - purely a logging safety net.
+
+        2026-07 reconcile-backoff fix (this method only - see module
+        docstring): guarded by self._reconcile_cooldown_until /
+        self._reconcile_backoff_sec so that a Binance-side outage (502/504
+        or timeout) on this specific REST call doesn't get retried on every
+        single caller (startup / every user-ws reconnect / every
+        position_risk_poller tick, ~10s apart) indefinitely. On entry, if
+        still within a previously armed cooldown, this is a fast no-op
+        (logged once). On failure, the cooldown is (re)armed with an
+        exponentially increasing duration (capped). On success, the
+        backoff resets to base. Nothing else about this method's
+        reconciliation/dedup/logging behavior is changed."""
         if DRY_RUN or self.client is None:
+            return
+
+        now_ts = time.time()
+        if now_ts < self._reconcile_cooldown_until:
+            remaining = self._reconcile_cooldown_until - now_ts
+            print(color(
+                f"[reconcile:{context}] skipping userTrades fetch - backing off "
+                f"{remaining:.0f}s more after a recent failure (avoids hammering "
+                f"an unstable endpoint).", GRAY,
+            ))
             return
 
         first_run = self._trade_sync_cursor <= 0 and self._last_live_trade_id <= 0
@@ -1713,12 +1784,25 @@ class MartingaleManager:
         try:
             fills = await self.client.get_user_trades(self.symbol, from_id=from_id, limit=1000)
         except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+            # Arm/extend the cooldown so this REST call backs off instead of
+            # being retried again in ~10s by the next poller tick / reconnect
+            # / startup - the actual root cause of the repeated 502/504 spam.
+            self._reconcile_cooldown_until = time.time() + self._reconcile_backoff_sec
             print(color(f"[reconcile:{context}] could not fetch Binance trade history "
-                        f"(continuing without it): {e}", YELLOW))
+                        f"(continuing without it): {e} - backing off for "
+                        f"{self._reconcile_backoff_sec:.0f}s.", YELLOW))
+            self._reconcile_backoff_sec = min(
+                self._reconcile_backoff_sec * 2, RECONCILE_BACKOFF_MAX_SEC
+            )
             return
         except Exception as e:  # noqa: BLE001 - reconciliation must never take the bot down
             print(color(f"[reconcile:{context}] unexpected error fetching trade history: {e}", RED))
             return
+
+        # Successful fetch (even if empty) - the endpoint is healthy again,
+        # so reset the backoff back to its base value for next time.
+        self._reconcile_backoff_sec = RECONCILE_BACKOFF_BASE_SEC
+        self._reconcile_cooldown_until = 0.0
 
         if not fills:
             if first_run:
@@ -2827,7 +2911,13 @@ async def initialize_sync(
     as before - no closed trade is ever permanently skipped, and nothing
     else in this function (already_synced check, OPEN/CLOSING position
     rebuild, DCA-state snapshot restore, Profit Lock carry-forward) is
-    touched."""
+    touched.
+
+    Note (2026-07 reconcile-backoff fix): reconcile_trade_history_from_exchange()
+    itself now also self-throttles on Binance-side 502/504/timeout failures
+    (see that method) - this function's own pending-close throttle above is
+    unchanged and still applies first; the two throttles are independent
+    and complementary, not a replacement for one another."""
     if DRY_RUN:
         return  # nothing real to sync against
 
