@@ -89,6 +89,26 @@
  prior lock state to carry forward", exactly as before this fix. Profit
  Lock's own activation/ratio/close logic in _manage_open_position() is
  completely unchanged.
+
+ 2026-07 reconcile-throttle fix (isolated to initialize_sync() only - no
+ other logic touched, see that function for details): initialize_sync()
+ previously called reconcile_trade_history_from_exchange() (a GET
+ /fapi/v1/userTrades REST call) unconditionally on every invocation -
+ startup, every user-data-websocket reconnect, AND every
+ position_risk_poller tick (every POSITION_RISK_POLL_SEC, i.e. every 10s),
+ forever. While a close order is already pending for the current position
+ (status == "CLOSING" with a pending_order_id in flight - including the
+ restart-safe pending-close recovery path), that lifecycle hasn't closed
+ on Binance's side yet, so re-fetching userTrades on every single poll
+ tick finds nothing new and simply piles up redundant REST calls against
+ an already-loaded endpoint - this was the source of the repeated
+ 502/504s observed after the pending-close recovery fix. Reconciliation
+ is now skipped for the duration of that pending close only, and resumes
+ automatically as soon as status leaves CLOSING (the very next startup /
+ reconnect / poll call) - no closed trade is ever permanently skipped,
+ and every other branch of initialize_sync() (already_synced check,
+ OPEN/CLOSING position rebuild, DCA-state snapshot restore, Profit Lock
+ carry-forward) is unchanged.
 ================================================================================
 """
 
@@ -2787,7 +2807,27 @@ async def initialize_sync(
     their dataclass defaults automatically via PositionState()) - EXCEPT
     profit_lock_active/peak_unrealized_pnl, which are now explicitly
     carried forward on a matching same-side OPEN resync (see 2026-07
-    Profit Lock resync fix in the module docstring)."""
+    Profit Lock resync fix in the module docstring).
+
+    2026-07 reconcile-throttle fix (this function only - see module
+    docstring): reconcile_trade_history_from_exchange() (a GET
+    /fapi/v1/userTrades REST call) is now SKIPPED for as long as the
+    current position has a close order already pending (status ==
+    "CLOSING" with a pending_order_id set) - covers both a normal close
+    in flight and the restart-safe pending-close recovery path (see
+    initialize_sync()'s own pending-CLOSE restore below, and
+    _try_recover_close_fill()). While that close hasn't resolved on
+    Binance's side yet, reconciliation cannot find anything new, so
+    calling it on every position_risk_poller tick (every
+    POSITION_RISK_POLL_SEC) was purely redundant load against an already
+    rate-limited/slow endpoint - the source of the repeated 502/504s seen
+    after the pending-close recovery fix. As soon as status leaves
+    CLOSING (fill processed, or the next startup/reconnect call), the
+    very next invocation of this function resumes reconciliation exactly
+    as before - no closed trade is ever permanently skipped, and nothing
+    else in this function (already_synced check, OPEN/CLOSING position
+    rebuild, DCA-state snapshot restore, Profit Lock carry-forward) is
+    touched."""
     if DRY_RUN:
         return  # nothing real to sync against
 
@@ -2795,7 +2835,26 @@ async def initialize_sync(
     # docstring. Runs on every startup / websocket-reconnect / periodic poll that
     # already calls this function, so no new timer is introduced. Independent of
     # the position-sync logic below: never touches PositionState.
-    await manager.reconcile_trade_history_from_exchange(context=context)
+    #
+    # EXCEPTION (2026-07 reconcile-throttle fix, see function docstring above):
+    # while a close order is already pending for the current position, skip
+    # this REST call entirely - the lifecycle can't have closed on Binance's
+    # side yet, so re-fetching userTrades every ~10s here only piles up
+    # redundant calls against an endpoint that was already returning
+    # 502/504s. Reconciliation resumes automatically the next time this
+    # function runs after status leaves CLOSING.
+    pending_close_in_flight = (
+        manager.position.status == "CLOSING"
+        and manager.position.pending_order_id is not None
+    )
+    if pending_close_in_flight:
+        print(color(
+            f"{now_str()} [sync:{context}] [reconcile] skipping userTrades reconciliation - "
+            f"close order (id={manager.position.pending_order_id}) already pending for the "
+            f"current position; will resume once it resolves.", GRAY,
+        ))
+    else:
+        await manager.reconcile_trade_history_from_exchange(context=context)
 
     if rows is None:
         try:
