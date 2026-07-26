@@ -1461,6 +1461,12 @@ class MartingaleManager:
             "last_dca_price": p.last_dca_price,
             "profit_lock_active": p.profit_lock_active,
             "peak_unrealized_pnl": p.peak_unrealized_pnl,
+            # Persisted so a CLOSE order's fill can still be routed to
+            # _on_close_filled() after a restart/reconnect wipes the
+            # in-memory _order_index - see handle_order_update()'s
+            # untracked_order_id recovery path below.
+            "pending_order_id": p.pending_order_id,
+            "pending_role": p.pending_role,
         }
 
     async def save_dca_state(self, reason: str) -> None:
@@ -2206,6 +2212,10 @@ class MartingaleManager:
             self._order_index[resp["orderId"]] = "close"
             self.position.pending_order_id = resp["orderId"]
             self.position.pending_role = "close"
+            # Restart-safe close-fill recovery: persist the pending close
+            # order's id/role now, before its FILLED event arrives - see
+            # handle_order_update()'s untracked_order_id recovery path.
+            asyncio.create_task(self.save_dca_state(reason="close order placed"))
         except BinanceApiError as e:
             print(color(
                 f"[position] FAILED to close position: {e} - "
@@ -2504,6 +2514,45 @@ class MartingaleManager:
 
     # -- order fill handling --------------------------------------------------------
 
+    async def _try_recover_close_fill(self, order_id: int, o: dict) -> bool:
+        """Restart-safe fallback for handle_order_update(): if `order_id`
+        isn't in this process's in-memory _order_index (e.g. a restart
+        happened between close_position() placing the order and its
+        FILLED event arriving), checks the persisted DCA-state snapshot
+        for a matching pending CLOSE order before giving up. Only fires
+        when the snapshot's own pending_order_id (for pending_role="close")
+        exactly matches this order_id, so an unrelated/stale snapshot can
+        never be mistaken for this fill. Never raises - any failure here
+        just falls through to the existing untracked_order_id diagnostic
+        and reconciliation safety net, unchanged."""
+        try:
+            snapshot = await self.load_dca_state_snapshot()
+        except Exception:  # noqa: BLE001 - recovery must never crash the fill handler
+            return False
+        if not snapshot:
+            return False
+        if snapshot.get("pending_role") != "close":
+            return False
+        snap_order_id = snapshot.get("pending_order_id")
+        if snap_order_id is None:
+            return False
+        try:
+            if int(snap_order_id) != int(order_id):
+                return False
+        except (TypeError, ValueError):
+            return False
+
+        fill_price = float(o.get("ap") or 0.0)
+        rp = float(o.get("rp") or 0.0)
+        print(color(
+            f"{now_str()} [fill-trace] path=restart_recovery order_id={order_id} "
+            f"reason=matched_persisted_dca_state_snapshot (pending_role=close, "
+            f"pending_order_id={snap_order_id}) -> routing to _on_close_filled() "
+            f"despite empty in-memory _order_index (restart-safe recovery)", CYAN,
+        ))
+        await self._on_close_filled(fill_price, rp, order_id=order_id)
+        return True
+
     async def handle_order_update(self, event: dict) -> None:
         o = event.get("o", {})
         order_id = o.get("i")
@@ -2523,10 +2572,16 @@ class MartingaleManager:
             # order_id isn't in this process's in-memory _order_index (never
             # persisted across restarts), so a FILLED event that genuinely
             # arrived over the connected user-data websocket still can't be
-            # routed to _on_close_filled(). Only reconcile_trade_history_from_
-            # exchange() will ever pick this fill up, on its next run. Logging
-            # only - the `return` below is unchanged.
+            # routed to _on_close_filled(). Restart-safe recovery: if this was
+            # this process's own pending CLOSE order before a restart/reconnect
+            # wiped _order_index, the persisted DCA-state snapshot (written by
+            # close_position() when the order was placed) still has its
+            # order_id/role - use it to route the fill correctly instead of
+            # silently dropping it until the next reconciliation pass.
             if _diag_status == "FILLED":
+                recovered = await self._try_recover_close_fill(order_id, o)
+                if recovered:
+                    return
                 print(color(
                     f"{now_str()} [fill-trace] path=live_user_websocket order_id={order_id} "
                     f"trade_id={_diag_trade_id} close_time={_diag_close_time} "
