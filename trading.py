@@ -2556,6 +2556,47 @@ class MartingaleManager:
                     emergency=True, exit_reason_tag="max_dca_exhausted",
                 )
                 return
+
+            # --- Final-DCA low-probability-recovery gate (new, scoped ONLY to
+            # the last allowed DCA step) --------------------------------------
+            # Before committing the LAST DCA add, sanity-check the existing
+            # Brain confidence / trend / momentum / risk reads. If they
+            # indicate a low-probability recovery, skip the final DCA and
+            # exit the position via the existing close path instead of
+            # doubling down one more time. Does not touch any earlier DCA
+            # step, sizing, or any other decision in this function.
+            is_final_dca_step = (p.dca_step + 1) >= MAX_DCA_STEPS
+            if is_final_dca_step:
+                conf = self.last_confidence
+                velocity = 0.0
+                if self.prev_price and self.current_price:
+                    velocity = (self.current_price - self.prev_price) / self.prev_price
+                momentum_against = (
+                    (p.side == "LONG" and velocity < -0.0004)
+                    or (p.side == "SHORT" and velocity > 0.0004)
+                )
+                trend_against = (
+                    conf.trend_direction is not None
+                    and conf.trend_direction != p.side
+                    and conf.trend_confidence >= 0.35
+                )
+                low_probability_recovery = (
+                    conf.confidence_score < 0.35
+                    or conf.risk_score >= 0.65
+                    or trend_against
+                    or momentum_against
+                )
+                if low_probability_recovery:
+                    await self.close_position(
+                        f"final DCA step skipped: low-probability recovery "
+                        f"(confidence={conf.confidence_score:.2f}, risk={conf.risk_score:.2f}, "
+                        f"trend_direction={conf.trend_direction}, trend_against={trend_against}, "
+                        f"momentum_against={momentum_against}) at {pct_move*100:.2f}% - "
+                        f"exiting instead of adding the last DCA step",
+                        emergency=True, exit_reason_tag="final_dca_skipped_low_probability",
+                    )
+                    return
+
             size_mult = self.confidence_size_multiplier(self.last_confidence, self.last_regime)
             await self._place_step_order(step=p.dca_step + 1, side_signal=p.side, size_mult=size_mult)
             p.last_dca_price = price
