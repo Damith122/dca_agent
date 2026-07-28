@@ -138,6 +138,39 @@
      logic, the trade-sync cursor, or any entry/exit/DCA/risk decision -
      it only paces how often this one REST call is attempted while it is
      failing.
+
+ 2026-07 DCA-state-recovery fix (this update - isolated to
+ _dca_state_snapshot(), save_dca_state() call sites inside
+ _manage_open_position(), and MartingaleManager.__init__ only; the
+ startup-side compare-and-restore logic in initialize_sync() was already
+ correct and is UNCHANGED):
+   - Root cause: the persisted DCA-state snapshot (dca_step, last_dca_price,
+     profit_lock_active, peak_unrealized_pnl, ...) was only ever re-saved
+     on an entry fill (_on_entry_filled) or a full close. Position-level
+     Profit Lock's own state (profit_lock_active flipping on, and
+     peak_unrealized_pnl growing tick-by-tick while a trade runs) changes
+     independently of any entry/DCA fill, so a restart/redeploy between a
+     Profit Lock activation (or a new, higher peak) and the next entry
+     fill silently lost that state - initialize_sync() would then restore
+     a STALE snapshot (profit_lock_active possibly still False, or a
+     lower peak than what actually happened), even though dca_step/
+     avg_entry/side/qty still matched the exchange perfectly.
+   - Fix: the position snapshot is now also persisted (fire-and-forget,
+     same asyncio.create_task(self.save_dca_state(...)) pattern used
+     everywhere else in this file) the moment Profit Lock first activates,
+     and again whenever its tracked peak meaningfully increases afterward
+     (throttled via _last_dca_state_peak_saved so a profitable trade
+     running for a while doesn't trigger a disk/GitHub write on every
+     single tick). dca_step/last_dca_price were already saved correctly on
+     every entry/DCA fill - unchanged.
+   - Also added `initial_entry_price` (the price of the very first entry
+     fill) to the persisted snapshot purely as an additional audit/
+     debugging field - it is not required by and does not change the
+     side/qty/avg_entry_price matching logic in initialize_sync(), which
+     remains the sole authority for deciding whether a snapshot is trusted
+     and applied on restart.
+   - No entry/exit/DCA/TP/Smart-Exit/Brain/Risk decision, and no field or
+     branch of initialize_sync() itself, was touched by this fix.
 ================================================================================
 """
 
@@ -271,6 +304,14 @@ GREEN, RED, YELLOW, CYAN, GRAY, BOLD, MAGENTA, BLUE = "32", "31", "33", "36", "9
 
 PROFIT_LOCK_ACTIVATION_USDT = 0.10   # unrealized net PnL at which the lock arms
 PROFIT_LOCK_RATIO = 0.50             # protected profit = this fraction of peak
+
+# DCA-state peak-save throttle (2026-07 DCA-state-recovery fix): minimum
+# growth in peak_unrealized_pnl (USDT) since the last persisted snapshot
+# before Profit Lock's growing peak triggers another save_dca_state() call.
+# Keeps a long-running profitable trade from writing to disk/GitHub on
+# every single tick while still keeping the persisted peak reasonably
+# fresh for restart/redeploy recovery.
+DCA_STATE_PEAK_SAVE_MIN_DELTA_USDT = 0.02
 
 
 # ============================================================================
@@ -1442,6 +1483,16 @@ class MartingaleManager:
         self._reconcile_backoff_sec: float = RECONCILE_BACKOFF_BASE_SEC
         self._reconcile_cooldown_until: float = 0.0
 
+        # --- DCA-state peak-save throttle (2026-07 DCA-state-recovery fix) --
+        # Tracks the peak_unrealized_pnl value that was last persisted via
+        # save_dca_state(), so _manage_open_position()'s Profit Lock branch
+        # only re-saves the snapshot when the peak has grown meaningfully
+        # since then (see DCA_STATE_PEAK_SAVE_MIN_DELTA_USDT above) instead
+        # of on every single tick of a long-running profitable trade. Purely
+        # a persistence-throttling detail - does not affect Profit Lock's
+        # own activation/ratio/close decisions in any way.
+        self._last_dca_state_peak_saved: float = 0.0
+
     # -- Persistent Adaptive Learning: startup load / ongoing persistence ----
 
     async def load_or_init_brain(self) -> None:
@@ -1512,12 +1563,15 @@ class MartingaleManager:
 
     # -- DCA state persistence (side/qty/avg_entry_price/dca_step/last_dca_price/
     # profit_lock_active/peak_unrealized_pnl) - local-disk snapshot only,
-    # written after every entry fill (initial + each DCA add) and deleted once
-    # a position fully closes. Consumed by initialize_sync() to restore
-    # dca_step/last_dca_price/profit_lock_active/peak_unrealized_pnl across a
-    # reconnect/restart, but ONLY when the snapshot's side/qty/avg_entry_price
-    # still match what the exchange itself is reporting - see initialize_sync()
-    # below. Deliberately does not touch any Entry/TP/DCA/Smart-Exit/Brain/Risk
+    # written after every entry fill (initial + each DCA add), after every
+    # meaningful Profit Lock state change (activation, and subsequent
+    # meaningful peak growth - see 2026-07 DCA-state-recovery fix), and
+    # deleted once a position fully closes. Consumed by initialize_sync() to
+    # restore dca_step/last_dca_price/profit_lock_active/peak_unrealized_pnl
+    # across a reconnect/restart, but ONLY when the snapshot's own
+    # side/qty/avg_entry_price still match what the exchange itself is
+    # reporting - see initialize_sync() below (unchanged by this fix).
+    # Deliberately does not touch any Entry/TP/DCA/Smart-Exit/Brain/Risk
     # decision logic; this is purely a state-recovery snapshot.
 
     def _dca_state_snapshot(self) -> dict:
@@ -1526,6 +1580,12 @@ class MartingaleManager:
             "side": p.side,
             "qty": p.total_qty,
             "avg_entry_price": p.avg_entry_price,
+            # Audit/debugging field only (2026-07 DCA-state-recovery fix) -
+            # the price of the very first entry fill for this position, as
+            # opposed to avg_entry_price which blends in every DCA add.
+            # NOT used by initialize_sync()'s match/restore decision, which
+            # continues to compare side/qty/avg_entry_price only.
+            "initial_entry_price": p.entries[0][0] if p.entries else p.avg_entry_price,
             "dca_step": p.dca_step,
             "last_dca_price": p.last_dca_price,
             "profit_lock_active": p.profit_lock_active,
@@ -2447,8 +2507,24 @@ class MartingaleManager:
                     f"{now_str()} [profit-lock] ACTIVATED at unrealized_pnl=${unrealized_pnl_usdt:+.4f} "
                     f"(protects {PROFIT_LOCK_RATIO*100:.0f}% of peak profit from here on)", GREEN,
                 ))
+                # 2026-07 DCA-state-recovery fix: persist immediately so a
+                # restart/redeploy right after activation doesn't restore a
+                # stale snapshot with profit_lock_active still False - see
+                # module docstring.
+                self._last_dca_state_peak_saved = p.peak_unrealized_pnl
+                asyncio.create_task(self.save_dca_state(reason="profit lock activated"))
             if p.profit_lock_active:
                 p.peak_unrealized_pnl = max(p.peak_unrealized_pnl, unrealized_pnl_usdt)
+                # 2026-07 DCA-state-recovery fix: re-persist whenever the
+                # tracked peak has grown meaningfully since the last save,
+                # so a restart/redeploy mid-trade recovers a peak close to
+                # the real one instead of whatever was last saved on an
+                # entry/DCA fill. Throttled (DCA_STATE_PEAK_SAVE_MIN_DELTA_USDT)
+                # so a long-running profitable trade doesn't write to disk/
+                # GitHub on every single tick.
+                if (p.peak_unrealized_pnl - self._last_dca_state_peak_saved) >= DCA_STATE_PEAK_SAVE_MIN_DELTA_USDT:
+                    self._last_dca_state_peak_saved = p.peak_unrealized_pnl
+                    asyncio.create_task(self.save_dca_state(reason="profit lock peak updated"))
                 locked_profit = p.peak_unrealized_pnl * PROFIT_LOCK_RATIO
                 if unrealized_pnl_usdt <= locked_profit:
                     await self.close_position(
@@ -2805,6 +2881,14 @@ class MartingaleManager:
             side_color,
         ))
 
+        # Reset the peak-save throttle whenever the position's shape
+        # changes via an entry/DCA fill (2026-07 DCA-state-recovery fix) -
+        # a fresh fill already triggers save_dca_state() below (capturing
+        # dca_step/last_dca_price/avg_entry/qty accurately), so the next
+        # Profit Lock peak save should be measured relative to that fresh
+        # baseline, not whatever peak happened to be saved before this fill.
+        self._last_dca_state_peak_saved = self.position.peak_unrealized_pnl
+
         asyncio.create_task(self.save_dca_state(reason=f"{step_label} filled"))
 
     async def _on_close_filled(self, fill_price: float, total_rp: float, order_id: Optional[int] = None) -> None:
@@ -2902,6 +2986,10 @@ class MartingaleManager:
         self._log_completed_trade(record)
 
         self.position = PositionState(last_close_time=time.time())
+        # New (flat) position - reset the peak-save throttle so the next
+        # trade's Profit Lock starts measuring peak growth from zero
+        # (2026-07 DCA-state-recovery fix).
+        self._last_dca_state_peak_saved = 0.0
 
         asyncio.create_task(self.persist_brain(reason="trade closed"))
         asyncio.create_task(self.sync_trade_log_to_github())
@@ -2958,7 +3046,20 @@ async def initialize_sync(
     itself now also self-throttles on Binance-side 502/504/timeout failures
     (see that method) - this function's own pending-close throttle above is
     unchanged and still applies first; the two throttles are independent
-    and complementary, not a replacement for one another."""
+    and complementary, not a replacement for one another.
+
+    DCA-STATE RECOVERY (side/qty/avg_entry-gated restore of dca_step /
+    last_dca_price / profit_lock_active / peak_unrealized_pnl - see the
+    "snapshot" block below): unchanged by the 2026-07 DCA-state-recovery
+    fix. That fix only changed WHEN save_dca_state() is called (now also on
+    Profit Lock activation/peak growth, not just on entry fills/close) and
+    what _dca_state_snapshot() additionally records (initial_entry_price,
+    audit-only). The compare-and-restore logic here still requires side,
+    qty, and avg_entry_price to all match the exchange's reported position
+    (within a small tolerance) before ANY snapshot field is trusted; on any
+    mismatch the snapshot is discarded entirely and dca_step/last_dca_price/
+    profit_lock_active/peak_unrealized_pnl all start fresh at their
+    PositionState() defaults, exactly as before."""
     if DRY_RUN:
         return  # nothing real to sync against
 
@@ -3137,6 +3238,11 @@ async def initialize_sync(
         pending_role=restored_pending_role,
         pending_order_ts=time.time() if restored_pending_order_id is not None else 0.0,
     )
+    # Keep the peak-save throttle consistent with whatever peak was just
+    # restored (or reset to 0.0 on a fresh/mismatched snapshot), so the
+    # next Profit Lock peak update in _manage_open_position() is measured
+    # relative to the correct baseline (2026-07 DCA-state-recovery fix).
+    manager._last_dca_state_peak_saved = preserved_peak_unrealized_pnl
     if restored_pending_order_id is not None:
         # Re-populate the in-memory order index too, so the fill routes
         # through the normal handle_order_update() path directly - the
