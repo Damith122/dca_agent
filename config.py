@@ -10,6 +10,15 @@
 
  Railway / any host: no environment variable changes are required. This file
  reads the exact same env vars, with the exact same defaults, as before.
+
+ 2026-07 session-start filter (this update - isolated to the new
+ SESSION_START_DATE constant only; nothing else in this file was touched):
+ adds a manual cutoff timestamp used by trading.py's startup reconciliation
+ (reconcile_trade_history_from_exchange) to ignore Binance trade history
+ that closed before this moment, so old/pre-session trades are never
+ written into trades_log.csv / trades_log.jsonl / performance_stats.csv.
+ Does not affect entry/exit/DCA/TP/SL/Smart-Exit/Profit-Lock/Risk logic or
+ any existing recovery logic.
 ================================================================================
 """
 
@@ -202,6 +211,21 @@ GITHUB_TRADE_SYNC_CURSOR_PATH = os.environ.get(
 # "reconciled_from_exchange" so they're easy to identify and audit.
 TRADE_RECONCILE_BACKFILL_FROM_ID = os.environ.get("TRADE_RECONCILE_BACKFILL_FROM_ID", "") or None
 
+# --- Manual trading-session start filter (2026-07 session-start filter) -----
+# Startup reconciliation (reconcile_trade_history_from_exchange in
+# trading.py) treats Binance's own userTrades history as the source of
+# truth and can recover/backfill trades the live websocket missed. This
+# cutoff lets an operator mark "the current session officially starts
+# here": any Binance trade that CLOSED before this timestamp is ignored by
+# that reconciliation pass and is never written into trades_log.csv /
+# trades_log.jsonl / performance_stats.csv, regardless of
+# TRADE_RECONCILE_BACKFILL_FROM_ID or the persisted trade-sync cursor.
+# ISO-8601 UTC string, e.g. "2026-07-31T09:00:00Z". Does not affect
+# entry/exit/DCA/TP/SL/Smart-Exit/Profit-Lock/Risk logic, live fills, or
+# any existing restart/recovery logic - it only gates what reconciliation
+# is allowed to log.
+SESSION_START_DATE = os.environ.get("SESSION_START_DATE", "2026-07-31T09:00:00Z")
+
 # --- Persistent DCA state ------------------------------------------------------
 DCA_STATE_PATH = os.environ.get("DCA_STATE_PATH", "dca_state.json")
 GITHUB_DCA_STATE_PATH = os.environ.get(
@@ -320,6 +344,7 @@ __all__ = [
     "TRADE_SYNC_CURSOR_PATH",
     "GITHUB_TRADE_SYNC_CURSOR_PATH",
     "TRADE_RECONCILE_BACKFILL_FROM_ID",
+    "SESSION_START_DATE",
     "DCA_STATE_PATH",
     "GITHUB_DCA_STATE_PATH",
     "BRAIN_AUTO_PUSH_INTERVAL_SEC",
