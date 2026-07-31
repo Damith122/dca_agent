@@ -171,6 +171,33 @@
      and applied on restart.
    - No entry/exit/DCA/TP/Smart-Exit/Brain/Risk decision, and no field or
      branch of initialize_sync() itself, was touched by this fix.
+
+ 2026-07 final-DCA gate fix (this update - isolated to the
+ "Final-DCA low-probability-recovery gate" block inside
+ _manage_open_position() only; no other logic - Entry, general DCA
+ sizing/triggers, TP, Smart Exit, Brain/Risk scoring, or
+ initialize_sync() - was touched):
+   - Root cause: the gate treated a single weak signal - most commonly
+     conf.confidence_score < 0.35 on its own - as sufficient to abandon
+     the final DCA step and force-close the position. Brain V2's
+     confidence_score legitimately runs low during ordinary sideways
+     chop/consolidation even when nothing is actually wrong, so this was
+     closing out normal sideways recoveries the last DCA add would
+     otherwise have handled fine, before the trade ever got a chance to
+     recover.
+   - Fix: confidence_score is no longer part of this gate at all. The
+     gate now looks only at four independent "genuinely low probability
+     of recovery" signals - strong trend against the position (trend
+     confidence bar raised from 0.35 to 0.55), high heuristic risk score
+     (bar raised from 0.65 to 0.75), abnormal (not just mildly adverse)
+     momentum against the position (velocity threshold raised from
+     0.0004 to 0.0008), and extreme volatility (HIGH_VOL regime AND
+     atr_ratio meaningfully beyond the regime engine's own HIGH_VOL
+     cutoff) - and only skips the final DCA / closes the position when at
+     least two of these four agree. A single borderline reading (e.g. one
+     adverse tick, or a momentarily elevated risk score) can no longer
+     trigger this on its own. Every other DCA step, DCA sizing, and every
+     other branch of _manage_open_position() is unchanged.
 ================================================================================
 """
 
@@ -2633,41 +2660,74 @@ class MartingaleManager:
                 )
                 return
 
-            # --- Final-DCA low-probability-recovery gate (new, scoped ONLY to
-            # the last allowed DCA step) --------------------------------------
-            # Before committing the LAST DCA add, sanity-check the existing
-            # Brain confidence / trend / momentum / risk reads. If they
-            # indicate a low-probability recovery, skip the final DCA and
-            # exit the position via the existing close path instead of
-            # doubling down one more time. Does not touch any earlier DCA
-            # step, sizing, or any other decision in this function.
+            # --- Final-DCA low-probability-recovery gate (2026-07 final-DCA
+            # gate fix - see module docstring) ----------------------------------
+            # Scoped ONLY to the last allowed DCA step. Before committing the
+            # LAST DCA add, sanity-check whether this genuinely looks like a
+            # low-probability recovery rather than an ordinary sideways
+            # chop the DCA add would otherwise handle fine. Does not touch
+            # any earlier DCA step, sizing, or any other decision in this
+            # function.
+            #
+            # confidence_score is deliberately NOT part of this gate - Brain
+            # V2's confidence legitimately runs low during normal sideways
+            # consolidation, and using it here was closing out perfectly
+            # recoverable trades before the last DCA ever got a chance to
+            # work. Instead, four independent "genuinely bad" signals are
+            # each evaluated with a stricter bar than their general-purpose
+            # (Smart Exit) equivalents, and at least TWO of them must agree
+            # before the final DCA is skipped and the position closed - a
+            # single borderline reading is no longer enough on its own.
             is_final_dca_step = (p.dca_step + 1) >= MAX_DCA_STEPS
             if is_final_dca_step:
                 conf = self.last_confidence
+                regime = self.last_regime
                 velocity = 0.0
                 if self.prev_price and self.current_price:
                     velocity = (self.current_price - self.prev_price) / self.prev_price
+
+                # 1) Abnormal momentum against the position - raised from
+                #    0.0004 to 0.0008 so a single mildly adverse tick isn't
+                #    "abnormal" on its own.
                 momentum_against = (
-                    (p.side == "LONG" and velocity < -0.0004)
-                    or (p.side == "SHORT" and velocity > 0.0004)
+                    (p.side == "LONG" and velocity < -0.0008)
+                    or (p.side == "SHORT" and velocity > 0.0008)
                 )
+                # 2) Strong trend against the position - trend_confidence
+                #    bar raised from 0.35 to 0.55.
                 trend_against = (
                     conf.trend_direction is not None
                     and conf.trend_direction != p.side
-                    and conf.trend_confidence >= 0.35
+                    and conf.trend_confidence >= 0.55
                 )
-                low_probability_recovery = (
-                    conf.confidence_score < 0.35
-                    or conf.risk_score >= 0.65
-                    or trend_against
-                    or momentum_against
+                # 3) Genuinely high (not just elevated) heuristic risk score
+                #    - bar raised from 0.65 to 0.75.
+                high_risk = conf.risk_score >= 0.75
+                # 4) Extreme volatility - HIGH_VOL regime AND atr_ratio well
+                #    beyond the regime engine's own HIGH_VOL cutoff, not
+                #    merely at the threshold.
+                extreme_volatility = (
+                    regime.regime == REGIME_HIGH_VOL
+                    and regime.atr_ratio >= REGIME_ATR_HIGH_MULT * 1.25
                 )
+
+                recovery_risk_signals = {
+                    "trend_against": trend_against,
+                    "high_risk": high_risk,
+                    "momentum_against": momentum_against,
+                    "extreme_volatility": extreme_volatility,
+                }
+                agree_count = sum(1 for v in recovery_risk_signals.values() if v)
+                low_probability_recovery = agree_count >= 2
+
                 if low_probability_recovery:
                     await self.close_position(
                         f"final DCA step skipped: low-probability recovery "
-                        f"(confidence={conf.confidence_score:.2f}, risk={conf.risk_score:.2f}, "
-                        f"trend_direction={conf.trend_direction}, trend_against={trend_against}, "
-                        f"momentum_against={momentum_against}) at {pct_move*100:.2f}% - "
+                        f"({agree_count}/{len(recovery_risk_signals)} signals agree: "
+                        f"{', '.join(k for k, v in recovery_risk_signals.items() if v)}; "
+                        f"risk={conf.risk_score:.2f}, trend_direction={conf.trend_direction}, "
+                        f"trend_confidence={conf.trend_confidence:.2f}, regime={regime.regime}, "
+                        f"atr_ratio={regime.atr_ratio:.2f}) at {pct_move*100:.2f}% - "
                         f"exiting instead of adding the last DCA step",
                         emergency=True, exit_reason_tag="final_dca_skipped_low_probability",
                     )
@@ -3059,7 +3119,11 @@ async def initialize_sync(
     (within a small tolerance) before ANY snapshot field is trusted; on any
     mismatch the snapshot is discarded entirely and dca_step/last_dca_price/
     profit_lock_active/peak_unrealized_pnl all start fresh at their
-    PositionState() defaults, exactly as before."""
+    PositionState() defaults, exactly as before.
+
+    Not touched by the 2026-07 final-DCA gate fix either - that fix is
+    scoped entirely to the final-DCA decision inside
+    _manage_open_position() and has no effect on position sync/recovery."""
     if DRY_RUN:
         return  # nothing real to sync against
 
