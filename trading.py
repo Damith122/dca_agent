@@ -292,6 +292,7 @@ from config import (
     TRADE_SYNC_CURSOR_PATH,
     GITHUB_TRADE_SYNC_CURSOR_PATH,
     TRADE_RECONCILE_BACKFILL_FROM_ID,
+    SESSION_START_DATE,
     DCA_STATE_PATH,
 )
 from indicators import clamp, safe_div, ema_series, round_step
@@ -350,6 +351,24 @@ DCA_STATE_PEAK_SAVE_MIN_DELTA_USDT = 0.02
 
 RECONCILE_BACKOFF_BASE_SEC = 30.0     # initial cooldown armed after the first failure
 RECONCILE_BACKOFF_MAX_SEC = 300.0     # cap on the cooldown even after repeated failures
+
+
+# ============================================================================
+# SESSION START FILTER (new - 2026-07 session-start filter, see config.py's
+# SESSION_START_DATE docstring). Parsed once at import time; used only by
+# reconcile_trade_history_from_exchange() to gate which recovered Binance
+# trades are allowed into trades_log.csv / trades_log.jsonl /
+# performance_stats.csv. Falls back to "no cutoff" (epoch 0) if
+# SESSION_START_DATE is unset or malformed, so a bad value never blocks
+# startup or reconciliation.
+# ============================================================================
+
+try:
+    SESSION_START_MS = int(
+        datetime.fromisoformat(SESSION_START_DATE.replace("Z", "+00:00")).timestamp() * 1000
+    )
+except Exception:  # noqa: BLE001 - a malformed/missing cutoff must never block startup
+    SESSION_START_MS = 0
 
 
 # ============================================================================
@@ -1950,6 +1969,17 @@ class MartingaleManager:
                 already_order_ids = set()
 
             for lc in lifecycles:
+                # 2026-07 session-start filter: a lifecycle that closed
+                # before the operator-configured SESSION_START_DATE is old
+                # Binance history from before this session and must never
+                # be written into trades_log.csv / trades_log.jsonl /
+                # performance_stats.csv. The trade-sync cursor still
+                # advances past it further below (cursor_cap is computed
+                # from max_id_seen over ALL fetched fills, unconditionally)
+                # so this same old trade is not re-evaluated on every
+                # future reconciliation pass - it is simply never logged.
+                if lc["close_time"] < SESSION_START_MS:
+                    continue
                 order_ids = {int(t["orderId"]) for t in lc["fills"]}
                 if order_ids & already_order_ids:
                     continue  # at least one fill already logged by the live path - skip, avoid a duplicate
