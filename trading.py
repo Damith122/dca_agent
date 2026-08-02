@@ -1511,6 +1511,25 @@ class MartingaleManager:
         self._order_index: Dict[int, str] = {}
         self._rp_accum: Dict[int, float] = {}
 
+        # --- Unmatched-fill buffer (2026-08 fill-tracking race fix) --------
+        # Bridges the gap between placing an order (REST call returns an
+        # orderId) and this same coroutine registering that orderId in
+        # _order_index immediately afterward. Under asyncio, the user-data
+        # websocket's FILLED event for that exact order can be scheduled and
+        # processed by handle_order_update() WHILE this coroutine is still
+        # awaiting the REST response - at that instant _order_index doesn't
+        # have the id yet, so the fill was previously dropped permanently
+        # (logged as "untracked_order_id") for "initial"/"dca" roles, which
+        # left dca_step stuck and triggered spurious RESYNCING TO MATCH
+        # EXCHANGE on the next periodic poll. Buffering the raw event here
+        # (keyed by order_id, with an arrival timestamp for TTL pruning) lets
+        # _place_step_order()/close_position() replay it the instant they
+        # register the id, closing the race regardless of which side wins.
+        # Does not change entry/exit/DCA/risk decisions - purely a delivery
+        # guarantee for fill events this process's own orders generate.
+        self._unmatched_fills: Dict[int, Tuple[dict, float]] = {}
+        self._UNMATCHED_FILL_TTL_SEC: float = 15.0
+
         # --- Trade-log reconciliation (Binance is the source of truth) ----
         # In-memory high-water-mark of the highest Binance trade id ("t" on
         # ORDER_TRADE_UPDATE) this process has itself seen live, plus the
@@ -2378,16 +2397,27 @@ class MartingaleManager:
             resp = await self.client.place_order(
                 symbol=self.symbol, side=order_side, type="MARKET", quantity=qty,
             )
-            self._order_index[resp["orderId"]] = role
-            self.position.pending_order_id = resp["orderId"]
-            self.position.pending_role = role
-            self.position.pending_order_ts = time.time()
-            self.position.side = side_signal
-            self.position.status = "ENTERING" if step == 0 else "DCA_PENDING"
-            self.last_trade_action_ts = time.time()
+            order_id = resp["orderId"]
+            # 2026-08 fill-tracking race fix: was a bare
+            # `self._order_index[resp["orderId"]] = role` - now goes through
+            # _register_order_and_replay() so a FILLED event that arrived
+            # before this line (asyncio can schedule the websocket consumer
+            # while this coroutine was still awaiting place_order()'s REST
+            # response) gets replayed instead of silently dropped. If that
+            # happened, the position has ALREADY been advanced by that
+            # replay (dca_step incremented, status back to OPEN) - do not
+            # then overwrite it with "still pending" bookkeeping below.
+            already_filled = await self._register_order_and_replay(order_id, role)
+            if not already_filled:
+                self.position.pending_order_id = order_id
+                self.position.pending_role = role
+                self.position.pending_order_ts = time.time()
+                self.position.side = side_signal
+                self.position.status = "ENTERING" if step == 0 else "DCA_PENDING"
+                self.last_trade_action_ts = time.time()
             print(color(
                 f"{now_str()} {step_label} PLACED  {order_side} {qty} {self.symbol} "
-                f"@ market (notional=${notional:.2f}, orderId={resp['orderId']}, "
+                f"@ market (notional=${notional:.2f}, orderId={order_id}, "
                 f"size_mult={size_mult:.2f}, regime={self.last_regime.regime})",
                 CYAN,
             ))
@@ -2430,13 +2460,27 @@ class MartingaleManager:
                 symbol=self.symbol, side=close_side, type="MARKET",
                 quantity=qty, reduceOnly="true",
             )
-            self._order_index[resp["orderId"]] = "close"
-            self.position.pending_order_id = resp["orderId"]
-            self.position.pending_role = "close"
-            # Restart-safe close-fill recovery: persist the pending close
-            # order's id/role now, before its FILLED event arrives - see
-            # handle_order_update()'s untracked_order_id recovery path.
-            asyncio.create_task(self.save_dca_state(reason="close order placed"))
+            order_id = resp["orderId"]
+            # 2026-08 fill-tracking race fix (same as _place_step_order()) -
+            # replaces the previous bare `self._order_index[resp["orderId"]]
+            # = "close"` so a FILLED event that arrived before this line is
+            # replayed instead of dropped (it would otherwise only ever be
+            # recovered later via _try_recover_close_fill()'s persisted-
+            # snapshot path, which needs save_dca_state() below to have run
+            # first - a real gap this closes for the common in-session case).
+            already_filled = await self._register_order_and_replay(order_id, "close")
+            if not already_filled:
+                self.position.pending_order_id = order_id
+                self.position.pending_role = "close"
+                # Restart-safe close-fill recovery: persist the pending close
+                # order's id/role now, before its FILLED event arrives - see
+                # handle_order_update()'s untracked_order_id recovery path.
+                asyncio.create_task(self.save_dca_state(reason="close order placed"))
+            # NOTE: if already_filled is True, _on_close_filled() (run via the
+            # replay above) has already reset self.position to flat and
+            # scheduled delete_dca_state("trade closed") - saving a "close
+            # order placed" snapshot afterward would be wrong, hence the
+            # guard above instead of an unconditional call.
         except BinanceApiError as e:
             print(color(
                 f"[position] FAILED to close position: {e} - "
@@ -2583,11 +2627,31 @@ class MartingaleManager:
                     self._last_dca_state_peak_saved = p.peak_unrealized_pnl
                     asyncio.create_task(self.save_dca_state(reason="profit lock peak updated"))
                 locked_profit = p.peak_unrealized_pnl * PROFIT_LOCK_RATIO
-                if unrealized_pnl_usdt <= locked_profit:
+                # 2026-08 fee/slippage-safe Profit Lock fix: previously
+                # triggered the moment unrealized_pnl_usdt dropped to/below
+                # locked_profit, even when that margin was only a few cents
+                # above zero (e.g. peak just barely cleared
+                # PROFIT_LOCK_ACTIVATION_USDT=0.10, so locked_profit could be
+                # as low as ~0.05). estimate_net_pnl_usdt() is already
+                # fee-aware, but it's evaluated against the current mark
+                # price at decision time - by the time close_position()
+                # actually places and fills the market order, ordinary
+                # execution slippage can erase a margin that thin, closing
+                # at a REALIZED net loss despite the decision being
+                # estimated net-positive (confirmed in trades_log.csv:
+                # exit_reason=profit_lock rows with negative net_pnl_usdt).
+                # Requiring the same fee-aware floor already used by
+                # TP/Partial TP below (MIN_NET_PROFIT_USDT) leaves a buffer
+                # for exactly that slippage. Activation, peak tracking, the
+                # 50% ratio, and every other exit's logic are unchanged; if
+                # this additional floor isn't met, Profit Lock simply holds
+                # for this tick instead of closing - Hard Stop/Smart Exit
+                # remain fully active as the risk backstop either way.
+                if unrealized_pnl_usdt <= locked_profit and unrealized_pnl_usdt >= MIN_NET_PROFIT_USDT:
                     await self.close_position(
                         f"PROFIT LOCK: unrealized pnl ${unrealized_pnl_usdt:+.4f} fell to/below "
                         f"locked level ${locked_profit:+.4f} (peak=${p.peak_unrealized_pnl:+.4f}, "
-                        f"ratio={PROFIT_LOCK_RATIO*100:.0f}%)",
+                        f"ratio={PROFIT_LOCK_RATIO*100:.0f}%, fee-safe floor=${MIN_NET_PROFIT_USDT:.4f})",
                         exit_reason_tag="profit_lock",
                     )
                     return
@@ -2864,6 +2928,49 @@ class MartingaleManager:
         await self._on_close_filled(fill_price, rp, order_id=order_id)
         return True
 
+    def _prune_unmatched_fills(self) -> None:
+        """2026-08 fill-tracking race fix: drops any buffered unmatched-fill
+        event older than _UNMATCHED_FILL_TTL_SEC. Pure memory hygiene - an
+        event that old was never claimed by this process's own order
+        registration (_register_order_and_replay()) and is left to
+        reconciliation, exactly as before this fix."""
+        if not self._unmatched_fills:
+            return
+        cutoff = time.time() - self._UNMATCHED_FILL_TTL_SEC
+        stale = [oid for oid, (_, ts) in self._unmatched_fills.items() if ts < cutoff]
+        for oid in stale:
+            self._unmatched_fills.pop(oid, None)
+
+    async def _register_order_and_replay(self, order_id: int, role: str) -> bool:
+        """2026-08 fill-tracking race fix: the single place that registers a
+        just-placed order's id/role into _order_index - replaces the
+        previous bare `self._order_index[resp["orderId"]] = role` at each
+        call site (_place_step_order(), close_position()). Immediately after
+        registering, checks _unmatched_fills for a FILLED event that arrived
+        over the user-data websocket before this registration could happen
+        (see handle_order_update()'s untracked_order_id branch) and, if
+        found, replays it through handle_order_update() right now - so
+        _on_entry_filled()/_on_close_filled()/_apply_partial_close() run
+        exactly as they would for a normally-ordered live fill (dca_step
+        increments, status flips to OPEN/whatever the fill implies, etc.).
+        No entry/exit/DCA/risk decision logic is duplicated here - this only
+        closes the delivery-ordering race. Returns True if a buffered fill
+        was replayed (caller must NOT then overwrite position.status/
+        pending_order_id/pending_role with "still pending" values - the
+        position has already moved past that)."""
+        self._order_index[order_id] = role
+        buffered = self._unmatched_fills.pop(order_id, None)
+        if buffered is None:
+            return False
+        event, _ts = buffered
+        print(color(
+            f"{now_str()} [fill-trace] path=replayed_unmatched_fill order_id={order_id} "
+            f"role={role} -> registration arrived after this order's FILLED event; replaying "
+            f"it now through handle_order_update() instead of leaving it lost.", CYAN,
+        ))
+        await self.handle_order_update(event)
+        return True
+
     async def handle_order_update(self, event: dict) -> None:
         o = event.get("o", {})
         order_id = o.get("i")
@@ -2893,13 +3000,39 @@ class MartingaleManager:
                 recovered = await self._try_recover_close_fill(order_id, o)
                 if recovered:
                     return
+                # 2026-08 fill-tracking race fix: before this fix, an
+                # untracked FILLED event for "initial"/"dca" (i.e. not
+                # "close") was simply dropped here forever - there was no
+                # recovery path for those roles, unlike close orders above.
+                # Since _place_step_order() only registers order_id in
+                # _order_index AFTER its `await self.client.place_order(...)`
+                # REST call returns, this process's own websocket consumer
+                # can process this exact order's FILLED event first (pure
+                # asyncio scheduling, not necessarily a restart) - dropping
+                # it left dca_step stuck and position.status stuck at
+                # ENTERING/DCA_PENDING, which then made every subsequent
+                # periodic-poll initialize_sync() treat the position as
+                # "not synced" and rebuild it, resetting dca_step to 0 and
+                # (per the RESYNCING TO MATCH EXCHANGE / EMERGENCY CLOSE
+                # pattern this fixes) letting the bot re-open DCA steps it
+                # had already taken. Buffer the raw event instead of
+                # dropping it - _register_order_and_replay() (called from
+                # _place_step_order()/close_position() the moment they learn
+                # this same order_id) will replay it through this same
+                # function within moments. If nothing ever claims it,
+                # _prune_unmatched_fills() drops it after
+                # _UNMATCHED_FILL_TTL_SEC and reconciliation remains the
+                # fallback, exactly as before this fix.
+                self._prune_unmatched_fills()
+                if order_id is not None:
+                    self._unmatched_fills[order_id] = (event, time.time())
                 print(color(
                     f"{now_str()} [fill-trace] path=live_user_websocket order_id={order_id} "
                     f"trade_id={_diag_trade_id} close_time={_diag_close_time} "
-                    f"reason=untracked_order_id (order_id not in local _order_index - not placed "
-                    f"by this process instance, e.g. a restart happened between order placement "
-                    f"and this fill; _on_close_filled() will NOT run for this fill, only "
-                    f"reconciliation will eventually recover it)", YELLOW,
+                    f"reason=untracked_order_id (order_id not in local _order_index yet - buffered "
+                    f"for up to {self._UNMATCHED_FILL_TTL_SEC:.0f}s in case this process's own order "
+                    f"registration is still in flight; falls back to reconciliation if never claimed)",
+                    YELLOW,
                 ))
             return
 
@@ -3228,6 +3361,31 @@ async def initialize_sync(
     )
     if already_synced:
         return
+
+    # 2026-08 DCA_PENDING-resync fix: mirrors the SYNC_PENDING_GRACE_SEC
+    # allowance already used a few lines up for the exchange-flat case.
+    # A position that is ENTERING/DCA_PENDING with its own order still
+    # inside the grace window is EXPECTED to look "not yet synced" for a
+    # few seconds while that order's FILLED event is still in flight (see
+    # handle_order_update()'s untracked_order_id buffering and
+    # _register_order_and_replay() above, which is the primary fix for
+    # this) - it is not evidence of a stale/corrupted position, and
+    # rebuilding it here would reset dca_step to 0 for no reason (the
+    # exact "RESYNCING TO MATCH EXCHANGE ... dca_step reset to 0" pattern
+    # this fixes). Only falls through to the full rebuild below once that
+    # grace window has actually elapsed - same as the flat-case check -
+    # and every other branch of this function (genuine mismatch,
+    # reconnect/restart resync, DCA-state snapshot restore, Profit Lock
+    # carry-forward) is untouched.
+    if p.status in ("ENTERING", "DCA_PENDING") and p.side == side:
+        age = time.time() - p.pending_order_ts
+        if age < SYNC_PENDING_GRACE_SEC:
+            print(color(
+                f"{now_str()} [sync:{context}] exchange shows {side} qty={qty} but local "
+                f"order ({p.status}) was placed only {age:.1f}s ago (< {SYNC_PENDING_GRACE_SEC}s "
+                f"grace) - waiting for its FILLED event instead of resyncing early.", GRAY,
+            ))
+            return
 
     # Preserve Profit Lock state across this resync - ONLY if the local
     # state being replaced was itself an OPEN position on the SAME side as
