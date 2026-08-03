@@ -1,0 +1,5 @@
+close_time,symbol,side,entry_price,exit_price,qty,invested_notional,gross_pnl_usdt,fees_usdt,net_pnl_usdt,net_pnl_pct,dca_count,holding_time_sec,mfe_pct,mae_pct,exit_reason,tp_hit,smart_exit,manual_exit,hard_stop,entry_regime,exit_regime,entry_confidence,entry_risk_score,entry_success_prob,entry_tp_hit_prob,reward,final_outcome,exit_order_id
+2026-08-03 02:21:15 UTC,BTCUSDT,SHORT,63141.91764705882,63246.4,0.0017,107.34126,-0.09167596,0.08594404,-0.17762,-0.0016547225176972954,1,33159.87,,,reconciled_from_exchange,,,,,,,,,,,,loss,27581344562
+2026-08-03 03:47:22 UTC,BTCUSDT,LONG,63018.53518518518,62841.5,0.0054,340.30009,-0.68413234,0.27185766,-0.95599,-0.0028092557953775443,3,4778.4,,,reconciled_from_exchange,,,,,,,,,,,,loss,27630406006
+2026-08-03 04:01:19 UTC,BTCUSDT,SHORT,62959.700000000004,62881.6,0.0018,113.32746,0.23118573,0.09060573,0.14058,0.0012404760505529727,1,717.106,,,reconciled_from_exchange,,,,,,,,,,,,win,27638272436
+2026-08-03 06:41:35 UTC,BTCUSDT,SHORT,62888.5,62666.3,0.0009,56.59965,0.24517972,0.04519972,0.19998,0.0035332373963443235,0,9395.79,,,reconciled_from_exchange,,,,,,,,,,,,win,27734481104
