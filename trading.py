@@ -198,6 +198,29 @@
      adverse tick, or a momentarily elevated risk score) can no longer
      trigger this on its own. Every other DCA step, DCA sizing, and every
      other branch of _manage_open_position() is unchanged.
+
+ 2026-08 Smart Exit V2 retune (isolated to the Smart Exit V2 block inside
+ _manage_open_position() and its two new config constants only - signal
+ calculation in _smart_exit_v2_signals(), Profit Lock, DCA, TP, Hard Stop,
+ Brain scoring, and initialize_sync() are all untouched):
+   - Root cause: testnet observation showed most losing trades closing via
+     smart_exit rather than hard_stop/max_dca_exhausted, with Smart Exit
+     firing on ordinary pullbacks in choppy/ranging conditions before mean
+     reversion had a chance to play out.
+   - Fix 1: Smart Exit now gates on its own, stricter minimum hold
+     (SMART_EXIT_MIN_HOLD_SEC, 90s) instead of the general held_long_enough
+     (60s, still used unchanged by TP/partial-TP/trailing-stop), so a
+     freshly opened position gets extra room before Smart Exit can act.
+   - Fix 2: in SIDEWAYS/WEAK_TREND regimes, the required signal agreement
+     bar rises from SMART_EXIT_MIN_AGREE (5/6) to
+     SMART_EXIT_MIN_AGREE_RANGING (6/6, unanimous), since ordinary chop in
+     these regimes routinely trips 1-2 of the 6 signals without a genuine
+     reversal. STRONG_TREND/HIGH_VOL keep the original 5/6 bar unchanged,
+     so real reversals/breakdowns are still closed just as quickly as
+     before.
+   - Nothing about the six underlying signals, the loss/DCA-proximity
+     gates, or any other exit path (TP, trailing stop, hard stop, profit
+     lock, max DCA exhausted, final-DCA gate) was changed.
 ================================================================================
 """
 
@@ -280,6 +303,8 @@ from config import (
     SMART_EXIT_CONFIDENCE_DROP,
     SMART_EXIT_ATR_MOVE_MULT,
     SMART_EXIT_DCA_PROXIMITY_RATIO,
+    SMART_EXIT_MIN_HOLD_SEC,
+    SMART_EXIT_MIN_AGREE_RANGING,
     DCA_ATR_MULTIPLIER,
     DCA_MIN_DISTANCE_PCT,
     DCA_MAX_DISTANCE_PCT,
@@ -1154,6 +1179,8 @@ TRADE_LOG_FIELDS = [
     "entry_regime", "exit_regime", "entry_confidence", "entry_risk_score",
     "entry_success_prob", "entry_tp_hit_prob", "reward", "final_outcome",
     "exit_order_id",
+    "smart_exit_agree_count", "smart_exit_required_agree",
+    "smart_exit_signals_fired", "smart_exit_dca_distance_pct",
 ]
 
 
@@ -1571,6 +1598,16 @@ class MartingaleManager:
         # guarantee for fill events this process's own orders generate.
         self._unmatched_fills: Dict[int, Tuple[dict, float]] = {}
         self._UNMATCHED_FILL_TTL_SEC: float = 15.0
+
+        # 2026-08 Smart Exit diagnostics (logging-only, added alongside the
+        # Smart Exit V2 retune): captures the signal agree_count/
+        # required_agree/which-signals-fired/dca_distance_pct at the exact
+        # moment a smart_exit close is decided in _manage_open_position(),
+        # so _on_close_filled() can attach it to the permanent trade-log
+        # record below. Purely additive - does not affect any entry/exit/
+        # DCA/risk decision. Cleared (consumed) on every close so it can
+        # never leak into an unrelated later exit's record.
+        self._last_smart_exit_diagnostics: Optional[dict] = None
 
         # --- Trade-log reconciliation (Binance is the source of truth) ----
         # In-memory high-water-mark of the highest Binance trade id ("t" on
@@ -2862,22 +2899,50 @@ class MartingaleManager:
         #      distance, so DCA gets to activate instead of racing Smart
         #      Exit to close the trade first.
         #   3. SMART_EXIT_MIN_AGREE raised to 5/6 (see config.py).
+        #
+        # 2026-08 Smart Exit V2 retune (two additional gates, isolated to
+        # this block only - signal calculation in _smart_exit_v2_signals(),
+        # DCA/TP/Hard-Stop/Brain logic, and everything else untouched):
+        #   4. Smart Exit now waits for its OWN minimum hold
+        #      (SMART_EXIT_MIN_HOLD_SEC, 90s) rather than reusing the
+        #      general held_long_enough (60s, shared with TP/partial-TP/
+        #      trailing-stop). A fresh entry gets extra room before Smart
+        #      Exit can act, without delaying take-profit for winners.
+        #   5. In ranging regimes (SIDEWAYS/WEAK_TREND) - where ordinary
+        #      chop routinely trips 1-2 of the 6 signals without a real
+        #      reversal - the required agreement bar rises to
+        #      SMART_EXIT_MIN_AGREE_RANGING (6/6, unanimous) instead of the
+        #      normal SMART_EXIT_MIN_AGREE (5/6). STRONG_TREND/HIGH_VOL are
+        #      unchanged at 5/6 so genuine reversals are still caught fast.
+        smart_exit_held_long_enough = (time.time() - p.opened_at) >= SMART_EXIT_MIN_HOLD_SEC
         smart_exit_loss_gate = pct_move <= -SMART_EXIT_MIN_LOSS_PCT
         smart_exit_near_dca = (
             dca_distance_pct > 0
             and (-pct_move) >= dca_distance_pct * SMART_EXIT_DCA_PROXIMITY_RATIO
         )
         if (
-            SMART_EXIT_ENABLED and held_long_enough
+            SMART_EXIT_ENABLED and smart_exit_held_long_enough
             and smart_exit_loss_gate
             and pct_move > -SMART_EXIT_MAX_LOSS_PCT
             and not smart_exit_near_dca
         ):
             signals = self._smart_exit_v2_signals(pct_move, dynamic_tp_pct)
             agree_count = sum(1 for v in signals.values() if v)
-            if agree_count >= SMART_EXIT_MIN_AGREE:
+            required_agree = (
+                SMART_EXIT_MIN_AGREE_RANGING
+                if self.last_regime.regime in (REGIME_SIDEWAYS, REGIME_WEAK_TREND)
+                else SMART_EXIT_MIN_AGREE
+            )
+            if agree_count >= required_agree:
+                self._last_smart_exit_diagnostics = {
+                    "agree_count": agree_count,
+                    "required_agree": required_agree,
+                    "signals_fired": ",".join(k for k, v in signals.items() if v),
+                    "dca_distance_pct": dca_distance_pct,
+                }
                 await self.close_position(
                     f"SMART EXIT V2: {agree_count}/{len(signals)} signals agree "
+                    f"(required {required_agree}, regime={self.last_regime.regime}) "
                     f"({', '.join(k for k, v in signals.items() if v)}) at {pct_move*100:.2f}% - "
                     f"exiting before further adverse move rather than a single-tick panic exit",
                     exit_reason_tag="smart_exit",
@@ -3313,6 +3378,13 @@ class MartingaleManager:
                 f"reward={reward:+.4f}, brain_updates={self.brain.update_count})", MAGENTA,
             ))
 
+        # 2026-08 Smart Exit diagnostics (logging-only - see attribute's own
+        # comment in __init__). Only ever populated immediately before a
+        # smart_exit close, and always consumed (popped) here so a later,
+        # unrelated exit can never accidentally inherit stale values.
+        smart_exit_diag = self._last_smart_exit_diagnostics if exit_reason == "smart_exit" else None
+        self._last_smart_exit_diagnostics = None
+
         # --- permanent training dataset -------------------------------------------
         record = {
             "close_time": trade_log_close_time_str(),
@@ -3345,6 +3417,10 @@ class MartingaleManager:
             "final_outcome": "win" if was_success else "loss",
             "exit_order_id": int(order_id) if order_id is not None else None,
             "binance_order_ids": [int(order_id)] if order_id is not None else [],
+            "smart_exit_agree_count": smart_exit_diag["agree_count"] if smart_exit_diag else "",
+            "smart_exit_required_agree": smart_exit_diag["required_agree"] if smart_exit_diag else "",
+            "smart_exit_signals_fired": smart_exit_diag["signals_fired"] if smart_exit_diag else "",
+            "smart_exit_dca_distance_pct": smart_exit_diag["dca_distance_pct"] if smart_exit_diag else "",
         }
         self._log_completed_trade(record)
 
