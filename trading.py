@@ -232,6 +232,20 @@ from config import (
     TAKE_PROFIT_MAX_PCT,
     TP_VOL_LOW,
     TP_VOL_HIGH,
+    MAX_HOLD_TIME_ENABLED,
+    MAX_HOLD_TIME_SEC,
+    MAX_HOLD_TIME_HARD_CAP_SEC,
+    LOW_VOLATILITY_FILTER_ENABLED,
+    LOW_VOLATILITY_ATR_PCT_THRESHOLD,
+    ADAPTIVE_SIZING_ENABLED,
+    ADAPTIVE_SIZE_SENSITIVITY,
+    ADAPTIVE_SCALE_MIN,
+    ADAPTIVE_SCALE_MAX,
+    ADAPTIVE_TP_MIN_RATIO,
+    ADAPTIVE_TP_MAX_RATIO,
+    ENTRY_MOMENTUM_SATURATION_PCT,
+    PROFIT_LOCK_ACTIVATION_USDT,
+    PROFIT_LOCK_RATIO,
     SIGNAL_LOOKBACK_TICKS,
     SIGNAL_DEADBAND_PCT,
     TRADE_COOLDOWN_SEC,
@@ -326,12 +340,11 @@ GREEN, RED, YELLOW, CYAN, GRAY, BOLD, MAGENTA, BLUE = "32", "31", "33", "36", "9
 
 # ============================================================================
 # PROFIT LOCK (new, position-level, DCA-aware - see module docstring) -------
-# Kept as local constants in this module only, per the requirement to scope
-# this feature to trading.py without touching config.py.
+# PROFIT_LOCK_ACTIVATION_USDT / PROFIT_LOCK_RATIO now live in config.py
+# (2026-08 Railway-tuning fix, see config.py) so they can be tuned via
+# environment variables without a code edit - same default values as
+# before, imported above.
 # ============================================================================
-
-PROFIT_LOCK_ACTIVATION_USDT = 0.10   # unrealized net PnL at which the lock arms
-PROFIT_LOCK_RATIO = 0.50             # protected profit = this fraction of peak
 
 # DCA-state peak-save throttle (2026-07 DCA-state-recovery fix): minimum
 # growth in peak_unrealized_pnl (USDT) since the last persisted snapshot
@@ -950,6 +963,25 @@ class EntryEngineV2:
         )
         regime_blocked = regime.regime not in allowed_regimes
 
+        # --- Low-volatility ("dead market") hard gate (NEW) ---------------------
+        # MarketRegimeEngine's SIDEWAYS/LOW_VOL split is RELATIVE (current ATR
+        # vs its own recent rolling mean - see MarketRegimeEngine.evaluate), so
+        # a genuinely dead/flat tape can still be classified SIDEWAYS (allowed,
+        # at a lower score threshold) instead of LOW_VOL (already blocked) if
+        # the rolling mean itself has also been low for a while. This is an
+        # ABSOLUTE floor on atr_pct, independent of that ratio, so it only
+        # blocks truly dead conditions - normal ranging/SIDEWAYS markets above
+        # the floor are completely unaffected. Like the regime gate above, this
+        # is a hard block, not a score discount, and only applies when we
+        # actually have a valid (nonzero) ATR reading, so warmup / insufficient-
+        # candle ticks (atr_pct == 0.0 default) never get blocked by this.
+        dead_market_blocked = (
+            LOW_VOLATILITY_FILTER_ENABLED
+            and regime.atr_pct > 0
+            and regime.atr_pct < LOW_VOLATILITY_ATR_PCT_THRESHOLD
+        )
+        regime_blocked = regime_blocked or dead_market_blocked
+
         volume_confirmation = clamp((volume_z + 2.0) / 4.0, 0.0, 1.0)  # z in [-2,2] -> [0,1]
 
         # Volatility fit: entries are best in LOW/normal-to-moderate vol and
@@ -965,7 +997,16 @@ class EntryEngineV2:
         else:  # SIDEWAYS
             volatility_fit = 0.4
 
-        momentum_component = clamp((abs(momentum) / 0.002), 0.0, 1.0)  # saturates at 0.2% tick momentum
+        # (2026-08 entry-timing fix) `momentum` is now the short rolling
+        # return (features[4], ~5 candles - see on_price_tick) rather than a
+        # single bookTicker-tick return. Root cause of the prior bug: a
+        # single-tick return is typically ~1e-5 for BTC, so scoring it
+        # against a 0.2% (0.002) saturation threshold meant this component
+        # was effectively always ~0 regardless of real market momentum -
+        # the 0.13 weight assigned to it in ENTRY_WEIGHTS was silently dead.
+        # ENTRY_MOMENTUM_SATURATION_PCT (config.py) is sized for the
+        # multi-candle rolling return actually being passed in now.
+        momentum_component = clamp((abs(momentum) / ENTRY_MOMENTUM_SATURATION_PCT), 0.0, 1.0)
 
         # Regime fit: does the regime's own directional bias (slope sign)
         # agree with the brain's proposed side?
@@ -1005,7 +1046,8 @@ class EntryEngineV2:
         if self._should_log():
             print(color(
                 f"{now_str()} [entry-debug] regime={regime.regime} "
-                f"regime_blocked={regime_blocked} "
+                f"regime_blocked={regime_blocked} dead_market_blocked={dead_market_blocked} "
+                f"atr_pct={regime.atr_pct:.6f} "
                 f"brain_confidence={components['brain_confidence']:.4f} "
                 f"trend_confidence={components['trend_confidence']:.4f} "
                 f"volume_confirmation={components['volume_confirmation']:.4f} "
@@ -2202,6 +2244,41 @@ class MartingaleManager:
 
     # -- dynamic TP / DCA spacing --------------------------------------------------
 
+    def _adaptive_scale_factor(self) -> float:
+        """Percentage Adaptive TP/DCA System (NEW): a bounded multiplier
+        applied on top of the existing ATR-based dynamic TP/DCA numbers
+        below, based on:
+          - position size/notional/margin already committed (bigger
+            accumulated notional - i.e. deeper DCA - shrinks the multiplier
+            toward ADAPTIVE_SCALE_MIN, so a large book targets a smaller
+            percentage move to secure profit faster / tighten DCA spacing;
+            a small/fresh position stays close to 1.0)
+          - current market regime (trending regimes nudge the multiplier up
+            toward ADAPTIVE_SCALE_MAX so winners/DCA can run a bit wider;
+            SIDEWAYS nudges it down toward tighter targets)
+        Always clamped to [ADAPTIVE_SCALE_MIN, ADAPTIVE_SCALE_MAX] - the
+        callers below additionally clamp the final TP/DCA pct to their own
+        existing absolute safety bounds, so this can only move the result
+        within those established ceilings/floors, never past them."""
+        if not ADAPTIVE_SIZING_ENABLED:
+            return 1.0
+
+        scale = 1.0
+        p = self.position
+        if p.total_qty and p.avg_entry_price:
+            current_notional = p.total_qty * p.avg_entry_price
+            baseline_notional = INITIAL_ENTRY_USDT * self.leverage
+            if baseline_notional > 0:
+                depth_ratio = max(0.0, (current_notional / baseline_notional) - 1.0)
+                scale *= 1.0 / (1.0 + ADAPTIVE_SIZE_SENSITIVITY * depth_ratio)
+
+        if self.last_regime.regime in (REGIME_STRONG_TREND, REGIME_WEAK_TREND):
+            scale *= 1.05
+        elif self.last_regime.regime == REGIME_SIDEWAYS:
+            scale *= 0.90
+
+        return clamp(scale, ADAPTIVE_SCALE_MIN, ADAPTIVE_SCALE_MAX)
+
     def get_dynamic_take_profit_pct(self) -> float:
         if not DYNAMIC_TP_ENABLED:
             return TAKE_PROFIT_PCT
@@ -2210,25 +2287,46 @@ class MartingaleManager:
             return TAKE_PROFIT_PCT
         vol = self.last_regime.atr_pct if self.last_regime.atr_pct else compute_atr_pct(candles)
         if vol <= TP_VOL_LOW:
-            return TAKE_PROFIT_PCT
-        if vol >= TP_VOL_HIGH:
-            return TAKE_PROFIT_MAX_PCT
-        vol_range = TP_VOL_HIGH - TP_VOL_LOW
-        ratio = (vol - TP_VOL_LOW) / vol_range if vol_range > 0 else 0.0
-        return TAKE_PROFIT_PCT + ratio * (TAKE_PROFIT_MAX_PCT - TAKE_PROFIT_PCT)
+            base_tp = TAKE_PROFIT_PCT
+        elif vol >= TP_VOL_HIGH:
+            base_tp = TAKE_PROFIT_MAX_PCT
+        else:
+            vol_range = TP_VOL_HIGH - TP_VOL_LOW
+            ratio = (vol - TP_VOL_LOW) / vol_range if vol_range > 0 else 0.0
+            base_tp = TAKE_PROFIT_PCT + ratio * (TAKE_PROFIT_MAX_PCT - TAKE_PROFIT_PCT)
+
+        # Percentage Adaptive TP System: scale the vol-based base_tp by
+        # position size/margin + regime, then re-clamp to
+        # [TAKE_PROFIT_PCT * ADAPTIVE_TP_MIN_RATIO, TAKE_PROFIT_MAX_PCT *
+        # ADAPTIVE_TP_MAX_RATIO] - both ratios default to 1.0, so with no
+        # env overrides this clamp is identical to the existing
+        # [TAKE_PROFIT_PCT, TAKE_PROFIT_MAX_PCT] band and default behavior
+        # for a fresh (step-0) position in a non-trending/non-sideways
+        # regime is unchanged (scale == 1.0).
+        adaptive_tp = base_tp * self._adaptive_scale_factor()
+        return clamp(
+            adaptive_tp,
+            TAKE_PROFIT_PCT * ADAPTIVE_TP_MIN_RATIO,
+            TAKE_PROFIT_MAX_PCT * ADAPTIVE_TP_MAX_RATIO,
+        )
 
     def get_dynamic_dca_distance_pct(self) -> float:
         """ATR-adaptive DCA spacing: distance scales with current ATR% so
         DCA adds happen further apart in a volatile market (avoiding
         rapid-fire DCA into noise) and closer together in a quiet one,
         always bounded to [DCA_MIN_DISTANCE_PCT, DCA_MAX_DISTANCE_PCT] and
-        never below the original static DCA_TRIGGER_PCT floor."""
+        never below the original static DCA_TRIGGER_PCT floor. Also scaled
+        by the same Percentage Adaptive System factor as dynamic TP (size/
+        margin + regime), still within the same existing absolute bounds."""
         atr_pct = self.last_regime.atr_pct
         if atr_pct <= 0:
-            return DCA_TRIGGER_PCT
-        dynamic = atr_pct * DCA_ATR_MULTIPLIER
-        dynamic = clamp(dynamic, DCA_MIN_DISTANCE_PCT, DCA_MAX_DISTANCE_PCT)
-        return max(dynamic, DCA_TRIGGER_PCT)
+            dynamic = DCA_TRIGGER_PCT
+        else:
+            dynamic = clamp(atr_pct * DCA_ATR_MULTIPLIER, DCA_MIN_DISTANCE_PCT, DCA_MAX_DISTANCE_PCT)
+
+        adaptive = dynamic * self._adaptive_scale_factor()
+        adaptive = clamp(adaptive, DCA_MIN_DISTANCE_PCT, DCA_MAX_DISTANCE_PCT)
+        return max(adaptive, DCA_TRIGGER_PCT)
 
     # -- entry signal (fallback for warmup only) ------------------------------------
 
@@ -2325,7 +2423,12 @@ class MartingaleManager:
             if len(volumes) >= 10:
                 vmean, vstd = float(np.mean(volumes[-30:])), float(np.std(volumes[-30:]))
                 volume_z = clamp(safe_div(volumes[-1] - vmean, vstd, 0.0), -4.0, 4.0) if vstd else 0.0
-            momentum = float(features[22]) if len(features) > 22 else 0.0  # momentum_short index
+            # (2026-08 entry-timing fix) features[4] is rolling_return_5 (the
+            # short multi-candle rolling return) rather than features[22]'s
+            # single-tick momentum_short - see EntryEngineV2.evaluate's
+            # momentum_component comment for why the previous index/threshold
+            # pairing left this scoring component effectively inert.
+            momentum = float(features[4]) if len(features) > 4 else 0.0  # rolling_return_5
 
             decision = self.entry_engine.evaluate(self.last_confidence, self.last_regime, volume_z, momentum, features)
             self.last_entry_decision = decision
@@ -2655,6 +2758,43 @@ class MartingaleManager:
                         exit_reason_tag="profit_lock",
                     )
                     return
+
+        # --- Max Hold Time Protection (NEW - scalping-bot safety net) --------------
+        # This is a scalping bot; positions are meant to resolve in minutes,
+        # not hours. If TP/Smart-Exit/DCA/Profit-Lock all keep passing on a
+        # position because the market is dead/ranging, this is a backstop
+        # so it never silently holds for many hours. Deliberately does NOT
+        # blindly close a profitable trade:
+        #   - if Profit Lock is already active, it is already protecting
+        #     this trade's profit on its own terms - deferred to, below the
+        #     hard cap.
+        #   - if the position is currently net-profitable AND the market is
+        #     still genuinely trending (STRONG_TREND/WEAK_TREND), it's given
+        #     more room to keep working rather than being cut off mid-trend.
+        #   - otherwise (flat/losing, or a dead/ranging/choppy regime), it
+        #     is closed once MAX_HOLD_TIME_SEC is reached.
+        # MAX_HOLD_TIME_HARD_CAP_SEC is an unconditional absolute ceiling
+        # that always closes the position regardless of PnL/regime/Profit-
+        # Lock state, so total holding time is always bounded even for a
+        # genuinely-still-trending winner.
+        held_sec_so_far = time.time() - p.opened_at
+        if MAX_HOLD_TIME_ENABLED and held_sec_so_far >= MAX_HOLD_TIME_SEC:
+            hard_cap_hit = held_sec_so_far >= MAX_HOLD_TIME_HARD_CAP_SEC
+            trending_and_profitable = (
+                unrealized_pnl_usdt > 0
+                and self.last_regime.regime in (REGIME_STRONG_TREND, REGIME_WEAK_TREND)
+            )
+            still_deferring = (not hard_cap_hit) and (p.profit_lock_active or trending_and_profitable)
+            if not still_deferring:
+                await self.close_position(
+                    f"max hold time reached: {held_sec_so_far/3600:.2f}h >= "
+                    f"{MAX_HOLD_TIME_SEC/3600:.2f}h (hard_cap={hard_cap_hit}, "
+                    f"regime={self.last_regime.regime}, unrealized_pnl=${unrealized_pnl_usdt:+.4f}, "
+                    f"profit_lock_active={p.profit_lock_active}) - closing dead/ranging hold "
+                    f"instead of tying up capital indefinitely",
+                    emergency=True, exit_reason_tag="max_hold_time",
+                )
+                return
 
         held_long_enough = (time.time() - p.opened_at) >= MIN_HOLD_SEC_BEFORE_EXIT
         dynamic_tp_pct = self.get_dynamic_take_profit_pct()
