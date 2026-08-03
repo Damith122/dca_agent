@@ -43,25 +43,93 @@ API_KEY = os.environ.get("BINANCE_API_KEY", "")
 API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
 
 # --- Account / margin --------------------------------------------------------
-LEVERAGE = 40
-MAX_ALLOWED_LEVERAGE = 50
+# (2026-08 Railway-tuning fix) These were previously hardcoded numbers with
+# no environment override. They are now read from the environment with the
+# EXACT SAME default values as before, so an unconfigured Railway deploy
+# behaves identically to today - only an operator explicitly setting one of
+# these env vars changes anything.
+LEVERAGE = int(os.environ.get("LEVERAGE", "40"))
+MAX_ALLOWED_LEVERAGE = int(os.environ.get("MAX_ALLOWED_LEVERAGE", "50"))
 MARGIN_TYPE = "CROSSED"
 
 # --- Position sizing (Fixed Amount base, Martingale, now confidence-scaled) -
-INITIAL_ENTRY_USDT = 1.5
-DCA_MULTIPLIER = 1.6            # reduced from 2.0 (2026-07 profitability fix) - less notional/fee blowup per DCA rung
-MAX_DCA_STEPS = 3               # reduced from 5 (2026-07 profitability fix) - caps worst-case martingale depth
+INITIAL_ENTRY_USDT = float(os.environ.get("INITIAL_ENTRY_USDT", "1.5"))
+DCA_MULTIPLIER = float(os.environ.get("DCA_MULTIPLIER", "1.6"))  # reduced from 2.0 (2026-07 profitability fix) - less notional/fee blowup per DCA rung
+MAX_DCA_STEPS = int(os.environ.get("MAX_DCA_STEPS", "3"))        # reduced from 5 (2026-07 profitability fix) - caps worst-case martingale depth
 
 # --- Trade management ---------------------------------------------------------
-DCA_TRIGGER_PCT = 0.002          # floor / fallback DCA spacing (also used if ATR unavailable)
-TAKE_PROFIT_PCT = 0.0035         # raised from 0.002 (2026-07 profitability fix) - clears round-trip fee floor with real margin
-HARD_STOP_PCT = 0.02            # tightened from 0.05 (2026-07 profitability fix) - fixes stop:TP risk/reward skew
+DCA_TRIGGER_PCT = float(os.environ.get("DCA_TRIGGER_PCT", "0.002"))    # floor / fallback DCA spacing (also used if ATR unavailable)
+TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PCT", "0.0035"))   # raised from 0.002 (2026-07 profitability fix) - clears round-trip fee floor with real margin
+HARD_STOP_PCT = float(os.environ.get("HARD_STOP_PCT", "0.02"))         # tightened from 0.05 (2026-07 profitability fix) - fixes stop:TP risk/reward skew
 
 # --- Dynamic (volatility-based) Take Profit ----------------------------------
-DYNAMIC_TP_ENABLED = True
-TAKE_PROFIT_MAX_PCT = 0.010      # raised from 0.006 (2026-07 profitability fix) - lets winners run further in trend/high-vol
-TP_VOL_LOW = 0.0003              # tick-return std at/below this -> quiet -> base TP
-TP_VOL_HIGH = 0.0012             # tick-return std at/above this -> max TP expansion
+DYNAMIC_TP_ENABLED = os.environ.get("DYNAMIC_TP_ENABLED", "true").lower() != "false"
+TAKE_PROFIT_MAX_PCT = float(os.environ.get("TAKE_PROFIT_MAX_PCT", "0.010"))  # raised from 0.006 (2026-07 profitability fix) - lets winners run further in trend/high-vol
+TP_VOL_LOW = float(os.environ.get("TP_VOL_LOW", "0.0003"))    # tick-return std at/below this -> quiet -> base TP
+TP_VOL_HIGH = float(os.environ.get("TP_VOL_HIGH", "0.0012"))  # tick-return std at/above this -> max TP expansion
+
+# --- Max Hold Time Protection (NEW - scalping bot safety net) ----------------
+# This is a scalping bot; positions are meant to resolve in minutes, not
+# hours. If the market goes dead/ranging and none of TP/Smart-Exit/DCA/
+# Profit-Lock naturally close the trade, this is a backstop so the bot
+# never silently holds a position for many hours. See trading.py's
+# _manage_open_position() for how PnL/regime/Profit-Lock state are
+# consulted before this is allowed to force-close a trade (it does NOT
+# blindly close profitable/trending positions - see MAX_HOLD_TIME_HARD_CAP_SEC
+# for the unconditional absolute ceiling).
+MAX_HOLD_TIME_ENABLED = os.environ.get("MAX_HOLD_TIME_ENABLED", "true").lower() != "false"
+MAX_HOLD_TIME_SEC = int(os.environ.get("MAX_HOLD_TIME_SEC", str(4 * 3600)))       # 4h soft cap
+MAX_HOLD_TIME_HARD_CAP_SEC = int(os.environ.get("MAX_HOLD_TIME_HARD_CAP_SEC", str(8 * 3600)))  # 8h absolute cap, always closes regardless of PnL/regime/profit-lock
+
+# --- Low Volatility ("dead market") Entry Filter (NEW) -----------------------
+# MarketRegimeEngine's SIDEWAYS/LOW_VOL split is RELATIVE (current ATR vs its
+# own recent rolling mean), so a genuinely dead/flat tape can still be
+# classified SIDEWAYS (which EntryEngineV2 allows, at a lower score
+# threshold) rather than LOW_VOL (which is already blocked) if the rolling
+# mean itself has also been low for a while. This is an ABSOLUTE floor on
+# atr_pct, independent of that ratio, so only truly dead conditions are
+# blocked - normal ranging/SIDEWAYS markets above this floor are unaffected.
+LOW_VOLATILITY_FILTER_ENABLED = os.environ.get("LOW_VOLATILITY_FILTER_ENABLED", "true").lower() != "false"
+LOW_VOLATILITY_ATR_PCT_THRESHOLD = float(os.environ.get("LOW_VOLATILITY_ATR_PCT_THRESHOLD", "0.00015"))
+
+# --- Percentage Adaptive TP/DCA System (NEW) ---------------------------------
+# Applies a bounded multiplier on TOP of the existing ATR-based dynamic TP
+# (get_dynamic_take_profit_pct) and dynamic DCA spacing
+# (get_dynamic_dca_distance_pct) in trading.py, based on how large the
+# position has already grown (notional/margin, i.e. DCA depth) and the
+# current market regime:
+#   - bigger accumulated notional -> multiplier shrinks toward
+#     ADAPTIVE_SCALE_MIN (secure profit / tighten DCA sooner on a large book)
+#   - small/initial-size position -> multiplier stays near 1.0
+#   - trending regimes -> multiplier nudged up (toward ADAPTIVE_SCALE_MAX)
+#   - flat/SIDEWAYS regime -> multiplier nudged down
+# The result is still clamped by the EXISTING absolute safety bounds
+# (TAKE_PROFIT_PCT/TAKE_PROFIT_MAX_PCT and DCA_MIN_DISTANCE_PCT/
+# DCA_MAX_DISTANCE_PCT below) - this can only move the dynamic TP/DCA value
+# within those already-established ceilings/floors, never beyond them,
+# unless ADAPTIVE_TP_MIN_RATIO/ADAPTIVE_TP_MAX_RATIO are explicitly changed
+# from their backward-compatible defaults of 1.0.
+ADAPTIVE_SIZING_ENABLED = os.environ.get("ADAPTIVE_SIZING_ENABLED", "true").lower() != "false"
+ADAPTIVE_SIZE_SENSITIVITY = float(os.environ.get("ADAPTIVE_SIZE_SENSITIVITY", "0.15"))
+ADAPTIVE_SCALE_MIN = float(os.environ.get("ADAPTIVE_SCALE_MIN", "0.75"))
+ADAPTIVE_SCALE_MAX = float(os.environ.get("ADAPTIVE_SCALE_MAX", "1.15"))
+ADAPTIVE_TP_MIN_RATIO = float(os.environ.get("ADAPTIVE_TP_MIN_RATIO", "1.0"))
+ADAPTIVE_TP_MAX_RATIO = float(os.environ.get("ADAPTIVE_TP_MAX_RATIO", "1.0"))
+
+# --- Entry Timing: momentum feature calibration (2026-08 entry-timing fix) ---
+# See trading.py EntryEngineV2/on_price_tick module notes for root cause:
+# the momentum component previously read the single-tick price_return
+# (features[22], typically ~1e-5 for BTC bookTicker jitter) but scored it
+# against a 0.002 (0.2%) saturation threshold sized for a multi-candle move
+# - the momentum term was effectively always ~0 regardless of real market
+# momentum. Entry now reads the short rolling return (features[4],
+# ROLLING_RETURN_WINDOWS[0]=5 candles) against this threshold instead.
+ENTRY_MOMENTUM_SATURATION_PCT = float(os.environ.get("ENTRY_MOMENTUM_SATURATION_PCT", "0.0015"))
+
+# --- Profit Lock (env-configurable - 2026-08 Railway-tuning fix; values and
+# behavior are UNCHANGED, only made overridable without a code edit) --------
+PROFIT_LOCK_ACTIVATION_USDT = float(os.environ.get("PROFIT_LOCK_ACTIVATION_USDT", "0.10"))
+PROFIT_LOCK_RATIO = float(os.environ.get("PROFIT_LOCK_RATIO", "0.50"))
 
 # --- Simple entry signal (warmup/fallback only, see BRAIN V2 below) ---------
 SIGNAL_LOOKBACK_TICKS = 20
@@ -277,6 +345,20 @@ __all__ = [
     "TAKE_PROFIT_MAX_PCT",
     "TP_VOL_LOW",
     "TP_VOL_HIGH",
+    "MAX_HOLD_TIME_ENABLED",
+    "MAX_HOLD_TIME_SEC",
+    "MAX_HOLD_TIME_HARD_CAP_SEC",
+    "LOW_VOLATILITY_FILTER_ENABLED",
+    "LOW_VOLATILITY_ATR_PCT_THRESHOLD",
+    "ADAPTIVE_SIZING_ENABLED",
+    "ADAPTIVE_SIZE_SENSITIVITY",
+    "ADAPTIVE_SCALE_MIN",
+    "ADAPTIVE_SCALE_MAX",
+    "ADAPTIVE_TP_MIN_RATIO",
+    "ADAPTIVE_TP_MAX_RATIO",
+    "ENTRY_MOMENTUM_SATURATION_PCT",
+    "PROFIT_LOCK_ACTIVATION_USDT",
+    "PROFIT_LOCK_RATIO",
     "SIGNAL_LOOKBACK_TICKS",
     "SIGNAL_DEADBAND_PCT",
     "TRADE_COOLDOWN_SEC",
