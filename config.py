@@ -199,6 +199,17 @@ SMART_EXIT_MIN_AGREE = 5          # of the following 6 signals, how many must ag
 SMART_EXIT_CONFIDENCE_DROP = 0.18  # confidence_score drop vs entry that counts as "dropped"
 SMART_EXIT_ATR_MOVE_MULT = 0.8     # adverse move >= this * ATR% counts as a signal
 SMART_EXIT_DCA_PROXIMITY_RATIO = 0.9  # if the adverse move is already >= this fraction of the current DCA trigger distance, Smart Exit is blocked so DCA can activate instead (2026-07 Smart Exit fix)
+SMART_EXIT_MIN_HOLD_SEC = float(os.environ.get("SMART_EXIT_MIN_HOLD_SEC", "90"))
+# Smart-Exit-only minimum hold, separate from and stricter than MIN_HOLD_SEC_BEFORE_EXIT
+# (60s) above. Only gates Smart Exit itself, so TP/partial-TP/trailing-stop timing is
+# unchanged - a fresh entry just gets extra room before Smart Exit can close it
+# (2026-08 Smart Exit V2 retune).
+SMART_EXIT_MIN_AGREE_RANGING = int(os.environ.get("SMART_EXIT_MIN_AGREE_RANGING", "6"))
+# In SIDEWAYS/WEAK_TREND, require ALL 6 signals (unanimous) instead of the normal
+# SMART_EXIT_MIN_AGREE (5), since ordinary chop/pullbacks in these regimes trip 1-2
+# signals often without a real reversal happening. STRONG_TREND/HIGH_VOL keep the
+# stricter 5-of-6 bar unchanged, so genuine reversals are still caught quickly
+# (2026-08 Smart Exit V2 retune).
 
 # --- ATR-based Dynamic DCA ----------------------------------------------------
 DCA_ATR_MULTIPLIER = float(os.environ.get("DCA_ATR_MULTIPLIER", "1.2"))
@@ -398,6 +409,8 @@ __all__ = [
     "SMART_EXIT_CONFIDENCE_DROP",
     "SMART_EXIT_ATR_MOVE_MULT",
     "SMART_EXIT_DCA_PROXIMITY_RATIO",
+    "SMART_EXIT_MIN_HOLD_SEC",
+    "SMART_EXIT_MIN_AGREE_RANGING",
     "DCA_ATR_MULTIPLIER",
     "DCA_MIN_DISTANCE_PCT",
     "DCA_MAX_DISTANCE_PCT",
