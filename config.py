@@ -48,7 +48,7 @@ API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
 # EXACT SAME default values as before, so an unconfigured Railway deploy
 # behaves identically to today - only an operator explicitly setting one of
 # these env vars changes anything.
-LEVERAGE = int(os.environ.get("LEVERAGE", "40"))
+LEVERAGE = int(os.environ.get("LEVERAGE", "20"))
 MAX_ALLOWED_LEVERAGE = int(os.environ.get("MAX_ALLOWED_LEVERAGE", "50"))
 MARGIN_TYPE = "CROSSED"
 
@@ -122,10 +122,10 @@ LOW_VOLATILITY_ATR_PCT_THRESHOLD = float(os.environ.get("LOW_VOLATILITY_ATR_PCT_
 # unless ADAPTIVE_TP_MIN_RATIO/ADAPTIVE_TP_MAX_RATIO are explicitly changed
 # from their backward-compatible defaults of 1.0.
 ADAPTIVE_SIZING_ENABLED = os.environ.get("ADAPTIVE_SIZING_ENABLED", "true").lower() != "false"
-ADAPTIVE_SIZE_SENSITIVITY = float(os.environ.get("ADAPTIVE_SIZE_SENSITIVITY", "0.15"))
-ADAPTIVE_SCALE_MIN = float(os.environ.get("ADAPTIVE_SCALE_MIN", "0.75"))
+ADAPTIVE_SIZE_SENSITIVITY = float(os.environ.get("ADAPTIVE_SIZE_SENSITIVITY", "0.25"))
+ADAPTIVE_SCALE_MIN = float(os.environ.get("ADAPTIVE_SCALE_MIN", "0.45"))
 ADAPTIVE_SCALE_MAX = float(os.environ.get("ADAPTIVE_SCALE_MAX", "1.15"))
-ADAPTIVE_TP_MIN_RATIO = float(os.environ.get("ADAPTIVE_TP_MIN_RATIO", "1.0"))
+ADAPTIVE_TP_MIN_RATIO = float(os.environ.get("ADAPTIVE_TP_MIN_RATIO", "0.45"))
 ADAPTIVE_TP_MAX_RATIO = float(os.environ.get("ADAPTIVE_TP_MAX_RATIO", "1.0"))
 
 # --- Entry Timing: momentum feature calibration (2026-08 entry-timing fix) ---
@@ -150,6 +150,15 @@ SIGNAL_DEADBAND_PCT = 0.0005
 # --- Over-trading guardrails --------------------------------------------------
 TRADE_COOLDOWN_SEC = int(os.environ.get("TRADE_COOLDOWN_SEC", "60"))
 MIN_HOLD_SEC_BEFORE_EXIT = int(os.environ.get("MIN_HOLD_SEC_BEFORE_EXIT", "60"))
+MAX_DAILY_LOSS_USDT = float(os.environ.get("MAX_DAILY_LOSS_USDT", "2.5"))
+# 2026-08 Daily Loss Protection: once today's (UTC calendar day) cumulative
+# realized PnL drops to/below -MAX_DAILY_LOSS_USDT, no NEW entries are opened
+# for the rest of that UTC day - see MartingaleManager's daily-loss tracker
+# in trading.py's on_price_tick(). An already-OPEN position keeps being
+# managed exactly as before (TP/Hard-Stop/Profit-Lock/DCA/Max-Hold-Time all
+# unaffected) - this only ever gates the FLAT-state entry decision, never
+# exit/risk management for an existing trade. Resets automatically at the
+# next UTC day boundary.
 
 # --- Fee-aware profit threshold ----------------------------------------------
 TAKER_FEE_RATE = float(os.environ.get("TAKER_FEE_RATE", "0.0005"))
@@ -388,6 +397,7 @@ __all__ = [
     "SIGNAL_DEADBAND_PCT",
     "TRADE_COOLDOWN_SEC",
     "MIN_HOLD_SEC_BEFORE_EXIT",
+    "MAX_DAILY_LOSS_USDT",
     "TAKER_FEE_RATE",
     "MIN_NET_PROFIT_USDT",
     "LIQUIDATION_SANITY_MIN_RATIO",
