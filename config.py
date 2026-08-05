@@ -53,9 +53,20 @@ MAX_ALLOWED_LEVERAGE = int(os.environ.get("MAX_ALLOWED_LEVERAGE", "50"))
 MARGIN_TYPE = "CROSSED"
 
 # --- Position sizing (Fixed Amount base, Martingale, now confidence-scaled) -
-INITIAL_ENTRY_USDT = float(os.environ.get("INITIAL_ENTRY_USDT", "1.5"))
+INITIAL_ENTRY_USDT = float(os.environ.get("INITIAL_ENTRY_USDT", "4"))
+# 2026-08 min-notional fix (this value only - DCA_MULTIPLIER, MAX_DCA_STEPS,
+# SIZE_MIN_MULT/MAX_MULT, and every other DCA/TP/Risk-Engine/Daily-Loss-
+# Protection value are unchanged): after reducing LEVERAGE to 20x, the
+# previous $1.50-$2 initial margin put INITIAL and DCA #1 notional below
+# Binance's $50 minimum whenever DCA #1's confidence-based size_mult (see
+# confidence_size_multiplier(), bounded to [SIZE_MIN_MULT, SIZE_MAX_MULT])
+# landed near its floor - both orders were rejected outright, so the bot
+# could never open a new position. $4 margin, at 20x, keeps INITIAL at $80
+# notional and DCA #1 at >= $64 notional even in the worst-case
+# (size_mult=SIZE_MIN_MULT=0.5) scenario - both comfortably above $50.
+# DCA #2/#3 were already well above the minimum and remain so.
 DCA_MULTIPLIER = float(os.environ.get("DCA_MULTIPLIER", "1.6"))  # reduced from 2.0 (2026-07 profitability fix) - less notional/fee blowup per DCA rung
-MAX_DCA_STEPS = int(os.environ.get("MAX_DCA_STEPS", "3"))        # reduced from 5 (2026-07 profitability fix) - caps worst-case martingale depth
+MAX_DCA_STEPS = int(os.environ.get("MAX_DCA_STEPS", "2"))        # reduced from 3 (2026-08 $33-account risk fix) - 3 steps required 112% of a $33 account's margin to fully cascade and produced ~45% worst-case single-trade loss; 2 steps fits within the account (~62.5% margin) and cuts worst-case loss to ~25% while keeping the final-DCA low-probability-recovery gate active at the depth where trade evidence showed it protecting against genuine trend moves
 
 # --- Trade management ---------------------------------------------------------
 DCA_TRIGGER_PCT = float(os.environ.get("DCA_TRIGGER_PCT", "0.002"))    # floor / fallback DCA spacing (also used if ATR unavailable)
