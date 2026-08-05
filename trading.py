@@ -258,6 +258,8 @@ from config import (
     MAX_HOLD_TIME_ENABLED,
     MAX_HOLD_TIME_SEC,
     MAX_HOLD_TIME_HARD_CAP_SEC,
+    MAX_HOLD_TIME_SMALL_LOSS_PCT,
+    MAX_HOLD_TIME_RECOVERY_MIN_AGREE,
     LOW_VOLATILITY_FILTER_ENABLED,
     LOW_VOLATILITY_ATR_PCT_THRESHOLD,
     ADAPTIVE_SIZING_ENABLED,
@@ -1539,6 +1541,9 @@ class MartingaleManager:
         self.last_trade_action_ts: float = 0.0
         self.last_trade_open_ts: float = 0.0
         self._last_warmup_skip_log_ts: float = 0.0  # throttles the pre-warmup "no entry" log line
+        self._last_max_hold_review_log_ts: float = 0.0  # throttles the Max Hold Time V2 "kept alive" diagnostic line
+        self._last_max_hold_dca_defer_log_ts: float = 0.0  # throttles the Max Hold Time V2 "DCA opportunity available" diagnostic line
+        self._max_hold_dca_defer_pending: bool = False  # set True when Max Hold Time V2 defers for a DCA opportunity this tick; consumed by _on_entry_filled() to log "[dca] executed after max-hold defer"
 
         # --- Brain V2 stack -----------------------------------------------------
         self.candles = CandleAggregator()
@@ -1740,6 +1745,17 @@ class MartingaleManager:
             # untracked_order_id recovery path below.
             "pending_order_id": p.pending_order_id,
             "pending_role": p.pending_role,
+            # 2026-08 CLOSING-resync opened_at fix: the real entry
+            # timestamp, so a full process restart (where the in-memory
+            # PositionState is gone entirely, unlike an in-process resync
+            # which has a separate, non-persistence-dependent fix in
+            # initialize_sync()) can still recover it instead of
+            # initialize_sync() falling back to time.time() when
+            # rebuilding - which previously corrupted holding_time_sec in
+            # the trade log. Only ever read back if side/qty/avg_entry_price
+            # all still match what the exchange reports, exactly like every
+            # other field restored from this snapshot.
+            "opened_at": p.opened_at,
         }
 
     async def save_dca_state(self, reason: str) -> None:
@@ -2387,6 +2403,26 @@ class MartingaleManager:
             return True
         return False
 
+    def _should_log_max_hold_review(self, interval_sec: float = 30.0) -> bool:
+        """Throttle for the Max Hold Time V2 'kept alive after emergency
+        review' diagnostic line - debugging only, does not affect whether
+        the position is actually deferred or closed."""
+        now = time.time()
+        if now - self._last_max_hold_review_log_ts >= interval_sec:
+            self._last_max_hold_review_log_ts = now
+            return True
+        return False
+
+    def _should_log_max_hold_dca_defer(self, interval_sec: float = 30.0) -> bool:
+        """Throttle for the Max Hold Time V2 'deferred: DCA opportunity
+        available' diagnostic line (2026-08 DCA-awareness fix) - debugging
+        only, does not affect whether the position is actually deferred."""
+        now = time.time()
+        if now - self._last_max_hold_dca_defer_log_ts >= interval_sec:
+            self._last_max_hold_dca_defer_log_ts = now
+            return True
+        return False
+
     # -- learning from ticks --------------------------------------------------------
 
     def _learn_from_tick(self, features: np.ndarray, atr_pct_now: float) -> None:
@@ -2437,6 +2473,31 @@ class MartingaleManager:
         if self.position.status == "FLAT":
             if time.time() - self.last_trade_action_ts < TRADE_COOLDOWN_SEC:
                 return
+
+            # 2026-08 Startup Warm-up Gate (isolated to entry gating only -
+            # DCA/exit management for an already-open position, Brain
+            # learning, and every other function are untouched). Brain's
+            # own update_count can in principle reach BRAIN2_WARMUP_UPDATES
+            # before the candle/indicator pipeline itself has enough
+            # history for a REAL (non-default) regime reading - ticks
+            # arrive far more often than candles close. MarketRegimeEngine
+            # already falls back to a default RegimeReading(atr_pct=0.0,
+            # regime=SIDEWAYS) when len(candles) is below the same
+            # max(EMA_SLOW, ATR_PERIOD) + 2 threshold used here, so
+            # `self.last_regime.atr_pct <= 0.0` after that many candles is
+            # itself a reliable "ATR/EMA not valid yet" signal - no
+            # duplicate calculation needed. No entries of any kind (Brain-
+            # scored or fallback) are allowed until both conditions clear.
+            if len(candles) < max(EMA_SLOW, ATR_PERIOD) + 2 or self.last_regime.atr_pct <= 0.0:
+                if self._should_log_warmup_skip():
+                    print(color(
+                        f"{now_str()} [entry-skip] startup warm-up: insufficient market history "
+                        f"(candles={len(candles)}/{max(EMA_SLOW, ATR_PERIOD) + 2}, "
+                        f"atr_pct={self.last_regime.atr_pct:.6f}) - indicators not yet valid, "
+                        f"no entries opened", GRAY,
+                    ))
+                return
+
             if not self.brain.is_ready():
                 # (2026-07 profitability fix) The static tick-momentum
                 # fallback traded a deadband smaller than normal BTC
@@ -2744,9 +2805,16 @@ class MartingaleManager:
             if not p.profit_lock_active and unrealized_pnl_usdt >= PROFIT_LOCK_ACTIVATION_USDT:
                 p.profit_lock_active = True
                 p.peak_unrealized_pnl = unrealized_pnl_usdt
+                # 2026-08 Profit Lock diagnostics (logging only - activation/
+                # ratio/close behavior below is unchanged): explicitly states
+                # peak, protected floor, locked percentage, and current
+                # unrealized PnL for debugging, instead of leaving floor/
+                # locked-pct implicit in the ratio text.
                 print(color(
-                    f"{now_str()} [profit-lock] ACTIVATED at unrealized_pnl=${unrealized_pnl_usdt:+.4f} "
-                    f"(protects {PROFIT_LOCK_RATIO*100:.0f}% of peak profit from here on)", GREEN,
+                    f"{now_str()} [profit-lock] ACTIVATED | unrealized_pnl=${unrealized_pnl_usdt:+.4f} "
+                    f"peak=${p.peak_unrealized_pnl:+.4f} "
+                    f"floor=${p.peak_unrealized_pnl * PROFIT_LOCK_RATIO:+.4f} "
+                    f"locked_pct={PROFIT_LOCK_RATIO*100:.0f}%", GREEN,
                 ))
                 # 2026-07 DCA-state-recovery fix: persist immediately so a
                 # restart/redeploy right after activation doesn't restore a
@@ -2766,6 +2834,16 @@ class MartingaleManager:
                 if (p.peak_unrealized_pnl - self._last_dca_state_peak_saved) >= DCA_STATE_PEAK_SAVE_MIN_DELTA_USDT:
                     self._last_dca_state_peak_saved = p.peak_unrealized_pnl
                     asyncio.create_task(self.save_dca_state(reason="profit lock peak updated"))
+                    # 2026-08 Profit Lock diagnostics (logging only): same
+                    # throttle as the persistence trigger above, so this
+                    # doesn't add per-tick log spam - purely for debugging,
+                    # does not affect activation/ratio/close behavior.
+                    print(color(
+                        f"{now_str()} [profit-lock] PEAK UPDATED | unrealized_pnl=${unrealized_pnl_usdt:+.4f} "
+                        f"peak=${p.peak_unrealized_pnl:+.4f} "
+                        f"floor=${p.peak_unrealized_pnl * PROFIT_LOCK_RATIO:+.4f} "
+                        f"locked_pct={PROFIT_LOCK_RATIO*100:.0f}%", GRAY,
+                    ))
                 locked_profit = p.peak_unrealized_pnl * PROFIT_LOCK_RATIO
                 # 2026-08 fee/slippage-safe Profit Lock fix: previously
                 # triggered the moment unrealized_pnl_usdt dropped to/below
@@ -2796,7 +2874,7 @@ class MartingaleManager:
                     )
                     return
 
-        # --- Max Hold Time Protection (NEW - scalping-bot safety net) --------------
+        # --- Max Hold Time Protection (scalping-bot safety net) --------------------
         # This is a scalping bot; positions are meant to resolve in minutes,
         # not hours. If TP/Smart-Exit/DCA/Profit-Lock all keep passing on a
         # position because the market is dead/ranging, this is a backstop
@@ -2814,6 +2892,22 @@ class MartingaleManager:
         # that always closes the position regardless of PnL/regime/Profit-
         # Lock state, so total holding time is always bounded even for a
         # genuinely-still-trending winner.
+        #
+        # 2026-08 Max Hold Time V2 (isolated to this block only - Smart
+        # Exit, DCA, TP, Profit Lock, Brain, Risk Engine, and every other
+        # exit path are untouched): timeout on a genuinely significant loss
+        # is no longer an unconditional force-close. It's now an "emergency
+        # review" - the same style of cheap, independent recovery-risk
+        # signals already used by the final-DCA gate (trend_against,
+        # high_risk, momentum_against, extreme_volatility), plus whether a
+        # DCA step is still available, are evaluated. The position is only
+        # force-closed if at least MAX_HOLD_TIME_RECOVERY_MIN_AGREE of
+        # those 5 agree (genuine low probability of recovery) - otherwise
+        # it's kept open for another check cycle. A loss smaller than
+        # MAX_HOLD_TIME_SMALL_LOSS_PCT skips this review entirely and
+        # closes normally, same as a profitable/flat position. The
+        # unconditional MAX_HOLD_TIME_HARD_CAP_SEC ceiling below is
+        # completely unchanged - a deferred loser can never be held past it.
         held_sec_so_far = time.time() - p.opened_at
         if MAX_HOLD_TIME_ENABLED and held_sec_so_far >= MAX_HOLD_TIME_SEC:
             hard_cap_hit = held_sec_so_far >= MAX_HOLD_TIME_HARD_CAP_SEC
@@ -2821,17 +2915,159 @@ class MartingaleManager:
                 unrealized_pnl_usdt > 0
                 and self.last_regime.regime in (REGIME_STRONG_TREND, REGIME_WEAK_TREND)
             )
-            still_deferring = (not hard_cap_hit) and (p.profit_lock_active or trending_and_profitable)
+            meaningful_loss = unrealized_pnl_usdt < 0 and abs(pct_move) > MAX_HOLD_TIME_SMALL_LOSS_PCT
+
+            # 2026-08 Max Hold Time V2 DCA-awareness fix (isolated to this
+            # still_deferring expression and this diagnostic log only - the
+            # DCA block itself, Smart Exit, TP, Profit Lock, Brain, Entry
+            # scoring, and Risk Engine are all untouched): previously, Max
+            # Hold Time V2 was evaluated strictly before the DCA block
+            # further down in this same function, so a position could be
+            # force-closed by timeout on the very tick price first reached
+            # the DCA trigger distance - closing it before DCA ever got a
+            # chance to average down and improve recovery odds. Reuses the
+            # SAME dca_distance_pct formula the DCA block itself uses
+            # (self.get_dynamic_dca_distance_pct() - no second/parallel
+            # distance calculation) to check whether a DCA add is currently
+            # available and actionable. If so, this tick defers regardless
+            # of the recovery-risk review below, letting execution continue
+            # to the DCA block after this function returns from this
+            # check - the DCA block's own dca_step >= MAX_DCA_STEPS /
+            # max_dca_exhausted close path is untouched, so exit-reason
+            # attribution (max_hold_time vs max_dca_exhausted) is
+            # unaffected. This can never defer forever: once DCA fires,
+            # dca_step increments and avg_entry_price shifts, so this
+            # exact condition is re-evaluated fresh (and eventually
+            # dca_exhausted) on the next cycle; if DCA is unavailable or
+            # price hasn't reached the trigger, this is simply False and
+            # the existing recovery-risk review below decides as before.
+            # Hard cap always wins regardless (`not hard_cap_hit` gate).
+            current_loss_distance = max(0.0, -pct_move)
+            dca_distance_pct_now = self.get_dynamic_dca_distance_pct()
+            dca_opportunity_available = (
+                not hard_cap_hit
+                and p.dca_step < MAX_DCA_STEPS
+                and current_loss_distance >= dca_distance_pct_now
+            )
+            # 2026-08 Max Hold Time <-> DCA debug logging: records this
+            # tick's defer-for-DCA decision so _on_entry_filled() (role=
+            # "dca") can log "[dca] executed after max-hold defer" the
+            # moment that DCA add actually fills, correlating the two
+            # decisions in the logs. Consumed (reset to False) there every
+            # time regardless of outcome, and also reset on every fresh
+            # "initial" entry, so it can never leak into an unrelated DCA
+            # fill from a different max-hold-time cycle or a later trade.
+            # Logging-only - does not affect dca_opportunity_available or
+            # still_deferring below in any way.
+            self._max_hold_dca_defer_pending = dca_opportunity_available
+
+            recovery_risk_signals: Dict[str, bool] = {}
+            recovery_agree_count = 0
+            low_probability_recovery = False
+            if meaningful_loss and not hard_cap_hit:
+                conf = self.last_confidence
+                regime = self.last_regime
+                velocity = 0.0
+                if self.prev_price and self.current_price:
+                    velocity = (self.current_price - self.prev_price) / self.prev_price
+                recovery_risk_signals = {
+                    "trend_against": (
+                        conf.trend_direction is not None
+                        and conf.trend_direction != p.side
+                        and conf.trend_confidence >= 0.55
+                    ),
+                    "high_risk": conf.risk_score >= 0.75,
+                    "momentum_against": (
+                        (p.side == "LONG" and velocity < -0.0008)
+                        or (p.side == "SHORT" and velocity > 0.0008)
+                    ),
+                    "extreme_volatility": (
+                        regime.regime == REGIME_HIGH_VOL
+                        and regime.atr_ratio >= REGIME_ATR_HIGH_MULT * 1.25
+                    ),
+                    "dca_exhausted": p.dca_step >= MAX_DCA_STEPS,
+                }
+                recovery_agree_count = sum(1 for v in recovery_risk_signals.values() if v)
+                low_probability_recovery = recovery_agree_count >= MAX_HOLD_TIME_RECOVERY_MIN_AGREE
+
+            # 2026-08 Max Hold Time V2 stale-profit-lock-flag fix (isolated
+            # to this still_deferring expression only - Profit Lock's own
+            # activation threshold, ratio, and close condition above are
+            # completely untouched): p.profit_lock_active is a sticky flag
+            # that, once set True, is never reset back to False while the
+            # SAME trade stays open (only a fresh PositionState() on full
+            # close changes it) - see Profit Lock's fee-safe-floor comment
+            # above for why a fast reversal can blow through the locked
+            # level without Profit Lock's own close condition catching it.
+            # Previously, a stuck profit_lock_active=True unconditionally
+            # bypassed the recovery review below even after the position
+            # had reversed into a real loss, silently disabling this
+            # safety net for exactly the trades it's meant to protect.
+            # profit_lock_active now only defers when the position is
+            # STILL actually in profit right now (unrealized_pnl_usdt > 0)
+            # - once it's flat/negative, the flag no longer bypasses the
+            # meaningful-loss recovery-risk check below.
+            still_deferring = (not hard_cap_hit) and (
+                (p.profit_lock_active and unrealized_pnl_usdt > 0)
+                or trending_and_profitable
+                or dca_opportunity_available
+                or (meaningful_loss and not low_probability_recovery)
+            )
             if not still_deferring:
+                review_suffix = ""
+                if meaningful_loss:
+                    review_suffix = (
+                        f", recovery_review={recovery_agree_count}/{len(recovery_risk_signals)} "
+                        f"signals agree (required {MAX_HOLD_TIME_RECOVERY_MIN_AGREE}: "
+                        f"{', '.join(k for k, v in recovery_risk_signals.items() if v)})"
+                    )
+                # 2026-08 Max Hold Time <-> DCA debug logging: structured
+                # close-decision line requested for auditing future
+                # decisions. Purely additive - printed once, right before
+                # the close_position() call below, which is unchanged.
+                if hard_cap_hit:
+                    close_decision_reason = "hard cap reached"
+                elif meaningful_loss and low_probability_recovery:
+                    close_decision_reason = "recovery review failed"
+                else:
+                    close_decision_reason = "no meaningful loss / not protected at timeout"
+                print(color(
+                    f"{now_str()} [max-hold-v2] close decision: "
+                    f"reason={close_decision_reason} "
+                    f"dca_step={p.dca_step}/{MAX_DCA_STEPS} "
+                    f"dca_available={p.dca_step < MAX_DCA_STEPS} "
+                    f"loss_pct={pct_move*100:.2f}% "
+                    f"signals_agree={recovery_agree_count}/{len(recovery_risk_signals)}",
+                    YELLOW,
+                ))
                 await self.close_position(
                     f"max hold time reached: {held_sec_so_far/3600:.2f}h >= "
                     f"{MAX_HOLD_TIME_SEC/3600:.2f}h (hard_cap={hard_cap_hit}, "
                     f"regime={self.last_regime.regime}, unrealized_pnl=${unrealized_pnl_usdt:+.4f}, "
-                    f"profit_lock_active={p.profit_lock_active}) - closing dead/ranging hold "
-                    f"instead of tying up capital indefinitely",
+                    f"profit_lock_active={p.profit_lock_active}{review_suffix}) - closing dead/ranging "
+                    f"hold instead of tying up capital indefinitely",
                     emergency=True, exit_reason_tag="max_hold_time",
                 )
                 return
+            elif dca_opportunity_available and self._should_log_max_hold_dca_defer():
+                print(color(
+                    f"{now_str()} [max-hold-v2] deferred: "
+                    f"reason=DCA opportunity available "
+                    f"dca_step={p.dca_step}/{MAX_DCA_STEPS} "
+                    f"loss_pct={pct_move*100:.2f}% "
+                    f"dca_distance={dca_distance_pct_now*100:.2f}% "
+                    f"hold_time={held_sec_so_far/3600:.2f}h", YELLOW,
+                ))
+            elif meaningful_loss and self._should_log_max_hold_review():
+                print(color(
+                    f"{now_str()} [max-hold-review] EMERGENCY REVIEW: timeout reached with "
+                    f"significant loss (unrealized_pnl=${unrealized_pnl_usdt:+.4f}, "
+                    f"pct_move={pct_move*100:.2f}%) but only {recovery_agree_count}/"
+                    f"{len(recovery_risk_signals)} recovery-risk signals agree (required "
+                    f"{MAX_HOLD_TIME_RECOVERY_MIN_AGREE}) - keeping position open instead of "
+                    f"force-closing (still bounded by hard cap at "
+                    f"{MAX_HOLD_TIME_HARD_CAP_SEC/3600:.2f}h)", YELLOW,
+                ))
 
         held_long_enough = (time.time() - p.opened_at) >= MIN_HOLD_SEC_BEFORE_EXIT
         dynamic_tp_pct = self.get_dynamic_take_profit_pct()
@@ -3291,10 +3527,30 @@ class MartingaleManager:
         self.position.original_qty = total_qty
         if role == "dca":
             self.position.dca_step += 1
+            # 2026-08 Max Hold Time <-> DCA debug logging: if Max Hold Time
+            # V2 deferred specifically because this DCA opportunity was
+            # available (set/refreshed every tick in _manage_open_position(),
+            # see _max_hold_dca_defer_pending's own comment in __init__),
+            # log the correlation now that the add has actually filled.
+            # Always consumed (reset to False) here regardless of whether it
+            # was True, so a stale value can never attach to an unrelated
+            # later DCA fill. Logging-only - does not affect dca_step,
+            # sizing, or any other part of this fill's handling.
+            if self._max_hold_dca_defer_pending:
+                print(color(
+                    f"{now_str()} [dca] executed after max-hold defer "
+                    f"dca_step={self.position.dca_step}/{MAX_DCA_STEPS} "
+                    f"entry_price={fill_price:.2f}", CYAN,
+                ))
+            self._max_hold_dca_defer_pending = False
         else:
             self.position.opened_at = time.time()
             self.position.max_favorable_price = fill_price
             self.position.max_adverse_price = fill_price
+            # Guards against a stale defer-flag from an earlier, already-
+            # closed trade ever being misattributed to this brand new
+            # position's own (unrelated) future DCA fills.
+            self._max_hold_dca_defer_pending = False
         self.position.status = "OPEN"
         self.position.pending_order_id = None
         self.position.pending_role = None
@@ -3603,6 +3859,48 @@ async def initialize_sync(
             ))
             return
 
+    # 2026-08 CLOSING-resync opened_at fix (this branch only - every other
+    # branch of this function is untouched): a position that is CLOSING
+    # with its own close order still pending, whose side/qty/avg_entry
+    # still match what the exchange reports RIGHT NOW, is the SAME active
+    # position with a close order genuinely still in flight - Binance
+    # simply hasn't processed the FILLED event yet by the time this
+    # periodic-poll/reconnect resync ran. This is not evidence of a
+    # stale/corrupted position (unlike a genuine side/qty/avg_entry
+    # mismatch, which still falls through to the full rebuild below).
+    # Before this fix, CLOSING was not treated as an in-flight state the
+    # way ENTERING/DCA_PENDING are above, so this exact situation fell
+    # through to the full PositionState rebuild further down, which
+    # unconditionally sets opened_at=time.time() - overwriting the real
+    # entry timestamp with "now". When the close fill event then arrived
+    # moments later, _on_close_filled()'s held_sec = time.time() -
+    # p.opened_at computed against that just-reset timestamp instead of
+    # the real one, producing a near-zero (e.g. ~0.05s) holding_time_sec
+    # in the trade log for a position that may have been open for hours.
+    # Skipping the rebuild entirely here (rather than rebuilding and only
+    # patching opened_at) preserves opened_at AND every other in-memory
+    # field untouched, and does not change how the eventual close fill is
+    # routed - pending_order_id/pending_role/status all stay exactly as
+    # they already were, so _try_recover_close_fill() /
+    # handle_order_update()'s normal tracked-order-id path both continue
+    # to work exactly as before.
+    if (
+        p.status == "CLOSING"
+        and p.pending_order_id is not None
+        and p.side == side
+        and p.avg_entry_price is not None
+        and abs(p.total_qty - qty) < max(manager.filters.step_size, 1e-9)
+        and entry_price > 0
+        and abs(p.avg_entry_price - entry_price) / entry_price < 0.001
+    ):
+        print(color(
+            f"{now_str()} [sync:{context}] exchange still shows {side} qty={qty} but a close "
+            f"order (id={p.pending_order_id}) is already pending for this exact position "
+            f"(side/qty/avg_entry all match) - its FILLED event just hasn't arrived yet. "
+            f"Leaving local state (including opened_at) untouched instead of rebuilding.", GRAY,
+        ))
+        return
+
     # Preserve Profit Lock state across this resync - ONLY if the local
     # state being replaced was itself an OPEN position on the SAME side as
     # what the exchange now reports (i.e. this is the same trade continuing
@@ -3621,13 +3919,15 @@ async def initialize_sync(
     # strictly against what the exchange is reporting RIGHT NOW: side, qty,
     # and avg_entry_price must all match (small tolerance) or the snapshot is
     # treated as stale/unrelated and ignored entirely - only dca_step,
-    # last_dca_price, profit_lock_active, peak_unrealized_pnl, and (for a
-    # pending CLOSE only - see below) pending_order_id/pending_role are ever
-    # taken from it; nothing else about position sizing/entries is touched.
+    # last_dca_price, profit_lock_active, peak_unrealized_pnl, opened_at, and
+    # (for a pending CLOSE only - see below) pending_order_id/pending_role
+    # are ever taken from it; nothing else about position sizing/entries is
+    # touched.
     restored_dca_step = 0
     restored_last_dca_price: Optional[float] = None
     restored_pending_order_id: Optional[int] = None
     restored_pending_role: Optional[str] = None
+    restored_opened_at: Optional[float] = None
     snapshot_restored = False
     snapshot = await manager.load_dca_state_snapshot()
     if snapshot is not None:
@@ -3645,6 +3945,16 @@ async def initialize_sync(
             restored_last_dca_price = snapshot.get("last_dca_price")
             preserved_profit_lock_active = bool(snapshot.get("profit_lock_active", False))
             preserved_peak_unrealized_pnl = float(snapshot.get("peak_unrealized_pnl", 0.0) or 0.0)
+            # 2026-08 CLOSING-resync opened_at fix: restore the real entry
+            # timestamp from the snapshot (present on any snapshot saved by
+            # the fixed _dca_state_snapshot() - older snapshots predating
+            # this fix simply won't have the key, so this safely falls back
+            # to None -> time.time() below, exactly like before this fix).
+            try:
+                snap_opened_at = float(snapshot.get("opened_at", 0) or 0)
+                restored_opened_at = snap_opened_at if snap_opened_at > 0 else None
+            except (TypeError, ValueError):
+                restored_opened_at = None
             snapshot_restored = True
             # Only a pending CLOSE is restored here (not "initial"/"dca") -
             # those are Entry/DCA order-placement concerns and are left
@@ -3670,7 +3980,8 @@ async def initialize_sync(
                 f"(side={side}, qty={qty}, avg_entry={entry_price:.2f}) - restoring dca_step="
                 f"{restored_dca_step}, last_dca_price={restored_last_dca_price}, "
                 f"profit_lock_active={preserved_profit_lock_active}, "
-                f"pending_close_order_id={restored_pending_order_id}.", MAGENTA,
+                f"pending_close_order_id={restored_pending_order_id}, "
+                f"opened_at={'restored' if restored_opened_at else 'not available - using now()'}.", MAGENTA,
             ))
         else:
             print(color(
@@ -3696,7 +4007,13 @@ async def initialize_sync(
         avg_entry_price=entry_price,
         total_qty=qty,
         original_qty=qty,
-        opened_at=time.time(),
+        # 2026-08 CLOSING-resync opened_at fix: prefer the real entry
+        # timestamp restored from the snapshot above (covers a genuine
+        # process restart, where there's no live PositionState left to
+        # preserve in-memory); only falls back to time.time() when no
+        # matching snapshot was found - i.e. a genuinely new/unrecoverable
+        # position, exactly as before this fix.
+        opened_at=(restored_opened_at if restored_opened_at else time.time()),
         max_favorable_price=entry_price,
         max_adverse_price=entry_price,
         last_dca_price=restored_last_dca_price,
