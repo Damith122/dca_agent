@@ -275,6 +275,7 @@ from config import (
     SIGNAL_DEADBAND_PCT,
     TRADE_COOLDOWN_SEC,
     MIN_HOLD_SEC_BEFORE_EXIT,
+    MAX_DAILY_LOSS_USDT,
     TAKER_FEE_RATE,
     MIN_NET_PROFIT_USDT,
     LIQUIDATION_WARNING_BUFFER_PCT,
@@ -1539,6 +1540,17 @@ class MartingaleManager:
         self.price_history: List[float] = []   # kept for the fallback static momentum signal only
         self.trade_count = 0
         self.realized_pnl_total = 0.0
+        # 2026-08 Daily Loss Protection: separate from realized_pnl_total
+        # (whole-process-lifetime "session_total") - this resets at every
+        # UTC calendar day boundary via _maybe_reset_daily_loss_tracker(),
+        # called from both the entry gate (on_price_tick) and the two
+        # realized-PnL accumulation points (_apply_partial_close,
+        # _on_close_filled) below. Purely a new-entry gate - never read by
+        # any exit/DCA/risk-management code path, so an already-OPEN
+        # position is completely unaffected regardless of this value.
+        self.daily_realized_pnl: float = 0.0
+        self._daily_loss_tracker_date: Optional[str] = None  # UTC "YYYY-MM-DD" the current daily_realized_pnl covers
+        self._last_daily_loss_block_log_ts: float = 0.0  # throttles the "entries halted" diagnostic line
         self.last_trade_action_ts: float = 0.0
         self.last_trade_open_ts: float = 0.0
         self._last_warmup_skip_log_ts: float = 0.0  # throttles the pre-warmup "no entry" log line
@@ -2472,6 +2484,33 @@ class MartingaleManager:
             return True
         return False
 
+    def _maybe_reset_daily_loss_tracker(self) -> None:
+        """2026-08 Daily Loss Protection: resets daily_realized_pnl to 0.0
+        whenever the UTC calendar day has changed since the last time this
+        ran. Called from the entry-gate check below and from both realized-
+        PnL accumulation points (_apply_partial_close, _on_close_filled) so
+        the tracker is always current whichever fires first. Pure
+        bookkeeping - never touches position/order state."""
+        today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self._daily_loss_tracker_date != today_utc:
+            if self._daily_loss_tracker_date is not None:
+                print(color(
+                    f"{now_str()} [daily-loss] new UTC day ({today_utc}) - resetting daily "
+                    f"realized PnL tracker (was ${self.daily_realized_pnl:+.4f})", GRAY,
+                ))
+            self._daily_loss_tracker_date = today_utc
+            self.daily_realized_pnl = 0.0
+
+    def _should_log_daily_loss_block(self, interval_sec: float = 60.0) -> bool:
+        """Throttle for the 'entries halted - daily loss limit reached'
+        diagnostic line - purely for visibility, does not affect whether
+        entries are actually blocked."""
+        now = time.time()
+        if now - self._last_daily_loss_block_log_ts >= interval_sec:
+            self._last_daily_loss_block_log_ts = now
+            return True
+        return False
+
     def _should_log_max_hold_review(self, interval_sec: float = 30.0) -> bool:
         """Throttle for the Max Hold Time V2 'kept alive after emergency
         review' diagnostic line - debugging only, does not affect whether
@@ -2565,6 +2604,27 @@ class MartingaleManager:
 
         if self.position.status == "FLAT":
             if time.time() - self.last_trade_action_ts < TRADE_COOLDOWN_SEC:
+                return
+
+            # 2026-08 Daily Loss Protection (isolated to entry gating only -
+            # exit/DCA/risk management for an already-open position, Brain
+            # learning, and every other function are untouched, identical in
+            # structure to the Startup Warm-up Gate right below): once
+            # today's (UTC calendar day) cumulative realized PnL drops to/
+            # below -MAX_DAILY_LOSS_USDT, no new entries are opened for the
+            # rest of that UTC day. Does not close, modify, or otherwise
+            # touch any currently-open position - Hard Stop/TP/Profit Lock/
+            # DCA/Max Hold Time all continue exactly as before for a trade
+            # that's already running when the limit is hit.
+            self._maybe_reset_daily_loss_tracker()
+            if MAX_DAILY_LOSS_USDT > 0 and self.daily_realized_pnl <= -MAX_DAILY_LOSS_USDT:
+                if self._should_log_daily_loss_block():
+                    print(color(
+                        f"{now_str()} [daily-loss] entries halted: today's realized PnL "
+                        f"${self.daily_realized_pnl:+.4f} <= -${MAX_DAILY_LOSS_USDT:.2f} limit - "
+                        f"no new trades until the next UTC day (existing open positions, if any, "
+                        f"are unaffected)", RED,
+                    ))
                 return
 
             # 2026-08 Startup Warm-up Gate (isolated to entry gating only -
@@ -2826,6 +2886,12 @@ class MartingaleManager:
         p.total_qty = max(p.total_qty - qty, 0.0)
         p.partial_tp_done = True
         self.realized_pnl_total += pnl
+        # 2026-08 Daily Loss Protection: same value, same accumulation
+        # point as realized_pnl_total above - only the DAILY bucket also
+        # resets at each UTC day boundary. Logging-only impact elsewhere;
+        # this does not change partial-close behavior itself.
+        self._maybe_reset_daily_loss_tracker()
+        self.daily_realized_pnl += pnl
         if BREAKEVEN_AFTER_PARTIAL:
             p.breakeven_armed = True
             p.breakeven_price = p.avg_entry_price
@@ -3724,6 +3790,13 @@ class MartingaleManager:
     async def _on_close_filled(self, fill_price: float, total_rp: float, order_id: Optional[int] = None) -> None:
         p = self.position
         self.realized_pnl_total += total_rp
+        # 2026-08 Daily Loss Protection: same value/accumulation point as
+        # realized_pnl_total above - only the DAILY bucket also resets at
+        # each UTC day boundary. This only ever feeds the entry-gate check
+        # in on_price_tick() - nothing about this close's own handling
+        # (trade log, DCA-state cleanup, etc.) is affected.
+        self._maybe_reset_daily_loss_tracker()
+        self.daily_realized_pnl += total_rp
         self.trade_count += 1
         pnl_color = GREEN if total_rp >= 0 else RED
 
