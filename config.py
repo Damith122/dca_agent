@@ -80,6 +80,18 @@ TP_VOL_HIGH = float(os.environ.get("TP_VOL_HIGH", "0.0012"))  # tick-return std 
 MAX_HOLD_TIME_ENABLED = os.environ.get("MAX_HOLD_TIME_ENABLED", "true").lower() != "false"
 MAX_HOLD_TIME_SEC = int(os.environ.get("MAX_HOLD_TIME_SEC", str(4 * 3600)))       # 4h soft cap
 MAX_HOLD_TIME_HARD_CAP_SEC = int(os.environ.get("MAX_HOLD_TIME_HARD_CAP_SEC", str(8 * 3600)))  # 8h absolute cap, always closes regardless of PnL/regime/profit-lock
+MAX_HOLD_TIME_SMALL_LOSS_PCT = float(os.environ.get("MAX_HOLD_TIME_SMALL_LOSS_PCT", "0.0015"))
+# 2026-08 Max Hold Time V2: a loss smaller (in magnitude) than this at timeout
+# is treated as "very small" and closes normally (not worth an emergency
+# recovery review). 0.15% mirrors DCA_MIN_DISTANCE_PCT's floor - roughly the
+# smallest adverse move the bot's own DCA/exit machinery treats as meaningful.
+MAX_HOLD_TIME_RECOVERY_MIN_AGREE = int(os.environ.get("MAX_HOLD_TIME_RECOVERY_MIN_AGREE", "2"))
+# Of the 5 recovery-risk signals evaluated at timeout for a position with a
+# genuinely significant loss (trend_against, high_risk, momentum_against,
+# extreme_volatility, dca_exhausted - see trading.py's
+# _manage_open_position()), how many must agree before the position is
+# force-closed as "low probability of recovery" rather than kept open past
+# MAX_HOLD_TIME_SEC (still bounded by MAX_HOLD_TIME_HARD_CAP_SEC either way).
 
 # --- Low Volatility ("dead market") Entry Filter (NEW) -----------------------
 # MarketRegimeEngine's SIDEWAYS/LOW_VOL split is RELATIVE (current ATR vs its
@@ -359,6 +371,8 @@ __all__ = [
     "MAX_HOLD_TIME_ENABLED",
     "MAX_HOLD_TIME_SEC",
     "MAX_HOLD_TIME_HARD_CAP_SEC",
+    "MAX_HOLD_TIME_SMALL_LOSS_PCT",
+    "MAX_HOLD_TIME_RECOVERY_MIN_AGREE",
     "LOW_VOLATILITY_FILTER_ENABLED",
     "LOW_VOLATILITY_ATR_PCT_THRESHOLD",
     "ADAPTIVE_SIZING_ENABLED",
