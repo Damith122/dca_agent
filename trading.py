@@ -335,6 +335,7 @@ from config import (
     TRADE_RECONCILE_BACKFILL_FROM_ID,
     SESSION_START_DATE,
     DCA_STATE_PATH,
+    GITHUB_DCA_STATE_PATH,
 )
 from indicators import clamp, safe_div, ema_series, round_step
 from exchange import BinanceApiError, RestClient, SymbolFilters
@@ -1544,6 +1545,8 @@ class MartingaleManager:
         self._last_max_hold_review_log_ts: float = 0.0  # throttles the Max Hold Time V2 "kept alive" diagnostic line
         self._last_max_hold_dca_defer_log_ts: float = 0.0  # throttles the Max Hold Time V2 "DCA opportunity available" diagnostic line
         self._max_hold_dca_defer_pending: bool = False  # set True when Max Hold Time V2 defers for a DCA opportunity this tick; consumed by _on_entry_filled() to log "[dca] executed after max-hold defer"
+        self._last_profit_lock_debug_log_ts: float = 0.0  # throttles the [profit-lock-debug] diagnostic line
+        self._last_profit_lock_peak_update_log_ts: float = 0.0  # throttles the [profit-lock-peak] UPDATED diagnostic line
 
         # --- Brain V2 stack -----------------------------------------------------
         self.candles = CandleAggregator()
@@ -1726,6 +1729,7 @@ class MartingaleManager:
     def _dca_state_snapshot(self) -> dict:
         p = self.position
         return {
+            "symbol": self.symbol,
             "side": p.side,
             "qty": p.total_qty,
             "avg_entry_price": p.avg_entry_price,
@@ -1759,22 +1763,87 @@ class MartingaleManager:
         }
 
     async def save_dca_state(self, reason: str) -> None:
+        """Persists the DCA/position snapshot both locally and to GitHub.
+
+        2026-08 DCA-state GitHub persistence fix: previously this only wrote
+        DCA_STATE_PATH locally. On a Railway redeploy (or any host that
+        doesn't guarantee filesystem persistence across restarts), that
+        local file - and with it dca_step, last_dca_price,
+        profit_lock_active, peak_unrealized_pnl, opened_at, and any pending
+        close-order info - could be silently lost even though
+        initialize_sync() would still correctly restore side/qty/avg_entry
+        from Binance itself. The dangerous consequence: an already-DCA'd
+        position could come back up reporting dca_step=0, letting the bot
+        take MORE DCA steps than the position's real risk envelope
+        intended. Reuses the SAME github_sync client/session/token/repo/
+        branch already used for brain.pkl and the CSV/JSONL trade logs -
+        no second GitHub client, no new credentials. Fail-soft: a GitHub
+        push failure never blocks the (already-succeeded) local write or
+        crashes the trading loop - the position keeps trading normally
+        either way, exactly as every other github_sync.upload() call site
+        in this file already behaves.
+        """
+        step_label = f"{self.position.dca_step}/{MAX_DCA_STEPS}"
         try:
             payload = json.dumps(self._dca_state_snapshot()).encode("utf-8")
             tmp_path = f"{DCA_STATE_PATH}.tmp"
             with open(tmp_path, "wb") as f:
                 f.write(payload)
             os.replace(tmp_path, DCA_STATE_PATH)  # atomic on POSIX - never a half-written file
+            print(color(f"{now_str()} [dca-state] saved local snapshot step={step_label}", GRAY))
         except Exception as e:  # noqa: BLE001 - snapshot persistence must never crash the trading loop
             print(color(f"[dca-state] failed to save snapshot ({reason}): {e}", YELLOW))
+            return  # don't attempt a GitHub push of a snapshot we couldn't even build/write locally
+
+        try:
+            pushed = await self.github_sync.upload(
+                payload, message=f"dca-state sync: {reason} (step={step_label})",
+                path=GITHUB_DCA_STATE_PATH,
+            )
+            if pushed:
+                print(color(f"{now_str()} [dca-state] pushed snapshot to GitHub step={step_label}", MAGENTA))
+        except Exception as e:  # noqa: BLE001 - belt-and-suspenders; upload() already catches internally
+            print(color(f"[dca-state] unexpected error pushing snapshot to GitHub (bot keeps trading): {e}", YELLOW))
 
     async def load_dca_state_snapshot(self) -> Optional[dict]:
+        """Local-first, GitHub-fallback DCA-state snapshot load.
+
+        2026-08 DCA-state GitHub persistence fix: previously local-disk-only,
+        which meant initialize_sync()'s own dca_step/last_dca_price/
+        profit_lock_active/peak_unrealized_pnl/opened_at restoration (the
+        block below this method, in initialize_sync()) had no way to
+        recover if the local file was wiped by a redeploy - even though
+        save_dca_state() (above) now also pushes to GitHub. Mirrors the
+        exact local-then-GitHub pattern dca2.py's own load_dca_state()
+        already uses for its separate startup pre-population step. Nothing
+        about WHAT is restored, or the side/qty/avg_entry_price validation
+        that gates whether any of it is trusted, changed - only WHERE the
+        bytes can come from.
+        """
         try:
             if os.path.exists(DCA_STATE_PATH):
                 with open(DCA_STATE_PATH, "r", encoding="utf-8") as f:
-                    return json.load(f)
-        except Exception as e:  # noqa: BLE001 - corrupt/missing snapshot must not block sync
-            print(color(f"[dca-state] failed to read snapshot: {e}", YELLOW))
+                    data = json.load(f)
+                    data["_snapshot_source"] = "local"
+                    return data
+        except Exception as e:  # noqa: BLE001 - corrupt local snapshot must not block sync/GitHub fallback
+            print(color(f"[dca-state] failed to read local snapshot: {e}", YELLOW))
+
+        try:
+            raw = await self.github_sync.download(path=GITHUB_DCA_STATE_PATH)
+            if raw:
+                print(color(f"{now_str()} [dca-state] local snapshot missing - using GitHub backup", MAGENTA))
+                data = json.loads(raw.decode("utf-8"))
+                data["_snapshot_source"] = "github"
+                return data
+        except Exception as e:  # noqa: BLE001 - restore must never block sync/startup
+            print(color(f"[dca-state] failed to read GitHub snapshot: {e}", YELLOW))
+
+        # Neither local nor GitHub had anything - do NOT silently pretend
+        # this is a brand-new position. Whoever calls this (initialize_sync())
+        # is responsible for the actual "not recoverable, dca_step reset to
+        # 0" warning once it knows an exchange-reported position exists but
+        # no snapshot could back it - see that function's own WARNING log.
         return None
 
     async def delete_dca_state(self, reason: str) -> None:
@@ -2423,6 +2492,30 @@ class MartingaleManager:
             return True
         return False
 
+    def _should_log_profit_lock_debug(self, interval_sec: float = 30.0) -> bool:
+        """Throttle for the [profit-lock-debug] diagnostic line (2026-08
+        Profit Lock diagnostics, Issue 2) - debugging only, does not affect
+        Profit Lock activation/close behavior."""
+        now = time.time()
+        if now - self._last_profit_lock_debug_log_ts >= interval_sec:
+            self._last_profit_lock_debug_log_ts = now
+            return True
+        return False
+
+    def _should_log_profit_lock_peak_update(self, interval_sec: float = 10.0) -> bool:
+        """Throttle for the [profit-lock-peak] UPDATED diagnostic line
+        (2026-08 Profit Lock peak-tracking visibility fix) - debugging
+        only, independent of the existing DCA_STATE_PEAK_SAVE_MIN_DELTA_USDT-
+        gated [profit-lock] PEAK UPDATED log/persistence trigger, which is
+        unchanged. A shorter default interval than the other profit-lock
+        debug logs since a fast-trailing peak during a strong move would
+        otherwise still print quite often even throttled at 30s."""
+        now = time.time()
+        if now - self._last_profit_lock_peak_update_log_ts >= interval_sec:
+            self._last_profit_lock_peak_update_log_ts = now
+            return True
+        return False
+
     # -- learning from ticks --------------------------------------------------------
 
     def _learn_from_tick(self, features: np.ndarray, atr_pct_now: float) -> None:
@@ -2793,6 +2886,42 @@ class MartingaleManager:
         # own terms and can close the position before Partial TP / TP /
         # Smart Exit / DCA are ever evaluated this tick.
         unrealized_pnl_usdt = self.estimate_net_pnl_usdt(price)
+
+        # 2026-08 Profit Lock debug diagnostics (Issue 2 - logging only, no
+        # behavior change: everything below this block, starting with the
+        # `if unrealized_pnl_usdt <= 0:` guard, is untouched). Makes the
+        # existing fee-adjusted-net-vs-gross-PnL behavior visible, since a
+        # position can look profitable on gross price movement alone (e.g.
+        # what an exchange UI shows) while actually being flat or negative
+        # once round-trip fees are subtracted - which is exactly why
+        # Profit Lock may correctly stay inactive even when unrealized PnL
+        # "looks" positive. Throttled like every other diagnostic-only log
+        # in this file, so an open position doesn't spam this every tick.
+        if self._should_log_profit_lock_debug():
+            fees_est = self.estimate_round_trip_fee_usdt(p.total_qty, p.avg_entry_price, price)
+            gross_pnl_usdt = unrealized_pnl_usdt + fees_est
+            if unrealized_pnl_usdt <= 0:
+                debug_action = "not activated (net pnl <=0)"
+            elif p.profit_lock_active:
+                debug_action = "active (monitoring floor)"
+            elif unrealized_pnl_usdt >= PROFIT_LOCK_ACTIVATION_USDT:
+                debug_action = "activating this tick"
+            else:
+                debug_action = "not activated (net pnl below threshold)"
+            # 2026-08 Profit Lock peak-tracking visibility fix: peak/floor
+            # appended to the existing debug line (all prior fields
+            # unchanged) so peak-tracking state is visible in the same
+            # place as the gross/fee/net breakdown, without needing to
+            # cross-reference a separate log line.
+            print(color(
+                f"{now_str()} [profit-lock-debug] side={p.side} avg_entry={p.avg_entry_price:.2f} "
+                f"mark_price={price:.2f} qty={p.total_qty:.6f} "
+                f"gross={gross_pnl_usdt:+.4f} fees={fees_est:.4f} net={unrealized_pnl_usdt:+.4f} "
+                f"threshold={PROFIT_LOCK_ACTIVATION_USDT:.2f} "
+                f"peak={p.peak_unrealized_pnl:+.4f} floor={p.peak_unrealized_pnl * PROFIT_LOCK_RATIO:+.4f} "
+                f"profit_lock_active={p.profit_lock_active} action={debug_action}", GRAY,
+            ))
+
         # Hard safety guard (root cause of the previous bug: once armed, the
         # lock kept comparing against a stale/positive peak even after PnL
         # dropped to/below zero, which could in theory close a trade that
@@ -2823,7 +2952,24 @@ class MartingaleManager:
                 self._last_dca_state_peak_saved = p.peak_unrealized_pnl
                 asyncio.create_task(self.save_dca_state(reason="profit lock activated"))
             if p.profit_lock_active:
+                # 2026-08 Profit Lock peak-tracking visibility fix (logging
+                # only - the max() assignment itself, the persistence
+                # trigger/threshold below, and the existing [profit-lock]
+                # PEAK UPDATED log are all untouched): captures old_peak
+                # BEFORE it's overwritten, so this new, separately-throttled
+                # log can report every genuine peak increase (net_pnl >
+                # stored peak) rather than only the ones large enough to
+                # cross DCA_STATE_PEAK_SAVE_MIN_DELTA_USDT below.
+                old_peak = p.peak_unrealized_pnl
                 p.peak_unrealized_pnl = max(p.peak_unrealized_pnl, unrealized_pnl_usdt)
+                if p.peak_unrealized_pnl > old_peak and self._should_log_profit_lock_peak_update():
+                    print(color(
+                        f"{now_str()} [profit-lock-peak] UPDATED | "
+                        f"old_peak=${old_peak:+.4f} | "
+                        f"new_peak=${p.peak_unrealized_pnl:+.4f} | "
+                        f"new_floor=${p.peak_unrealized_pnl * PROFIT_LOCK_RATIO:+.4f} | "
+                        f"locked_pct={PROFIT_LOCK_RATIO*100:.0f}%", GRAY,
+                    ))
                 # 2026-07 DCA-state-recovery fix: re-persist whenever the
                 # tracked peak has grown meaningfully since the last save,
                 # so a restart/redeploy mid-trade recovers a peak close to
@@ -3931,6 +4077,15 @@ async def initialize_sync(
     snapshot_restored = False
     snapshot = await manager.load_dca_state_snapshot()
     if snapshot is not None:
+        snap_source = snapshot.get("_snapshot_source", "local")
+        # 2026-08 DCA-state GitHub persistence fix: symbol is an additional
+        # (optional, backward-compatible) validation dimension alongside
+        # side/qty/avg_entry_price below - a snapshot predating this fix
+        # simply won't have the key, so it's treated as "ok" rather than
+        # rejected, exactly like opened_at's own backward-compatible
+        # fallback above.
+        snap_symbol = snapshot.get("symbol")
+        symbol_ok = snap_symbol is None or snap_symbol == manager.symbol
         snap_side = snapshot.get("side")
         snap_qty = snapshot.get("qty")
         snap_avg_entry = snapshot.get("avg_entry_price")
@@ -3940,7 +4095,7 @@ async def initialize_sync(
             snap_avg_entry is not None and entry_price > 0
             and abs(float(snap_avg_entry) - entry_price) / entry_price < 0.001
         )
-        if snap_side == side and qty_ok and price_ok:
+        if snap_side == side and qty_ok and price_ok and symbol_ok:
             restored_dca_step = int(snapshot.get("dca_step", 0) or 0)
             restored_last_dca_price = snapshot.get("last_dca_price")
             preserved_profit_lock_active = bool(snapshot.get("profit_lock_active", False))
@@ -3975,10 +4130,16 @@ async def initialize_sync(
                 except (TypeError, ValueError):
                     restored_pending_order_id = None
                     restored_pending_role = None
+            # 2026-08 DCA-state GitHub persistence fix: explicit "restored
+            # from GitHub" vs "restored from local" wording so it's obvious
+            # from the logs alone which source actually backed this
+            # recovery (requested diagnostic - purely additive, the
+            # restoration itself is identical either way).
             print(color(
-                f"{now_str()} [sync:{context}] [dca-state] snapshot matches exchange position "
-                f"(side={side}, qty={qty}, avg_entry={entry_price:.2f}) - restoring dca_step="
-                f"{restored_dca_step}, last_dca_price={restored_last_dca_price}, "
+                f"{now_str()} [sync:{context}] [dca-state] restored from "
+                f"{'GitHub' if snap_source == 'github' else 'local'} step="
+                f"{restored_dca_step}/{MAX_DCA_STEPS} side={side} avg_entry={entry_price:.2f} "
+                f"last_dca_price={restored_last_dca_price}, "
                 f"profit_lock_active={preserved_profit_lock_active}, "
                 f"pending_close_order_id={restored_pending_order_id}, "
                 f"opened_at={'restored' if restored_opened_at else 'not available - using now()'}.", MAGENTA,
@@ -3986,8 +4147,23 @@ async def initialize_sync(
         else:
             print(color(
                 f"{now_str()} [sync:{context}] [dca-state] snapshot found but does not match "
-                f"exchange position (side/qty/avg_entry) - ignoring.", YELLOW,
+                f"exchange position (side/qty/avg_entry/symbol) - ignoring.", YELLOW,
             ))
+    else:
+        # 2026-08 DCA-state GitHub persistence fix: explicit, unmissable
+        # WARNING (not silent) when neither local disk nor GitHub had
+        # anything to restore from, so a redeploy that reset dca_step to 0
+        # on a position that had genuinely already DCA'd is visible in the
+        # logs rather than happening quietly. Does not change what happens
+        # next (still falls through to the same rebuild below, dca_step=0)
+        # - this is a diagnostic addition only.
+        print(color(
+            f"{now_str()} [sync:{context}] [dca-state] WARNING snapshot missing - dca_step reset risk "
+            f"(exchange shows an open {side} qty={qty} position but no local or GitHub DCA-state "
+            f"snapshot could back it - dca_step, last_dca_price, profit_lock_active, and "
+            f"peak_unrealized_pnl cannot be recovered and will reset to their defaults below).",
+            RED,
+        ))
 
     print(color(
         f"{now_str()} [sync:{context}] *** RESYNCING TO MATCH EXCHANGE *** "
