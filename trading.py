@@ -3186,6 +3186,67 @@ class MartingaleManager:
                 f"profit_lock_active={p.profit_lock_active} action={debug_action}", GRAY,
             ))
 
+            # ================================================================
+            # TEMPORARY DIAGNOSTIC - [PROFITLOCK VERIFY] (2026-08 avg_entry_price
+            # drift investigation). To be REMOVED once the investigation is
+            # concluded. Read-only: fetches Binance's own entryPrice/
+            # positionAmt for this symbol and computes the SAME gross/fee/net
+            # formulas already used above, once against the local
+            # PositionState values and once against the exchange's own
+            # values, purely for comparison. Does NOT feed into, gate, or
+            # alter the Profit Lock activation decision below, DCA, TP,
+            # Smart Exit, Brain, or Risk Engine in any way - this block only
+            # ever prints. Skipped in DRY_RUN (nothing real to compare
+            # against) and fails silently (logged, not raised) on any fetch
+            # error so it can never affect the trading loop.
+            # ================================================================
+            if not DRY_RUN:
+                try:
+                    verify_rows = await self.client.get_position_risk(self.symbol)
+                    verify_row = next((r for r in verify_rows if r.get("symbol") == self.symbol), None)
+                    if verify_row is not None:
+                        exchange_entry = float(verify_row.get("entryPrice", 0) or 0)
+                        exchange_amt = float(verify_row.get("positionAmt", 0) or 0)
+                        exchange_qty = abs(exchange_amt)
+                        entry_diff = (
+                            (p.avg_entry_price - exchange_entry)
+                            if (p.avg_entry_price and exchange_entry) else None
+                        )
+                        if p.side == "LONG":
+                            gross_local = (price - p.avg_entry_price) * p.total_qty if p.avg_entry_price else 0.0
+                            gross_exchange = (price - exchange_entry) * exchange_qty if exchange_entry else 0.0
+                        else:
+                            gross_local = (p.avg_entry_price - price) * p.total_qty if p.avg_entry_price else 0.0
+                            gross_exchange = (exchange_entry - price) * exchange_qty if exchange_entry else 0.0
+                        fee_est_exchange = (
+                            self.estimate_round_trip_fee_usdt(exchange_qty, exchange_entry, price)
+                            if exchange_entry else 0.0
+                        )
+                        net_local = gross_local - fees_est
+                        net_exchange = gross_exchange - fee_est_exchange
+                        print(color(
+                            "[PROFITLOCK VERIFY]\n"
+                            f"local_avg_entry={p.avg_entry_price}\n"
+                            f"exchange_entry={exchange_entry}\n"
+                            f"entry_diff={entry_diff}\n"
+                            f"local_qty={p.total_qty}\n"
+                            f"exchange_qty={exchange_qty}\n"
+                            f"dca_step={p.dca_step}\n"
+                            f"gross_local={gross_local:.4f}\n"
+                            f"gross_exchange={gross_exchange:.4f}\n"
+                            f"fee_est={fees_est:.4f}\n"
+                            f"net_local={net_local:.4f}\n"
+                            f"net_exchange={net_exchange:.4f}",
+                            CYAN,
+                        ))
+                    else:
+                        print(color(
+                            f"[PROFITLOCK VERIFY] no positionRisk row found for {self.symbol} "
+                            f"(exchange reports flat?) - skipping comparison this tick.", YELLOW,
+                        ))
+                except Exception as e:  # noqa: BLE001 - a diagnostic fetch must never crash the trading loop
+                    print(color(f"[PROFITLOCK VERIFY] fetch failed: {e}", YELLOW))
+
         # Hard safety guard (root cause of the previous bug: once armed, the
         # lock kept comparing against a stale/positive peak even after PnL
         # dropped to/below zero, which could in theory close a trade that
