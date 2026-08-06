@@ -1762,6 +1762,13 @@ class MartingaleManager:
         invested_notional = sum(price * qty for price, qty in p.entries)
         return {
             "symbol": self.symbol,
+            # 2026-08 DCA state recovery hardening: explicit status so a
+            # restore can strictly validate that a snapshot claiming FLAT
+            # actually has FLAT-consistent economics (qty/avg_entry/
+            # dca_step/dca_history all zeroed) before trusting it, instead
+            # of inferring "closed" only implicitly from a side/qty
+            # mismatch against whatever the exchange currently shows.
+            "status": p.status,
             "side": p.side,
             "qty": p.total_qty,
             "avg_entry_price": p.avg_entry_price,
@@ -1824,7 +1831,39 @@ class MartingaleManager:
             "accumulated_close_pnl": self._closing_accumulated_rp,
         }
 
-    async def save_dca_state(self, reason: str) -> None:
+    def _flat_dca_state_snapshot(self) -> dict:
+        """2026-08 DCA state recovery hardening: the canonical, explicit
+        "no position" snapshot written when a trade fully closes (see
+        save_flat_dca_state() below). Deliberately a fixed, hand-built
+        structure rather than reusing _dca_state_snapshot() against a
+        freshly-reset PositionState(), so every numeric field is always a
+        literal 0 (not a JSON null) and status is unambiguously "FLAT" -
+        matching exactly what initialize_sync()'s new strict FLAT
+        validation checks for. This does not change what gets restored or
+        how - it only defines what gets WRITTEN at close time."""
+        return {
+            "symbol": self.symbol,
+            "status": "FLAT",
+            "side": None,
+            "qty": 0,
+            "avg_entry_price": 0,
+            "initial_entry_price": 0,
+            "dca_step": 0,
+            "last_dca_price": None,
+            "profit_lock_active": False,
+            "peak_unrealized_pnl": 0,
+            "pending_order_id": None,
+            "pending_role": None,
+            "opened_at": 0,
+            "dca_history": [],
+            "total_invested_margin": 0,
+            "current_notional": 0,
+            "last_entry_order_id": None,
+            "last_dca_order_id": None,
+            "accumulated_close_pnl": 0,
+        }
+
+    async def save_dca_state(self, reason: str, payload_override: Optional[dict] = None) -> None:
         """Persists the DCA/position snapshot both locally and to GitHub.
 
         2026-08 DCA-state GitHub persistence fix: previously this only wrote
@@ -1844,10 +1883,18 @@ class MartingaleManager:
         crashes the trading loop - the position keeps trading normally
         either way, exactly as every other github_sync.upload() call site
         in this file already behaves.
+
+        2026-08 DCA state recovery hardening: payload_override lets a
+        caller (see save_flat_dca_state() below) write a specific, fixed
+        payload instead of the live self._dca_state_snapshot() - every
+        existing call site omits this argument and is completely
+        unaffected (defaults to None, same behavior as before this
+        parameter existed).
         """
-        step_label = f"{self.position.dca_step}/{MAX_DCA_STEPS}"
+        payload_dict = payload_override if payload_override is not None else self._dca_state_snapshot()
+        step_label = f"{self.position.dca_step}/{MAX_DCA_STEPS}" if payload_override is None else "FLAT"
         try:
-            payload = json.dumps(self._dca_state_snapshot()).encode("utf-8")
+            payload = json.dumps(payload_dict).encode("utf-8")
             tmp_path = f"{DCA_STATE_PATH}.tmp"
             with open(tmp_path, "wb") as f:
                 f.write(payload)
@@ -1866,6 +1913,24 @@ class MartingaleManager:
                 print(color(f"{now_str()} [dca-state] pushed snapshot to GitHub step={step_label}", MAGENTA))
         except Exception as e:  # noqa: BLE001 - belt-and-suspenders; upload() already catches internally
             print(color(f"[dca-state] unexpected error pushing snapshot to GitHub (bot keeps trading): {e}", YELLOW))
+
+    async def save_flat_dca_state(self, reason: str) -> None:
+        """2026-08 DCA state recovery hardening: writes the canonical FLAT
+        snapshot to BOTH local disk and GitHub backup - called whenever a
+        trade fully closes, replacing the previous delete_dca_state()-only
+        call at those sites.
+
+        Root cause this fixes: delete_dca_state() only ever removed the
+        LOCAL file. It never touched the GitHub backup, so if a later
+        restart's local disk was wiped (e.g. a Railway redeploy) AND the
+        GitHub backup still held an older, stale snapshot from a PREVIOUS
+        (already-closed) trade, load_dca_state_snapshot()'s local-then-
+        GitHub fallback could resurrect that stale, closed-trade data.
+        Explicitly overwriting both copies with an unambiguous "no
+        position" record - rather than just deleting one of the two
+        copies - closes that gap directly.
+        """
+        await self.save_dca_state(reason=reason, payload_override=self._flat_dca_state_snapshot())
 
     async def load_dca_state_snapshot(self) -> Optional[dict]:
         """Local-first, GitHub-fallback DCA-state snapshot load.
@@ -3005,7 +3070,7 @@ class MartingaleManager:
                     ))
                     self.position = PositionState(last_close_time=time.time())
                     self.last_trade_action_ts = time.time()
-                    asyncio.create_task(self.delete_dca_state(reason="exchange already flat at close time"))
+                    asyncio.create_task(self.save_flat_dca_state(reason="exchange already flat at close time"))
                     return
                 elif exchange_side != self.position.side:
                     print(color(
@@ -4297,7 +4362,7 @@ class MartingaleManager:
 
         asyncio.create_task(self.persist_brain(reason="trade closed"))
         asyncio.create_task(self.sync_trade_log_to_github())
-        asyncio.create_task(self.delete_dca_state(reason="trade closed"))
+        asyncio.create_task(self.save_flat_dca_state(reason="trade closed"))
         if self._last_live_trade_id:
             asyncio.create_task(self._persist_trade_sync_cursor(
                 self._last_live_trade_id, reason="live close"
@@ -4542,6 +4607,43 @@ async def initialize_sync(
     restored_last_dca_order_id: Optional[int] = None
     snapshot_restored = False
     snapshot = await manager.load_dca_state_snapshot()
+
+    # 2026-08 DCA state recovery hardening: strict FLAT-snapshot
+    # validation. A snapshot that explicitly claims status="FLAT" must have
+    # FLAT-consistent economics (side=None, qty=0, avg_entry_price=0,
+    # dca_step=0, dca_history=[]). If it claims FLAT but still carries old
+    # position data - e.g. a GitHub backup written before save_flat_dca_state()
+    # existed, or any other way a stale snapshot could survive a close -
+    # it is corrupted and must not be trusted for ANY field, not just the
+    # ones that happen to fail a side/qty/price comparison against
+    # whatever the exchange currently shows. Treated identically to "no
+    # snapshot at all" below, which already safely rebuilds from the
+    # exchange. Snapshots without a "status" key (written before this fix)
+    # or with any status other than "FLAT" are completely unaffected and
+    # continue through the existing match logic further down, unchanged.
+    if snapshot is not None and snapshot.get("status") == "FLAT":
+        flat_qty = snapshot.get("qty")
+        flat_avg_entry = snapshot.get("avg_entry_price")
+        flat_dca_step = snapshot.get("dca_step")
+        flat_history = snapshot.get("dca_history")
+        flat_side = snapshot.get("side")
+        try:
+            is_consistent_flat = (
+                flat_side is None
+                and (flat_qty is None or float(flat_qty) == 0.0)
+                and (flat_avg_entry is None or float(flat_avg_entry) == 0.0)
+                and (flat_dca_step is None or int(flat_dca_step) == 0)
+                and not flat_history
+            )
+        except (TypeError, ValueError):
+            is_consistent_flat = False
+        if not is_consistent_flat:
+            print(color(
+                "[dca-state] invalid FLAT snapshot detected - clearing stale position fields",
+                RED,
+            ))
+            snapshot = None
+
     if snapshot is not None:
         snap_source = snapshot.get("_snapshot_source", "local")
         # 2026-08 DCA-state GitHub persistence fix: symbol is an additional
@@ -4644,6 +4746,13 @@ async def initialize_sync(
                 f"last_entry_order_id={restored_last_entry_order_id}, "
                 f"last_dca_order_id={restored_last_dca_order_id}.", MAGENTA,
             ))
+            # 2026-08 DCA state recovery hardening: exact requested log
+            # format, alongside the more detailed line above.
+            print(color(
+                f"[dca-state] restored valid snapshot:\n"
+                f"side={side} qty={qty} avg_entry={entry_price:.2f} dca_step={restored_dca_step}",
+                MAGENTA,
+            ))
             if restored_dca_history is None:
                 # 2026-08 DCA State Recovery V2: exact requested log format -
                 # the position/dca_step itself WAS recovered above (this
@@ -4660,6 +4769,12 @@ async def initialize_sync(
             print(color(
                 f"{now_str()} [sync:{context}] [dca-state] snapshot found but does not match "
                 f"exchange position (side/qty/avg_entry/symbol) - ignoring.", YELLOW,
+            ))
+            # 2026-08 DCA state recovery hardening: exact requested log
+            # format, alongside the more detailed line above.
+            print(color(
+                "[dca-state] snapshot rejected:\nreason=exchange mismatch",
+                YELLOW,
             ))
             # 2026-08 DCA State Recovery V2: exact requested log format - a
             # mismatched snapshot means NONE of dca_step/history/etc. can be
