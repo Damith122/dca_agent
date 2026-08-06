@@ -36,6 +36,16 @@ DRY_RUN = os.environ.get("DRY_RUN", "false").lower() != "false"
 I_UNDERSTAND_THIS_IS_REAL_MONEY = os.environ.get(
     "I_UNDERSTAND_THIS_IS_REAL_MONEY", ""
 ).lower() == "yes"
+LIVE_TRADING_CONFIRMATION = os.environ.get(
+    "LIVE_TRADING_CONFIRMATION", "false"
+).lower() == "true"
+# 2026-08 Live Trading Safety Guard: a second, explicit gate alongside
+# I_UNDERSTAND_THIS_IS_REAL_MONEY above - both must be satisfied before
+# mainnet trading (USE_TESTNET=false) is allowed to start. Deliberately a
+# separate variable/phrase rather than reusing the existing one, so
+# switching to live requires a distinct, deliberate action rather than
+# whatever value happened to already be set for the other flag. See
+# dca2.py's enforce_safety_gates().
 
 # API keys MUST come from environment variables - set these in Railway's
 # "Variables" tab (Project -> your service -> Variables), never in this file.
@@ -103,6 +113,35 @@ MAX_HOLD_TIME_RECOVERY_MIN_AGREE = int(os.environ.get("MAX_HOLD_TIME_RECOVERY_MI
 # _manage_open_position()), how many must agree before the position is
 # force-closed as "low probability of recovery" rather than kept open past
 # MAX_HOLD_TIME_SEC (still bounded by MAX_HOLD_TIME_HARD_CAP_SEC either way).
+MAX_HOLD_TIME_DCA_MULTIPLIER = float(os.environ.get("MAX_HOLD_TIME_DCA_MULTIPLIER", "0.5"))
+# 2026-08 DCA-aware Max Hold Time tuning: once a position has DCA'd at
+# least once (dca_step >= 1), the SOFT max-hold-time threshold
+# (MAX_HOLD_TIME_SEC) is multiplied by this factor - default 0.5 means a
+# DCA'd position times out in half the normal duration (e.g. 4h -> 2h),
+# since a DCA'd position already ties up more capital than a dca_step=0
+# position and shouldn't get the same full timeout to resolve. A fresh,
+# never-DCA'd position (dca_step == 0) is completely unaffected - it still
+# uses the full MAX_HOLD_TIME_SEC exactly as before. This ONLY changes
+# WHEN the existing Max Hold Time V2 emergency-review logic starts
+# evaluating a DCA'd position - the review itself (recovery-risk signals,
+# DCA-opportunity defer, stale-profit-lock-flag handling) and
+# MAX_HOLD_TIME_HARD_CAP_SEC (the unconditional absolute ceiling) are both
+# completely unchanged.
+
+# --- Close-order verification (2026-08 execution-reliability hardening) ------
+CLOSE_VERIFY_MAX_RETRIES = int(os.environ.get("CLOSE_VERIFY_MAX_RETRIES", "3"))
+# After every close-order fill, close_position()'s finalization step
+# (_on_close_filled() in trading.py) re-fetches the exchange's own
+# positionAmt to confirm the position is actually flat before treating the
+# trade as closed. If a meaningful remainder is still open (a genuine
+# partial fill, or a fill that landed on the position in the brief window
+# between the pre-close qty fetch and the order executing), another
+# reduceOnly close is submitted automatically for exactly that remainder.
+# This caps how many automatic retry attempts are made before giving up and
+# requiring manual intervention, so a persistently-failing exchange/network
+# condition can never spin forever - the position is left clearly flagged
+# and tracked as OPEN with the correct remaining quantity either way, never
+# silently treated as closed.
 
 # --- Low Volatility ("dead market") Entry Filter (NEW) -----------------------
 # MarketRegimeEngine's SIDEWAYS/LOW_VOL split is RELATIVE (current ATR vs its
@@ -373,6 +412,7 @@ __all__ = [
     "USE_TESTNET",
     "DRY_RUN",
     "I_UNDERSTAND_THIS_IS_REAL_MONEY",
+    "LIVE_TRADING_CONFIRMATION",
     "API_KEY",
     "API_SECRET",
     "LEVERAGE",
@@ -393,6 +433,8 @@ __all__ = [
     "MAX_HOLD_TIME_HARD_CAP_SEC",
     "MAX_HOLD_TIME_SMALL_LOSS_PCT",
     "MAX_HOLD_TIME_RECOVERY_MIN_AGREE",
+    "MAX_HOLD_TIME_DCA_MULTIPLIER",
+    "CLOSE_VERIFY_MAX_RETRIES",
     "LOW_VOLATILITY_FILTER_ENABLED",
     "LOW_VOLATILITY_ATR_PCT_THRESHOLD",
     "ADAPTIVE_SIZING_ENABLED",
