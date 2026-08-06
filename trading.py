@@ -260,6 +260,8 @@ from config import (
     MAX_HOLD_TIME_HARD_CAP_SEC,
     MAX_HOLD_TIME_SMALL_LOSS_PCT,
     MAX_HOLD_TIME_RECOVERY_MIN_AGREE,
+    MAX_HOLD_TIME_DCA_MULTIPLIER,
+    CLOSE_VERIFY_MAX_RETRIES,
     LOW_VOLATILITY_FILTER_ENABLED,
     LOW_VOLATILITY_ATR_PCT_THRESHOLD,
     ADAPTIVE_SIZING_ENABLED,
@@ -1499,6 +1501,12 @@ class PositionState:
     opened_at: float = 0.0
     last_close_time: float = 0.0
     last_dca_price: Optional[float] = None   # anchor for ATR-based DCA spacing
+    # 2026-08 DCA State Recovery V2: which order_id filled the initial
+    # entry / most recent DCA add - audit/recovery fields only, never read
+    # by any entry/exit/DCA/risk decision (mirrors initial_entry_price's
+    # own audit-only role in _dca_state_snapshot()).
+    last_entry_order_id: Optional[int] = None
+    last_dca_order_id: Optional[int] = None
 
     # -- partial TP / breakeven / trailing -------------------------------------
     partial_tp_done: bool = False
@@ -1551,6 +1559,17 @@ class MartingaleManager:
         self.daily_realized_pnl: float = 0.0
         self._daily_loss_tracker_date: Optional[str] = None  # UTC "YYYY-MM-DD" the current daily_realized_pnl covers
         self._last_daily_loss_block_log_ts: float = 0.0  # throttles the "entries halted" diagnostic line
+        # 2026-08 close-verification fix: a single logical "close this
+        # position" action can now take more than one reduceOnly order (a
+        # genuine partial fill, or a fill landing on the position in the
+        # gap between the pre-close qty fetch and the order executing).
+        # _closing_accumulated_rp sums realized PnL across every leg of the
+        # SAME close sequence so the eventual trade-log record reflects the
+        # whole trade, not just the last leg. Reset to 0.0 at the start of
+        # every FRESH close_position() call; NOT reset between retry legs
+        # of the same sequence (see _on_close_filled()).
+        self._closing_accumulated_rp: float = 0.0
+        self._closing_retry_count: int = 0
         self.last_trade_action_ts: float = 0.0
         self.last_trade_open_ts: float = 0.0
         self._last_warmup_skip_log_ts: float = 0.0  # throttles the pre-warmup "no entry" log line
@@ -1740,6 +1759,7 @@ class MartingaleManager:
 
     def _dca_state_snapshot(self) -> dict:
         p = self.position
+        invested_notional = sum(price * qty for price, qty in p.entries)
         return {
             "symbol": self.symbol,
             "side": p.side,
@@ -1772,6 +1792,36 @@ class MartingaleManager:
             # all still match what the exchange reports, exactly like every
             # other field restored from this snapshot.
             "opened_at": p.opened_at,
+            # 2026-08 DCA State Recovery V2 - all fields below are
+            # audit/recovery data restored alongside the fields above (same
+            # side/qty/avg_entry_price/symbol match gate in
+            # initialize_sync() - unchanged), never consulted by any entry/
+            # exit/DCA/risk decision:
+            #   - dca_history: the full list of (price, qty) fills that
+            #     built this position, so a restart doesn't just know the
+            #     blended avg_entry_price but the actual fill-by-fill
+            #     history that produced it.
+            #   - total_invested_margin: cumulative margin committed
+            #     (invested notional / leverage) across every entry/DCA fill.
+            #   - current_notional: invested notional at entry prices (qty *
+            #     each fill's price, summed) - an audit snapshot of size,
+            #     not a live mark-to-market figure.
+            #   - last_entry_order_id / last_dca_order_id: which Binance
+            #     order actually filled the initial entry / most recent DCA
+            #     add (see PositionState's own fields).
+            #   - accumulated_close_pnl: only non-zero while a close-
+            #     verification sequence (see close_position()/
+            #     _on_close_filled()) is actively in progress - lets a
+            #     restart mid-close-retry recover how much of this trade's
+            #     PnL has already been realized across earlier legs instead
+            #     of losing track of it if the process restarts between
+            #     retry attempts.
+            "dca_history": list(p.entries),
+            "total_invested_margin": safe_div(invested_notional, self.leverage, 0.0),
+            "current_notional": invested_notional,
+            "last_entry_order_id": p.last_entry_order_id,
+            "last_dca_order_id": p.last_dca_order_id,
+            "accumulated_close_pnl": self._closing_accumulated_rp,
         }
 
     async def save_dca_state(self, reason: str) -> None:
@@ -2778,28 +2828,51 @@ class MartingaleManager:
         except BinanceApiError as e:
             print(color(f"[dca] {step_label} order FAILED: {e}", RED))
 
-    async def close_position(self, reason: str, emergency: bool = False, exit_reason_tag: str = "manual") -> None:
-        if self.position.status not in ("OPEN", "DCA_PENDING") or self.position.total_qty <= 0:
-            return
-        close_side = "SELL" if self.position.side == "LONG" else "BUY"
-        # Normalize to the exchange's stepSize before sending - total_qty can
-        # accumulate float imprecision (e.g. 0.0048000000000000004) across
-        # multiple entry/DCA fills, which Binance rejects with -1111
-        # "Precision is over the maximum defined for this asset." Same
-        # round_step() helper already used for entry/DCA order quantities.
-        qty = round_step(self.position.total_qty, self.filters.step_size)
-        label = "EMERGENCY CLOSE" if emergency else "CLOSE (full)"
-        print(color(
-            f"{now_str()} {label}: {reason} | closing {close_side} {qty} {self.symbol}",
-            RED if emergency else GREEN,
-        ))
-        self.position.status = "CLOSING"
-        self.position.pending_order_ts = time.time()
-        self.last_trade_action_ts = time.time()
-        self._pending_exit_reason = exit_reason_tag  # consumed in _on_close_filled
+    async def _fetch_exchange_position(self) -> Optional[Tuple[Optional[str], float]]:
+        """Fetches THIS symbol's authoritative position from Binance.
 
+        2026-08 execution-reliability hardening: extracted from
+        close_position()'s original inline fetch so the same authoritative
+        source is used both before submitting a close order AND after
+        (verifying the fill actually zeroed the position - see
+        _on_close_filled()) - one implementation, not two that could drift
+        apart.
+
+        Returns (side, abs_qty) where side is "LONG"/"SHORT"/None (None
+        means the exchange reports flat). Returns None if the fetch itself
+        failed (network/API/anything unexpected) - callers MUST treat None
+        as "unknown, don't trust this," never as "flat". Broad except
+        (matches the persistence-layer's own "must never crash the trading
+        loop" convention elsewhere in this file) since a naive `self.client
+        is None` in some future caller must degrade to this same safe
+        fallback, not raise.
+        """
+        try:
+            rows = await self.client.get_position_risk(self.symbol)
+            row = next((r for r in rows if r.get("symbol") == self.symbol), None)
+            amt = float(row.get("positionAmt", 0) or 0) if row is not None else 0.0
+            side = "LONG" if amt > 0 else ("SHORT" if amt < 0 else None)
+            return side, abs(amt)
+        except Exception as e:  # noqa: BLE001 - a position-risk fetch must never crash the trading loop
+            print(color(f"{now_str()} [exchange-verify] could not fetch position for {self.symbol}: {e}", YELLOW))
+            return None
+
+    async def _place_reduce_only_close_order(self, close_side: str, qty: float) -> Optional[int]:
+        """Places a single reduceOnly MARKET order and registers it for
+        fill-tracking. Returns the order_id (or a fake negative id in
+        DRY_RUN), or None if placement failed (already logged - caller
+        decides how to react, e.g. leaving the position tracked as OPEN
+        with the correct remaining qty rather than assuming success).
+
+        2026-08 execution-reliability hardening: extracted from
+        close_position() so the SAME order-placement/tracking mechanics are
+        used both for the initial close attempt and for any automatic
+        close-verification retry in _on_close_filled() - one
+        implementation, not a second copy that could drift apart. Does NOT
+        touch self.position.status or finalize anything; callers own that.
+        """
         if DRY_RUN:
-            fake_id = -(int(time.time() * 1000) % 1_000_000) - 900000
+            fake_id = -(int(time.time() * 1000) % 1_000_000) - 900000 - self._closing_retry_count
             self._order_index[fake_id] = "close"
             self.position.pending_order_id = fake_id
             self.position.pending_role = "close"
@@ -2807,7 +2880,7 @@ class MartingaleManager:
                 f"{now_str()} [DRY RUN] would place CLOSE {close_side} {qty} "
                 f"{self.symbol} reduceOnly MARKET", GRAY
             ))
-            return
+            return fake_id
 
         try:
             resp = await self.client.place_order(
@@ -2816,12 +2889,12 @@ class MartingaleManager:
             )
             order_id = resp["orderId"]
             # 2026-08 fill-tracking race fix (same as _place_step_order()) -
-            # replaces the previous bare `self._order_index[resp["orderId"]]
-            # = "close"` so a FILLED event that arrived before this line is
-            # replayed instead of dropped (it would otherwise only ever be
-            # recovered later via _try_recover_close_fill()'s persisted-
-            # snapshot path, which needs save_dca_state() below to have run
-            # first - a real gap this closes for the common in-session case).
+            # replaces a bare `self._order_index[resp["orderId"]] = "close"`
+            # so a FILLED event that arrived before this line is replayed
+            # instead of dropped (it would otherwise only ever be recovered
+            # later via _try_recover_close_fill()'s persisted-snapshot
+            # path, which needs save_dca_state() below to have run first -
+            # a real gap this closes for the common in-session case).
             already_filled = await self._register_order_and_replay(order_id, "close")
             if not already_filled:
                 self.position.pending_order_id = order_id
@@ -2831,15 +2904,140 @@ class MartingaleManager:
                 # handle_order_update()'s untracked_order_id recovery path.
                 asyncio.create_task(self.save_dca_state(reason="close order placed"))
             # NOTE: if already_filled is True, _on_close_filled() (run via the
-            # replay above) has already reset self.position to flat and
-            # scheduled delete_dca_state("trade closed") - saving a "close
-            # order placed" snapshot afterward would be wrong, hence the
-            # guard above instead of an unconditional call.
-        except BinanceApiError as e:
+            # replay above) has already run its own verification/finalize
+            # logic - saving a "close order placed" snapshot afterward would
+            # be wrong, hence the guard above instead of an unconditional call.
+            return order_id
+        except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
             print(color(
-                f"[position] FAILED to close position: {e} - "
+                f"[position] FAILED to place reduceOnly close order: {e} - "
                 f"POSITION MAY STILL BE OPEN, check manually!", RED
             ))
+            return None
+        except Exception as e:  # noqa: BLE001 - order placement must never crash the trading loop;
+            # any unexpected failure here is exactly as dangerous as a
+            # recognized BinanceApiError (a close order that may or may not
+            # have gone through) and must be handled the same way, not
+            # propagate and kill the event loop mid-close.
+            print(color(
+                f"[position] UNEXPECTED error placing reduceOnly close order: {e} - "
+                f"POSITION MAY STILL BE OPEN, check manually!", RED
+            ))
+            return None
+
+    async def close_position(self, reason: str, emergency: bool = False, exit_reason_tag: str = "manual") -> None:
+        if self.position.status not in ("OPEN", "DCA_PENDING") or self.position.total_qty <= 0:
+            return
+        close_side = "SELL" if self.position.side == "LONG" else "BUY"
+
+        # 2026-08 close-verification fix: reset the close-sequence
+        # accumulators for this FRESH close attempt (a retry continuing an
+        # already-in-progress sequence goes through _on_close_filled()
+        # directly, not back through here, so this reset never clobbers an
+        # in-flight retry's accumulated PnL/count).
+        self._closing_accumulated_rp = 0.0
+        self._closing_retry_count = 0
+
+        # 2026-08 dust-position fix: previously this always derived the
+        # close quantity from the LOCALLY-tracked self.position.total_qty
+        # (accumulated via ordinary float addition across every entry/DCA
+        # fill), rounded DOWN to step_size. Local float accumulation can
+        # drift a hair below the true value - e.g. 0.0040999999999999995
+        # instead of exactly 0.0041 - and round_step()'s ROUND_DOWN then
+        # floors an ALREADY-slightly-under value to the next step below
+        # that, under-closing by a full step. The bot believes the trade
+        # is fully closed while Binance is left holding a real dust
+        # position. Now fetches the exchange's own authoritative
+        # positionAmt (via _fetch_exchange_position() above) immediately
+        # before submitting the close order and closes exactly that (still
+        # rounded down to step_size for Binance's own precision rules -
+        # safe now, since it starts from the true value instead of a
+        # possibly-drifted local copy). Skipped in DRY_RUN (nothing real to
+        # query - local qty is already authoritative there). Falls back to
+        # the previous local-total_qty behavior if the fetch fails, returns
+        # nothing for this symbol, or reports a side that doesn't match
+        # local state - a transient API hiccup must never be able to block
+        # an emergency close (Hard Stop, Max Hold Time, etc. all depend on
+        # this function actually running).
+        qty = round_step(self.position.total_qty, self.filters.step_size)
+        qty_source = "local total_qty"
+        if not DRY_RUN:
+            exchange_state = await self._fetch_exchange_position()
+            if exchange_state is not None:
+                exchange_side, amt_abs = exchange_state
+                if exchange_side == self.position.side:
+                    fresh_qty = round_step(amt_abs, self.filters.step_size)
+                    if fresh_qty > 0:
+                        if abs(fresh_qty - qty) > max(self.filters.step_size, 1e-9):
+                            print(color(
+                                f"{now_str()} [close-qty] exchange positionAmt ({amt_abs}) differs "
+                                f"from local total_qty ({self.position.total_qty}) by more than one "
+                                f"step - using the exchange value to avoid leaving dust.", YELLOW,
+                            ))
+                        qty = fresh_qty
+                        qty_source = "exchange positionAmt"
+                    else:
+                        # Same side, but rounds to a genuinely un-closeable
+                        # dust amount below step_size - treat identically to
+                        # the confidently-FLAT case below rather than
+                        # attempting a reduceOnly order for a quantity
+                        # Binance can't even represent.
+                        exchange_side = "FLAT"
+                if exchange_side is None:
+                    exchange_side = "FLAT"
+                if exchange_side == "FLAT":
+                    # Exchange confidently reports NO open position (amt
+                    # rounds to 0) - there is nothing to close. Falling
+                    # back to local total_qty here would submit a
+                    # reduceOnly order Binance will very likely reject
+                    # (nothing to reduce), which the existing
+                    # BinanceApiError handler below would then treat as a
+                    # FAILED close and reset status back to "OPEN" - wrong,
+                    # since the position is actually already flat. Instead,
+                    # reconcile local state to FLAT directly, exactly like
+                    # initialize_sync()'s own "exchange reports NO open
+                    # position" branch does, and skip order placement
+                    # entirely.
+                    print(color(
+                        f"{now_str()} [close-qty] exchange already reports FLAT for {self.symbol} "
+                        f"(no order needed) - reconciling local state to FLAT instead of submitting "
+                        f"a reduceOnly order for a position that no longer exists.", YELLOW,
+                    ))
+                    self.position = PositionState(last_close_time=time.time())
+                    self.last_trade_action_ts = time.time()
+                    asyncio.create_task(self.delete_dca_state(reason="exchange already flat at close time"))
+                    return
+                elif exchange_side != self.position.side:
+                    print(color(
+                        f"{now_str()} [close-qty] WARNING: exchange side ({exchange_side}) does not "
+                        f"match local side ({self.position.side}) for {self.symbol} - falling back "
+                        f"to local total_qty for this close order (not trusting a side mismatch).",
+                        YELLOW,
+                    ))
+            else:
+                print(color(
+                    f"{now_str()} [close-qty] could not fetch fresh positionAmt before closing - "
+                    f"falling back to local total_qty for this close order.", YELLOW,
+                ))
+
+        label = "EMERGENCY CLOSE" if emergency else "CLOSE (full)"
+        print(color(
+            f"{now_str()} {label}: {reason} | closing {close_side} {qty} {self.symbol} "
+            f"(qty_source={qty_source})",
+            RED if emergency else GREEN,
+        ))
+        self.position.status = "CLOSING"
+        self.position.pending_order_ts = time.time()
+        self.last_trade_action_ts = time.time()
+        self._pending_exit_reason = exit_reason_tag  # consumed in _on_close_filled
+
+        await self._place_reduce_only_close_order(close_side, qty)
+        if not DRY_RUN and self.position.pending_order_id is None and self.position.status == "CLOSING":
+            # _place_reduce_only_close_order() failed to place the order
+            # (already logged) and there's no already-filled replay to have
+            # handled it - leave status as OPEN so risk management resumes
+            # evaluating this position on the next tick instead of it being
+            # stuck in CLOSING with nothing actually pending.
             self.position.status = "OPEN"
 
     async def partial_close_position(self, fraction: float, reason: str) -> None:
@@ -3121,7 +3319,18 @@ class MartingaleManager:
         # unconditional MAX_HOLD_TIME_HARD_CAP_SEC ceiling below is
         # completely unchanged - a deferred loser can never be held past it.
         held_sec_so_far = time.time() - p.opened_at
-        if MAX_HOLD_TIME_ENABLED and held_sec_so_far >= MAX_HOLD_TIME_SEC:
+        # 2026-08 DCA-aware Max Hold Time tuning (this line only - every
+        # other part of this block, including the hard cap below, is
+        # unchanged): a position that has DCA'd at least once already ties
+        # up more capital than a fresh dca_step==0 position, so it gets a
+        # shorter soft timeout before this emergency-review logic starts
+        # evaluating it. dca_step==0 positions are completely unaffected -
+        # effective_max_hold_sec equals MAX_HOLD_TIME_SEC exactly, same as
+        # before this change.
+        effective_max_hold_sec = (
+            MAX_HOLD_TIME_SEC * MAX_HOLD_TIME_DCA_MULTIPLIER if p.dca_step >= 1 else MAX_HOLD_TIME_SEC
+        )
+        if MAX_HOLD_TIME_ENABLED and held_sec_so_far >= effective_max_hold_sec:
             hard_cap_hit = held_sec_so_far >= MAX_HOLD_TIME_HARD_CAP_SEC
             trending_and_profitable = (
                 unrealized_pnl_usdt > 0
@@ -3254,7 +3463,7 @@ class MartingaleManager:
                 ))
                 await self.close_position(
                     f"max hold time reached: {held_sec_so_far/3600:.2f}h >= "
-                    f"{MAX_HOLD_TIME_SEC/3600:.2f}h (hard_cap={hard_cap_hit}, "
+                    f"{effective_max_hold_sec/3600:.2f}h (dca_step={p.dca_step}, hard_cap={hard_cap_hit}, "
                     f"regime={self.last_regime.regime}, unrealized_pnl=${unrealized_pnl_usdt:+.4f}, "
                     f"profit_lock_active={p.profit_lock_active}{review_suffix}) - closing dead/ranging "
                     f"hold instead of tying up capital indefinitely",
@@ -3310,28 +3519,49 @@ class MartingaleManager:
                 return
 
         # --- Trailing stop on the runner (after partial TP armed breakeven) ----------
+        # 2026-08 fee-aware exit fix (this block only - trail-level/ATR
+        # calculation, activation via breakeven_armed, and every other
+        # exit path are unchanged): previously this closed on `pct_move >
+        # 0` alone - ANY still-technically-favorable price, even one too
+        # small to clear round-trip fees. TP, Partial TP, and Profit Lock
+        # all already require net_pnl >= MIN_NET_PROFIT_USDT before
+        # closing (see those blocks) - trailing stop was the one exit path
+        # that could still intentionally realize a net loss after fees on
+        # a technically-"favorable" move. Now requires the same fee-safe
+        # floor. If the trail level is hit but net PnL doesn't clear it,
+        # this simply doesn't force-close via trailing stop this tick -
+        # Hard Stop, Max Hold Time, and Smart Exit remain fully active as
+        # independent backstops, so this can never create an unbounded
+        # hold; it only removes trailing stop's ability to lock in a
+        # fee-losing "win".
         if TRAILING_STOP_ENABLED and p.breakeven_armed and held_long_enough and self.last_regime.atr_pct > 0:
             trail_distance = price * self.last_regime.atr_pct * TRAILING_STOP_ATR_MULT
             if p.side == "LONG":
                 candidate = (p.max_favorable_price or price) - trail_distance
                 p.trailing_stop_price = candidate if p.trailing_stop_price is None else max(p.trailing_stop_price, candidate)
                 if price <= p.trailing_stop_price and pct_move > 0:
-                    await self.close_position(
-                        f"trailing stop: price {price:.2f} <= trail {p.trailing_stop_price:.2f} "
-                        f"(ATR-based, {pct_move*100:.2f}% still favorable)",
-                        exit_reason_tag="trailing_stop",
-                    )
-                    return
+                    net_pnl_trail = self.estimate_net_pnl_usdt(price)
+                    if net_pnl_trail >= MIN_NET_PROFIT_USDT:
+                        await self.close_position(
+                            f"trailing stop: price {price:.2f} <= trail {p.trailing_stop_price:.2f} "
+                            f"(ATR-based, {pct_move*100:.2f}% still favorable, "
+                            f"est. net pnl=${net_pnl_trail:+.4f} after fees)",
+                            exit_reason_tag="trailing_stop",
+                        )
+                        return
             else:
                 candidate = (p.max_favorable_price or price) + trail_distance
                 p.trailing_stop_price = candidate if p.trailing_stop_price is None else min(p.trailing_stop_price, candidate)
                 if price >= p.trailing_stop_price and pct_move > 0:
-                    await self.close_position(
-                        f"trailing stop: price {price:.2f} >= trail {p.trailing_stop_price:.2f} "
-                        f"(ATR-based, {pct_move*100:.2f}% still favorable)",
-                        exit_reason_tag="trailing_stop",
-                    )
-                    return
+                    net_pnl_trail = self.estimate_net_pnl_usdt(price)
+                    if net_pnl_trail >= MIN_NET_PROFIT_USDT:
+                        await self.close_position(
+                            f"trailing stop: price {price:.2f} >= trail {p.trailing_stop_price:.2f} "
+                            f"(ATR-based, {pct_move*100:.2f}% still favorable, "
+                            f"est. net pnl=${net_pnl_trail:+.4f} after fees)",
+                            exit_reason_tag="trailing_stop",
+                        )
+                        return
 
         # --- ATR-adaptive DCA distance (computed here so Smart Exit's
         # proximity gate below can reference the same value the DCA branch
@@ -3714,7 +3944,7 @@ class MartingaleManager:
         fill_qty = float(o.get("z") or 0.0)
 
         if role in ("initial", "dca"):
-            await self._on_entry_filled(role, fill_price, fill_qty)
+            await self._on_entry_filled(role, fill_price, fill_qty, order_id=order_id)
         elif role == "partial_close":
             await self._apply_partial_close(fill_qty, fill_price)
         elif role == "close":
@@ -3730,7 +3960,7 @@ class MartingaleManager:
             await self._on_close_filled(fill_price, total_rp, order_id=order_id)
 
 
-    async def _on_entry_filled(self, role: str, fill_price: float, fill_qty: float) -> None:
+    async def _on_entry_filled(self, role: str, fill_price: float, fill_qty: float, order_id: Optional[int] = None) -> None:
         self.position.entries.append((fill_price, fill_qty))
         total_notional = sum(p * q for p, q in self.position.entries)
         total_qty = sum(q for _, q in self.position.entries)
@@ -3739,6 +3969,7 @@ class MartingaleManager:
         self.position.original_qty = total_qty
         if role == "dca":
             self.position.dca_step += 1
+            self.position.last_dca_order_id = order_id
             # 2026-08 Max Hold Time <-> DCA debug logging: if Max Hold Time
             # V2 deferred specifically because this DCA opportunity was
             # available (set/refreshed every tick in _manage_open_position(),
@@ -3757,6 +3988,7 @@ class MartingaleManager:
             self._max_hold_dca_defer_pending = False
         else:
             self.position.opened_at = time.time()
+            self.position.last_entry_order_id = order_id
             self.position.max_favorable_price = fill_price
             self.position.max_adverse_price = fill_price
             # Guards against a stale defer-flag from an earlier, already-
@@ -3797,8 +4029,103 @@ class MartingaleManager:
         # (trade log, DCA-state cleanup, etc.) is affected.
         self._maybe_reset_daily_loss_tracker()
         self.daily_realized_pnl += total_rp
+        # 2026-08 close-verification fix: this fill's realized PnL is real,
+        # permanent money regardless of whether the position turns out to
+        # be fully closed yet - accumulate it now so a trade needing 2-3
+        # close legs (a genuine partial fill, or a fill landing on the
+        # position between the pre-close qty fetch and the order executing)
+        # still produces ONE correct trade-log record for the whole trade,
+        # not one truncated record per leg.
+        self._closing_accumulated_rp += total_rp
+
+        # 2026-08 close-verification fix (this block only - the finalize
+        # logic below is otherwise unchanged in content, just now gated
+        # behind a confirmed-flat exchange position instead of running
+        # unconditionally after every fill): never assume a single FILLED
+        # event means the position is fully gone from Binance. Re-fetches
+        # the exchange's own positionAmt (skipped in DRY_RUN - nothing real
+        # to verify, the simulated fill is authoritative there by
+        # definition) and only proceeds to finalize the trade (log it,
+        # delete the DCA snapshot, reset to FLAT) once it's confirmed. If a
+        # meaningful remainder is still open, submits another reduceOnly
+        # close for exactly that remainder and returns - waiting for THAT
+        # order's own FILLED event to re-enter this same function and
+        # verify again, up to CLOSE_VERIFY_MAX_RETRIES attempts. If the
+        # verification fetch itself fails, this does NOT finalize either -
+        # it leaves state as CLOSING/DCA-snapshot-intact and relies on the
+        # independent periodic initialize_sync() resync (runs every
+        # POSITION_RISK_POLL_SEC regardless) to reconcile it, rather than
+        # ever guessing.
+        if not DRY_RUN:
+            exchange_state = await self._fetch_exchange_position()
+            if exchange_state is None:
+                print(color(
+                    f"{now_str()} [close-verify] could not verify exchange position after this "
+                    f"fill - NOT finalizing yet (state stays CLOSING, DCA snapshot NOT deleted); "
+                    f"the periodic exchange resync will reconcile this.", RED,
+                ))
+                return
+            exchange_side, remaining_qty = exchange_state
+            remaining_qty_rounded = round_step(remaining_qty, self.filters.step_size)
+            print(color(
+                f"{now_str()} [close-verify] exchange position after fill: side={exchange_side} "
+                f"qty={remaining_qty} (rounded={remaining_qty_rounded}, "
+                f"step_size={self.filters.step_size})", GRAY,
+            ))
+            if exchange_side is not None and remaining_qty_rounded > 0 and exchange_side == p.side:
+                self._closing_retry_count += 1
+                if self._closing_retry_count <= CLOSE_VERIFY_MAX_RETRIES:
+                    close_side = "SELL" if p.side == "LONG" else "BUY"
+                    print(color(
+                        f"{now_str()} [close-verify] position NOT fully closed - "
+                        f"{remaining_qty_rounded} {self.symbol} remains after this fill (retry "
+                        f"{self._closing_retry_count}/{CLOSE_VERIFY_MAX_RETRIES}) - submitting "
+                        f"another reduceOnly close for the remainder.", YELLOW,
+                    ))
+                    p.total_qty = remaining_qty_rounded
+                    new_order_id = await self._place_reduce_only_close_order(close_side, remaining_qty_rounded)
+                    if new_order_id is None:
+                        print(color(
+                            f"{now_str()} [close-verify] CRITICAL: retry order placement FAILED - "
+                            f"{remaining_qty_rounded} {self.symbol} remains open. Leaving position "
+                            f"tracked as OPEN with the correct remaining quantity - MANUAL REVIEW "
+                            f"RECOMMENDED. DCA snapshot NOT deleted.", RED,
+                        ))
+                        p.status = "OPEN"
+                        p.pending_order_id = None
+                        p.pending_role = None
+                        asyncio.create_task(self.save_dca_state(reason="close retry placement failed"))
+                    return  # wait for the retry order's own FILLED event (or the failure path above)
+                else:
+                    print(color(
+                        f"{now_str()} [close-verify] CRITICAL: {remaining_qty_rounded} {self.symbol} "
+                        f"still open after {CLOSE_VERIFY_MAX_RETRIES} automatic retry attempts - "
+                        f"giving up automatic retries. MANUAL INTERVENTION REQUIRED. Position left "
+                        f"tracked as OPEN with the remaining quantity so it is never silently lost. "
+                        f"DCA snapshot NOT deleted.", RED,
+                    ))
+                    p.total_qty = remaining_qty_rounded
+                    p.status = "OPEN"
+                    p.pending_order_id = None
+                    p.pending_role = None
+                    asyncio.create_task(self.save_dca_state(reason="close-verify retries exhausted"))
+                    return
+            # exchange_side is None (confirmed flat), or reports a
+            # different/opposite side (can't be attributed to closing this
+            # position further - treated as flat-for-this-purpose, same as
+            # initialize_sync()'s own handling), or remaining_qty_rounded
+            # is a genuinely un-closeable dust amount below step_size -
+            # every one of these means there is nothing more THIS close
+            # sequence can or should do. Proceed to finalize below.
+            print(color(f"{now_str()} [close-verify] confirmed FLAT on exchange - finalizing trade.", GRAY))
+
+        # --- finalize: exchange confirmed flat (or DRY_RUN, where the
+        # simulated fill is authoritative by definition) ------------------
+        total_rp_for_record = self._closing_accumulated_rp
+        self._closing_accumulated_rp = 0.0
+        self._closing_retry_count = 0
         self.trade_count += 1
-        pnl_color = GREEN if total_rp >= 0 else RED
+        pnl_color = GREEN if total_rp_for_record >= 0 else RED
 
         exit_reason = getattr(self, "_pending_exit_reason", "manual")
         held_sec = time.time() - p.opened_at if p.opened_at else 0.0
@@ -3818,9 +4145,11 @@ class MartingaleManager:
             mfe_pct = max(mfe_pct, 0.0)
             mae_pct = max(mae_pct, 0.0)
 
-        net_pnl_total = total_rp  # includes any partial-TP pnl already added to realized_pnl_total separately
-        # total_rp here is only the FINAL close leg's realized pnl per Binance's
-        # own accounting; combine with whatever partial-TP pnl we tracked locally.
+        net_pnl_total = total_rp_for_record  # includes any partial-TP pnl already added to realized_pnl_total separately
+        # total_rp_for_record is the SUM of every close leg's realized pnl
+        # for this trade (usually just one leg; more if close-verification
+        # above needed a retry) per Binance's own accounting; combine with
+        # whatever partial-TP pnl we tracked locally.
         combined_net_pnl = net_pnl_total
 
         reward = self.reward_calc.compute(
@@ -3834,7 +4163,7 @@ class MartingaleManager:
         )
 
         print(color(
-            f"{now_str()} POSITION CLOSED @ {fill_price:.2f}  PnL={total_rp:+.4f} USDT  "
+            f"{now_str()} POSITION CLOSED @ {fill_price:.2f}  PnL={total_rp_for_record:+.4f} USDT  "
             f"(DCA steps used: {p.dca_step}/{MAX_DCA_STEPS})  exit_reason={exit_reason}  "
             f"reward={reward:+.4f}  session_total={self.realized_pnl_total:+.4f}",
             pnl_color,
@@ -4147,6 +4476,9 @@ async def initialize_sync(
     restored_pending_order_id: Optional[int] = None
     restored_pending_role: Optional[str] = None
     restored_opened_at: Optional[float] = None
+    restored_dca_history: Optional[list] = None
+    restored_last_entry_order_id: Optional[int] = None
+    restored_last_dca_order_id: Optional[int] = None
     snapshot_restored = False
     snapshot = await manager.load_dca_state_snapshot()
     if snapshot is not None:
@@ -4183,6 +4515,37 @@ async def initialize_sync(
                 restored_opened_at = snap_opened_at if snap_opened_at > 0 else None
             except (TypeError, ValueError):
                 restored_opened_at = None
+            # 2026-08 DCA State Recovery V2: restore the full fill-by-fill
+            # history (dca_history) if present and internally consistent
+            # (a basic sanity check - its qty must sum to roughly the same
+            # total_qty already validated above via qty_ok). An older
+            # snapshot predating this field, or one that fails the sanity
+            # check, safely falls back to a single synthetic entry built
+            # from the exchange's own avg_entry_price/qty below - exactly
+            # the previous behavior - rather than trusting a
+            # malformed/stale history. Never used by any entry/exit/DCA/
+            # risk decision either way - side/qty/avg_entry_price (already
+            # validated above) remain the only fields that gate whether
+            # ANY of this snapshot is trusted at all.
+            raw_history = snapshot.get("dca_history")
+            if isinstance(raw_history, list) and raw_history:
+                try:
+                    parsed_history = [(float(p_), float(q_)) for p_, q_ in raw_history]
+                    history_qty_sum = sum(q_ for _, q_ in parsed_history)
+                    if abs(history_qty_sum - qty) <= qty_tol:
+                        restored_dca_history = parsed_history
+                except (TypeError, ValueError):
+                    restored_dca_history = None
+            try:
+                raw_entry_oid = snapshot.get("last_entry_order_id")
+                restored_last_entry_order_id = int(raw_entry_oid) if raw_entry_oid is not None else None
+            except (TypeError, ValueError):
+                restored_last_entry_order_id = None
+            try:
+                raw_dca_oid = snapshot.get("last_dca_order_id")
+                restored_last_dca_order_id = int(raw_dca_oid) if raw_dca_oid is not None else None
+            except (TypeError, ValueError):
+                restored_last_dca_order_id = None
             snapshot_restored = True
             # Only a pending CLOSE is restored here (not "initial"/"dca") -
             # those are Entry/DCA order-placement concerns and are left
@@ -4215,12 +4578,37 @@ async def initialize_sync(
                 f"last_dca_price={restored_last_dca_price}, "
                 f"profit_lock_active={preserved_profit_lock_active}, "
                 f"pending_close_order_id={restored_pending_order_id}, "
-                f"opened_at={'restored' if restored_opened_at else 'not available - using now()'}.", MAGENTA,
+                f"opened_at={'restored' if restored_opened_at else 'not available - using now()'}, "
+                f"dca_history={'restored (' + str(len(restored_dca_history)) + ' fills)' if restored_dca_history else 'not available - using single synthetic entry'}, "
+                f"last_entry_order_id={restored_last_entry_order_id}, "
+                f"last_dca_order_id={restored_last_dca_order_id}.", MAGENTA,
             ))
+            if restored_dca_history is None:
+                # 2026-08 DCA State Recovery V2: exact requested log format -
+                # the position/dca_step itself WAS recovered above (this
+                # branch only means the fill-by-fill history specifically
+                # wasn't available or didn't pass its sanity check), so a
+                # single synthetic entry is used as the conservative
+                # fallback for `entries` below instead of leaving it empty.
+                print(color(
+                    "[DCA RECOVERY WARNING]\n"
+                    "history unavailable, using conservative fallback",
+                    YELLOW,
+                ))
         else:
             print(color(
                 f"{now_str()} [sync:{context}] [dca-state] snapshot found but does not match "
                 f"exchange position (side/qty/avg_entry/symbol) - ignoring.", YELLOW,
+            ))
+            # 2026-08 DCA State Recovery V2: exact requested log format - a
+            # mismatched snapshot means NONE of dca_step/history/etc. can be
+            # trusted for this exchange-reported position (see the
+            # unconditional REBUILD below, dca_step resets to 0 exactly as
+            # before this fix).
+            print(color(
+                "[DCA RECOVERY WARNING]\n"
+                "history unavailable, using conservative fallback",
+                YELLOW,
             ))
     else:
         # 2026-08 DCA-state GitHub persistence fix: explicit, unmissable
@@ -4237,6 +4625,12 @@ async def initialize_sync(
             f"peak_unrealized_pnl cannot be recovered and will reset to their defaults below).",
             RED,
         ))
+        # 2026-08 DCA State Recovery V2: exact requested log format.
+        print(color(
+            "[DCA RECOVERY WARNING]\n"
+            "history unavailable, using conservative fallback",
+            YELLOW,
+        ))
 
     print(color(
         f"{now_str()} [sync:{context}] *** RESYNCING TO MATCH EXCHANGE *** "
@@ -4252,7 +4646,17 @@ async def initialize_sync(
         side=side,
         status=rebuilt_status,
         dca_step=restored_dca_step,
-        entries=[(entry_price, qty)],
+        # 2026-08 DCA State Recovery V2: prefer the restored fill-by-fill
+        # history when available and sanity-checked above; otherwise fall
+        # back to the single synthetic entry built from the exchange's own
+        # avg_entry_price/qty - exactly the previous (pre-this-fix)
+        # behavior. Either way, total_qty/avg_entry_price below are always
+        # the exchange's own authoritative values, never derived from
+        # entries - entries is informational/audit only (used for
+        # invested_notional/reward-calc inputs at close time), so this
+        # fallback can never desync position sizing from what Binance
+        # actually reports.
+        entries=(restored_dca_history if restored_dca_history else [(entry_price, qty)]),
         avg_entry_price=entry_price,
         total_qty=qty,
         original_qty=qty,
@@ -4266,6 +4670,8 @@ async def initialize_sync(
         max_favorable_price=entry_price,
         max_adverse_price=entry_price,
         last_dca_price=restored_last_dca_price,
+        last_entry_order_id=restored_last_entry_order_id,
+        last_dca_order_id=restored_last_dca_order_id,
         profit_lock_active=preserved_profit_lock_active,
         peak_unrealized_pnl=preserved_peak_unrealized_pnl,
         pending_order_id=restored_pending_order_id,
@@ -4283,6 +4689,22 @@ async def initialize_sync(
         # persisted-snapshot lookup in _try_recover_close_fill() remains as
         # a fallback for any case this doesn't cover.
         manager._order_index[restored_pending_order_id] = "close"
+        # 2026-08 DCA State Recovery V2: if this restored pending order is
+        # a CLOSE, also restore how much of this trade's PnL was already
+        # realized across earlier legs of the same close-verification
+        # sequence (see close_position()/_on_close_filled()'s
+        # _closing_accumulated_rp) - otherwise a restart landing mid-retry
+        # would lose track of it and the eventual trade-log record would
+        # under-report this trade's true PnL. The retry counter itself
+        # resets to 0 rather than trying to restore how many attempts had
+        # already happened - conservative (worst case, one extra retry
+        # attempt is available) rather than trusting a potentially stale
+        # count across a restart.
+        try:
+            manager._closing_accumulated_rp = float(snapshot.get("accumulated_close_pnl", 0.0) or 0.0) if snapshot else 0.0
+        except (TypeError, ValueError):
+            manager._closing_accumulated_rp = 0.0
+        manager._closing_retry_count = 0
         print(color(
             f"{now_str()} [sync:{context}] [dca-state] pending CLOSE order "
             f"{restored_pending_order_id} restored - position set to CLOSING so "
