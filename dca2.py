@@ -133,6 +133,7 @@ from config import (
     USE_TESTNET,
     DRY_RUN,
     I_UNDERSTAND_THIS_IS_REAL_MONEY,
+    LIVE_TRADING_CONFIRMATION,
     API_KEY,
     API_SECRET,
     LEVERAGE,
@@ -291,6 +292,26 @@ def enforce_safety_gates() -> None:
             "REFUSING TO START: USE_TESTNET=false (mainnet) but "
             "I_UNDERSTAND_THIS_IS_REAL_MONEY is not set to 'yes'. "
             "This is a deliberate safety gate."
+        )
+
+    # 2026-08 Live Trading Safety Guard: a second, independent gate -
+    # both this AND I_UNDERSTAND_THIS_IS_REAL_MONEY above must be set
+    # before mainnet trading is allowed to start. Deliberately checked
+    # separately (not merged into the check above) so it prints its own
+    # explicit message and can be reasoned about/audited independently.
+    if not USE_TESTNET and not LIVE_TRADING_CONFIRMATION:
+        print(color(
+            "[LIVE SAFETY]\n"
+            "Mainnet trading blocked.\n"
+            "Set LIVE_TRADING_CONFIRMATION=true to enable live orders.",
+            RED,
+        ))
+        raise SystemExit(
+            "REFUSING TO START: USE_TESTNET=false (mainnet) but "
+            "LIVE_TRADING_CONFIRMATION is not set to 'true'. "
+            "This is a deliberate safety gate, separate from "
+            "I_UNDERSTAND_THIS_IS_REAL_MONEY, to prevent accidental "
+            "real-money execution."
         )
 
     global LEVERAGE
