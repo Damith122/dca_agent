@@ -1585,6 +1585,14 @@ class MartingaleManager:
         self.regime_engine = MarketRegimeEngine()
         self.risk_engine = RiskEngine()
         self.brain = BrainV2(N_FEATURES_V2, BRAIN2_WARMUP_UPDATES)
+        # 2026-08 Brain rollback-safety fix: the highest Brain
+        # update_count this process has ever confirmed to exist (set once
+        # load_or_init_brain() finishes selecting the winning snapshot, and
+        # advanced again after every successful GitHub push in
+        # persist_brain()). Used only as a cheap, local, no-extra-API-call
+        # guard so a persist can never silently push a lower-update Brain
+        # over a known-higher remote one - see persist_brain() below.
+        self._brain_max_known_update_count: int = 0
         self.confidence_engine = ConfidenceEngine()
         self.entry_engine = EntryEngineV2()
         self.reward_calc = RewardCalculator()
@@ -1702,41 +1710,136 @@ class MartingaleManager:
     async def load_or_init_brain(self) -> None:
         # Start (or reuse) the single shared GitHub session up front, so it's
         # available for the CSV log/stats restore that runs right after this,
-        # regardless of which branch below actually loads the brain from.
+        # regardless of which candidate below actually wins the selection.
         await self.github_sync.start()
 
+        # 2026-08 Brain rollback-safety fix (this function only - Brain
+        # training/scoring formulas, N_FEATURES_V2, BRAIN2_WARMUP_UPDATES,
+        # and BrainV2.from_bytes()'s own compatibility validation are all
+        # unchanged): previously, any readable local brain.pkl was loaded
+        # unconditionally and this function RETURNED before ever checking
+        # GitHub - a stale local snapshot (e.g. surviving on a persistent
+        # volume across a redeploy) could silently roll the bot's learned
+        # state backward by tens of thousands of updates, with no
+        # comparison ever made and no log evidence of why. Now BOTH
+        # candidates are read (when available) and compared by
+        # BrainV2.update_count - the ONLY authoritative freshness signal
+        # used (never file mtime or Git commit timestamp, per the
+        # requirement that a stale snapshot's commit can postdate a
+        # genuinely newer one) - and the higher one wins.
+        #
+        # BrainV2.from_bytes() itself is untouched and does the validation:
+        # it never raises - an incompatible/corrupt snapshot silently
+        # becomes a fresh BrainV2 (update_count=0), which then automatically
+        # loses this comparison to any real snapshot on either side. So
+        # "only successfully validated snapshots participate" falls out of
+        # the existing from_bytes() behavior for free, without duplicating
+        # its compatibility checks here.
+        local_brain: Optional[BrainV2] = None
+        local_updates: Optional[int] = None
         if os.path.exists(BRAIN_LOCAL_PATH):
+            local_data: Optional[bytes] = None
             try:
                 with open(BRAIN_LOCAL_PATH, "rb") as f:
-                    data = f.read()
-                self.brain = BrainV2.from_bytes(data, N_FEATURES_V2, BRAIN2_WARMUP_UPDATES)
-                print(color(
-                    f"[brain] loaded local {BRAIN_LOCAL_PATH} "
-                    f"(updates={self.brain.update_count}, ready={self.brain.is_ready()})", MAGENTA,
-                ))
-                return
-            except Exception as e:  # noqa: BLE001 - corrupt local file must not block startup
-                print(color(f"[brain] local {BRAIN_LOCAL_PATH} unreadable ({e}), trying GitHub ...", YELLOW))
+                    local_data = f.read()
+            except Exception as e:  # noqa: BLE001 - a local read failure must not block startup
+                print(color(f"[brain] could not read local {BRAIN_LOCAL_PATH} ({e}) - treating as unavailable.", YELLOW))
+            if local_data:
+                local_brain = BrainV2.from_bytes(local_data, N_FEATURES_V2, BRAIN2_WARMUP_UPDATES)
+                local_updates = local_brain.update_count
+                print(color(f"[brain] local snapshot updates={local_updates}", GRAY))
 
-        remote = await self.github_sync.download()
-        if remote:
+        remote_brain: Optional[BrainV2] = None
+        remote_updates: Optional[int] = None
+        remote_data: Optional[bytes] = None
+        try:
+            remote_data = await self.github_sync.download()
+        except Exception as e:  # noqa: BLE001 - a remote fetch failure must not block startup
+            print(color(f"[brain] could not fetch remote GitHub snapshot ({e}) - continuing without it.", YELLOW))
+            remote_data = None
+        if remote_data:
+            remote_brain = BrainV2.from_bytes(remote_data, N_FEATURES_V2, BRAIN2_WARMUP_UPDATES)
+            remote_updates = remote_brain.update_count
+            print(color(f"[brain] remote snapshot updates={remote_updates}", GRAY))
+
+        def _cache_locally(data: bytes) -> None:
             try:
                 with open(BRAIN_LOCAL_PATH, "wb") as f:
-                    f.write(remote)
+                    f.write(data)
             except Exception as e:  # noqa: BLE001 - disk write failure shouldn't block using the brain
-                print(color(f"[brain] could not cache downloaded brain to disk: {e}", YELLOW))
-            self.brain = BrainV2.from_bytes(remote, N_FEATURES_V2, BRAIN2_WARMUP_UPDATES)
-            print(color(
-                f"[brain] restored from GitHub ({GITHUB_REPO}/{GITHUB_BRAIN_PATH}) "
-                f"(updates={self.brain.update_count}, ready={self.brain.is_ready()})", MAGENTA,
-            ))
-            return
+                print(color(f"[brain] could not cache selected brain snapshot to disk: {e}", YELLOW))
 
-        print(color(
-            "[brain] no local or remote snapshot found - starting a fresh (cold) Brain V2.", GRAY
-        ))
+        if local_brain is not None and remote_brain is not None:
+            if remote_updates > local_updates:
+                self.brain = remote_brain
+                _cache_locally(remote_data)
+                print(color(
+                    f"[brain] selected REMOTE snapshot ({remote_updates} > {local_updates}); "
+                    f"cached locally (ready={self.brain.is_ready()})", MAGENTA,
+                ))
+            else:
+                self.brain = local_brain
+                print(color(
+                    f"[brain] selected LOCAL snapshot ({local_updates} >= {remote_updates}) "
+                    f"(ready={self.brain.is_ready()})", MAGENTA,
+                ))
+        elif local_brain is not None:
+            self.brain = local_brain
+            print(color(
+                f"[brain] selected LOCAL snapshot (updates={local_updates}) - no valid remote "
+                f"available (ready={self.brain.is_ready()})", MAGENTA,
+            ))
+        elif remote_brain is not None:
+            self.brain = remote_brain
+            _cache_locally(remote_data)
+            print(color(
+                f"[brain] selected REMOTE snapshot (updates={remote_updates}) - no valid local "
+                f"available; cached locally (ready={self.brain.is_ready()})", MAGENTA,
+            ))
+        else:
+            # self.brain is already the fresh BrainV2() constructed in
+            # __init__ - identical outcome to the previous code's final
+            # branch, which also relied on that same pre-existing instance.
+            print(color(
+                "[brain] no valid local or remote snapshot found - starting a fresh (cold) Brain V2.", GRAY
+            ))
+
+        # 2026-08 Brain rollback-safety fix: baseline for persist_brain()'s
+        # anti-rollback guard - the highest update_count now confirmed to
+        # exist anywhere (local, remote, or 0 for a fresh brain).
+        self._brain_max_known_update_count = self.brain.update_count
 
     async def persist_brain(self, reason: str) -> None:
+        # 2026-08 Brain rollback-safety fix: cheap, local, no-extra-API-call
+        # guard - if this process's own Brain has somehow fallen below the
+        # highest update_count this process has itself already confirmed
+        # exists (selected at startup, or from its own prior successful
+        # push), refuse to push to GitHub. update_count only ever increases
+        # during normal learning (learn_success()/learn_quality()), so this
+        # should never fire in ordinary operation; it exists purely as a
+        # defensive backstop against something unexpected reassigning
+        # self.brain mid-process to a lower-update object, which would
+        # otherwise silently overwrite a known-higher remote snapshot. The
+        # local disk write below is NOT gated by this - it always reflects
+        # this process's own honest current state, which is harmless to
+        # keep locally cached regardless.
+        if self.brain.update_count < self._brain_max_known_update_count:
+            print(color(
+                f"[brain-sync] REFUSING to push to GitHub: this process's Brain "
+                f"(updates={self.brain.update_count}) is behind a snapshot already known to exist "
+                f"(updates={self._brain_max_known_update_count}) - this would roll back the shared "
+                f"snapshot. Saving locally only.", RED,
+            ))
+            try:
+                data = self.brain.to_bytes()
+                tmp_path = f"{BRAIN_LOCAL_PATH}.tmp"
+                with open(tmp_path, "wb") as f:
+                    f.write(data)
+                os.replace(tmp_path, BRAIN_LOCAL_PATH)
+            except Exception as e:  # noqa: BLE001
+                print(color(f"[brain] failed to write {BRAIN_LOCAL_PATH} locally: {e}", RED))
+            return
+
         try:
             data = self.brain.to_bytes()
         except Exception as e:  # noqa: BLE001 - serialization must never crash the trading loop
@@ -1757,6 +1860,11 @@ class MartingaleManager:
             )
             if pushed:
                 self.last_brain_sync_ts = time.time()
+                # Advance the known baseline - we just confirmed this
+                # update_count is now what GitHub holds.
+                self._brain_max_known_update_count = max(
+                    self._brain_max_known_update_count, self.brain.update_count
+                )
                 print(color(
                     f"{now_str()} [brain-sync] pushed brain snapshot to GitHub ({reason}, "
                     f"updates={self.brain.update_count})", MAGENTA,
