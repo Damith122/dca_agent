@@ -1618,6 +1618,27 @@ class MartingaleManager:
 
         self._order_index: Dict[int, str] = {}
         self._rp_accum: Dict[int, float] = {}
+        # 2026-08 realized-PnL/fee-accounting fix: actual Binance commission
+        # ("n" field on each fill), accumulated per order_id exactly like
+        # _rp_accum tracks "rp" - popped and rolled into
+        # _position_fees_accum (below) once that order's FILLED event
+        # arrives.
+        self._fee_accum: Dict[int, float] = {}
+        # Running total of ACTUAL commission paid across THIS position's
+        # entire lifecycle (initial entry + every DCA add + any partial
+        # closes + the close leg(s), including close-verification retries)
+        # - reset to 0.0 the moment a fresh "initial" entry fills, and
+        # consumed (read + reset) in _on_close_filled()'s finalize block.
+        # This is the field that makes commission accounting correct for a
+        # DCA'd trade instead of only accounting for the final close's fee.
+        self._position_fees_accum: float = 0.0
+        # False the moment any fill in this trade reports a commission
+        # asset other than USDT (e.g. BNB fee discount enabled on the
+        # account) - in that case _position_fees_accum cannot be trusted as
+        # a USDT figure, and _on_close_filled() falls back to the existing
+        # estimate_round_trip_fee_usdt() estimate for the whole trade
+        # instead of silently mixing a foreign-currency number into USDT.
+        self._position_fees_reliable: bool = True
 
         # --- Unmatched-fill buffer (2026-08 fill-tracking race fix) --------
         # Bridges the gap between placing an order (REST call returns an
@@ -1829,6 +1850,16 @@ class MartingaleManager:
             "last_entry_order_id": p.last_entry_order_id,
             "last_dca_order_id": p.last_dca_order_id,
             "accumulated_close_pnl": self._closing_accumulated_rp,
+            # 2026-08 realized-PnL/fee-accounting fix: actual commission
+            # accumulated across this trade's lifecycle so far (entry +
+            # every DCA + any partial closes + any close-retry legs
+            # already filled). Restored alongside dca_history/order-ids
+            # under the same side/qty/avg_entry_price/symbol match gate, so
+            # a restart mid-trade doesn't lose track of commission already
+            # paid on earlier legs and understate this trade's true fees
+            # when it eventually closes.
+            "position_fees_accum": self._position_fees_accum,
+            "position_fees_reliable": self._position_fees_reliable,
         }
 
     def _flat_dca_state_snapshot(self) -> dict:
@@ -1861,6 +1892,8 @@ class MartingaleManager:
             "last_entry_order_id": None,
             "last_dca_order_id": None,
             "accumulated_close_pnl": 0,
+            "position_fees_accum": 0,
+            "position_fees_reliable": True,
         }
 
     async def save_dca_state(self, reason: str, payload_override: Optional[dict] = None) -> None:
@@ -2301,7 +2334,17 @@ class MartingaleManager:
                 entry_qty = sum(float(t["qty"]) for t in entry_fills)
                 exit_qty = sum(float(t["qty"]) for t in exit_fills)
                 fees = sum(float(t.get("commission", 0.0)) for t in lc["fills"])
-                net_pnl = sum(float(t.get("realizedPnl", 0.0)) for t in lc["fills"])
+                # 2026-08 realized-PnL/fee-accounting fix: this was
+                # previously treated as the final "net" figure and used
+                # directly as net_pnl_usdt below. Binance's realizedPnl
+                # excludes commission (same semantics as "rp" on the
+                # websocket live path - see _on_close_filled()) - this is
+                # the RAW (pre-fee) realized PnL, already correctly summed
+                # across every fill in the lifecycle (entries + exits), so
+                # no data-sourcing change was needed here, only the
+                # downstream field semantics below.
+                raw_realized_pnl = sum(float(t.get("realizedPnl", 0.0)) for t in lc["fills"])
+                net_pnl = raw_realized_pnl - fees  # THE FIX: genuinely fee-net now
                 avg_entry = safe_div(entry_notional, entry_qty, 0.0)
                 avg_exit = safe_div(sum(float(t["qty"]) * float(t["price"]) for t in exit_fills), exit_qty, 0.0)
                 close_dt = datetime.fromtimestamp(lc["close_time"] / 1000, tz=timezone.utc)
@@ -2318,7 +2361,7 @@ class MartingaleManager:
                     "exit_price": avg_exit or None,
                     "qty": exit_qty or entry_qty,
                     "invested_notional": entry_notional,
-                    "gross_pnl_usdt": net_pnl + fees,
+                    "gross_pnl_usdt": raw_realized_pnl,
                     "fees_usdt": fees,
                     "net_pnl_usdt": net_pnl,
                     "net_pnl_pct": safe_div(net_pnl, entry_notional, 0.0),
@@ -3143,9 +3186,26 @@ class MartingaleManager:
         except BinanceApiError as e:
             print(color(f"[position] partial TP order FAILED: {e}", RED))
 
-    async def _apply_partial_close(self, qty: float, fill_price: float, dry_run: bool = False) -> None:
+    async def _apply_partial_close(
+        self, qty: float, fill_price: float, dry_run: bool = False,
+        actual_rp: Optional[float] = None, actual_fee: Optional[float] = None,
+    ) -> None:
         p = self.position
-        pnl = self.estimate_net_pnl_usdt(fill_price, qty) if fill_price else 0.0
+        # 2026-08 realized-PnL/fee-accounting fix: a real (live) partial
+        # close fill carries Binance's own realized PnL ("rp") and actual
+        # commission ("n"), passed in by handle_order_update() - use those
+        # directly (pnl = actual_rp - actual_fee) instead of the estimate,
+        # exactly like the full-close path now does. Falls back to the
+        # pre-existing estimate_net_pnl_usdt() estimate when actual data
+        # isn't available - DRY_RUN (no real fill exists) or the rare case
+        # actual_rp is None because this was called from somewhere that
+        # genuinely has no fill data.
+        pnl_source = "estimated"
+        if actual_rp is not None and self._position_fees_reliable:
+            pnl = actual_rp - (actual_fee or 0.0)
+            pnl_source = "actual"
+        else:
+            pnl = self.estimate_net_pnl_usdt(fill_price, qty) if fill_price else 0.0
         p.total_qty = max(p.total_qty - qty, 0.0)
         p.partial_tp_done = True
         self.realized_pnl_total += pnl
@@ -3160,7 +3220,7 @@ class MartingaleManager:
             p.breakeven_price = p.avg_entry_price
         print(color(
             f"{now_str()} PARTIAL TP FILLED @ {fill_price:.2f}  qty={qty}  "
-            f"est_pnl={pnl:+.4f} USDT  remaining_qty={p.total_qty}  "
+            f"pnl={pnl:+.4f} USDT ({pnl_source})  remaining_qty={p.total_qty}  "
             f"breakeven_armed={p.breakeven_armed}", GREEN,
         ))
 
@@ -3991,6 +4051,19 @@ class MartingaleManager:
 
         fill_price = float(o.get("ap") or 0.0)
         rp = float(o.get("rp") or 0.0)
+        # 2026-08 realized-PnL/fee-accounting fix: this order never passed
+        # through handle_order_update()'s normal "n"/"N" accumulation
+        # (that's exactly why this restart-recovery path exists), so read
+        # and roll in this fill's own commission here too, before
+        # finalizing - otherwise a restart landing on the close fill itself
+        # would silently lose that leg's commission.
+        comm = float(o.get("n") or 0.0)
+        comm_asset = o.get("N")
+        if comm:
+            if comm_asset is None or comm_asset == "USDT":
+                self._position_fees_accum += comm
+            else:
+                self._position_fees_reliable = False
         print(color(
             f"{now_str()} [fill-trace] path=restart_recovery order_id={order_id} "
             f"reason=matched_persisted_dca_state_snapshot (pending_role=close, "
@@ -4112,6 +4185,28 @@ class MartingaleManager:
         if rp:
             self._rp_accum[order_id] = self._rp_accum.get(order_id, 0.0) + rp
 
+        # 2026-08 realized-PnL/fee-accounting fix: actual commission for
+        # this fill. Binance's "rp" (realized profit) does NOT include
+        # commission - it is a separate deduction, reported here via "n"
+        # (amount) / "N" (asset). Only trusted when the commission asset is
+        # USDT (the standard case for USD-M futures); a non-USDT asset
+        # (BNB fee discount) marks the whole position's fee tracking
+        # unreliable so _on_close_filled() falls back to the existing
+        # TAKER_FEE_RATE estimate for the entire trade instead of silently
+        # treating a BNB amount as USDT.
+        comm = float(o.get("n") or 0.0)
+        comm_asset = o.get("N")
+        if comm:
+            if comm_asset is None or comm_asset == "USDT":
+                self._fee_accum[order_id] = self._fee_accum.get(order_id, 0.0) + comm
+            else:
+                self._position_fees_reliable = False
+                print(color(
+                    f"{now_str()} [fee-accounting] order_id={order_id} reported commission in "
+                    f"{comm_asset}, not USDT - cannot trust as a USDT amount; this trade's fees "
+                    f"will fall back to the TAKER_FEE_RATE estimate.", YELLOW,
+                ))
+
         # Record-keeping only (not used by any entry/exit/DCA/risk decision):
         # tracks the highest Binance trade id this process has itself
         # observed live, so the reconciliation safety net below never
@@ -4129,13 +4224,29 @@ class MartingaleManager:
 
         role = self._order_index.pop(order_id)
         total_rp = self._rp_accum.pop(order_id, 0.0)
+        total_fee_this_order = self._fee_accum.pop(order_id, 0.0)
         fill_price = float(o.get("ap") or 0.0)
         fill_qty = float(o.get("z") or 0.0)
+
+        # 2026-08 realized-PnL/fee-accounting fix: roll this order's actual
+        # commission into the position-lifecycle accumulator. Reset first
+        # on a fresh "initial" entry (defensive against any prior
+        # position's accumulator not having been cleanly consumed, e.g. an
+        # edge case in the finalize path) so it always starts this trade's
+        # count at exactly this fill's commission, then keeps growing
+        # through every subsequent DCA/partial/close fill for the same
+        # trade.
+        if role == "initial":
+            self._position_fees_accum = 0.0
+            self._position_fees_reliable = True
+        self._position_fees_accum += total_fee_this_order
 
         if role in ("initial", "dca"):
             await self._on_entry_filled(role, fill_price, fill_qty, order_id=order_id)
         elif role == "partial_close":
-            await self._apply_partial_close(fill_qty, fill_price)
+            await self._apply_partial_close(
+                fill_qty, fill_price, actual_rp=total_rp, actual_fee=total_fee_this_order,
+            )
         elif role == "close":
             # DIAGNOSTIC: confirms this close IS being routed through the
             # live path, for direct comparison against [fill-trace] lines
@@ -4210,14 +4321,11 @@ class MartingaleManager:
 
     async def _on_close_filled(self, fill_price: float, total_rp: float, order_id: Optional[int] = None) -> None:
         p = self.position
-        self.realized_pnl_total += total_rp
-        # 2026-08 Daily Loss Protection: same value/accumulation point as
-        # realized_pnl_total above - only the DAILY bucket also resets at
-        # each UTC day boundary. This only ever feeds the entry-gate check
-        # in on_price_tick() - nothing about this close's own handling
-        # (trade log, DCA-state cleanup, etc.) is affected.
-        self._maybe_reset_daily_loss_tracker()
-        self.daily_realized_pnl += total_rp
+        # 2026-08 realized-PnL/fee-accounting fix: realized_pnl_total and
+        # daily_realized_pnl are NO LONGER updated here per-leg with the
+        # raw Binance "rp" (which excludes commission - see the finalize
+        # block below for the corrected, fee-net update, which happens
+        # exactly once per trade regardless of how many close legs it took).
         # 2026-08 close-verification fix: this fill's realized PnL is real,
         # permanent money regardless of whether the position turns out to
         # be fully closed yet - accumulate it now so a trade needing 2-3
@@ -4310,16 +4418,49 @@ class MartingaleManager:
 
         # --- finalize: exchange confirmed flat (or DRY_RUN, where the
         # simulated fill is authoritative by definition) ------------------
-        total_rp_for_record = self._closing_accumulated_rp
+        total_rp_for_record = self._closing_accumulated_rp  # raw Binance realized PnL, excludes commission
         self._closing_accumulated_rp = 0.0
         self._closing_retry_count = 0
         self.trade_count += 1
-        pnl_color = GREEN if total_rp_for_record >= 0 else RED
 
         exit_reason = getattr(self, "_pending_exit_reason", "manual")
         held_sec = time.time() - p.opened_at if p.opened_at else 0.0
         invested_notional = sum(price * qty for price, qty in p.entries) or 0.0
-        fees_est = self.estimate_round_trip_fee_usdt(p.original_qty or p.total_qty, p.avg_entry_price or fill_price, fill_price)
+
+        # 2026-08 realized-PnL/fee-accounting fix (this block only - every
+        # other part of finalize is unchanged in content, just now fed the
+        # corrected combined_net_pnl below): Binance's "rp" is realized
+        # PRICE PnL only and excludes commission (confirmed against
+        # Binance USD-M Futures ORDER_TRADE_UPDATE/userTrades semantics -
+        # "rp"/"realizedPnl" and "n"/"commission" are reported as separate
+        # fields). Prefer the ACTUAL commission accumulated across this
+        # trade's full lifecycle (initial entry + every DCA add + any
+        # partial closes + the close leg(s)) over an estimate; fall back to
+        # the existing TAKER_FEE_RATE-based estimate only if that actual
+        # figure is unavailable or was flagged unreliable (a non-USDT
+        # commission asset was seen - see handle_order_update()).
+        if self._position_fees_reliable and self._position_fees_accum > 0:
+            fees_final = self._position_fees_accum
+            fee_source = "actual"
+        else:
+            fees_final = self.estimate_round_trip_fee_usdt(p.original_qty or p.total_qty, p.avg_entry_price or fill_price, fill_price)
+            fee_source = "estimated_fallback"
+        self._position_fees_accum = 0.0
+        self._position_fees_reliable = True
+
+        # THE FIX: true economic result = raw realized PnL minus actual
+        # full-lifecycle commission - previously this was left as the raw
+        # value (fees were computed but never actually subtracted here).
+        combined_net_pnl = total_rp_for_record - fees_final
+        pnl_color = GREEN if combined_net_pnl >= 0 else RED
+
+        # realized_pnl_total / daily_realized_pnl now update exactly once
+        # per trade, right here, with the fee-net result - not per-leg with
+        # the raw value as before. MAX_DAILY_LOSS_USDT can no longer be
+        # fooled by fees not being subtracted.
+        self._maybe_reset_daily_loss_tracker()
+        self.realized_pnl_total += combined_net_pnl
+        self.daily_realized_pnl += combined_net_pnl
 
         # MFE/MAE as pct-of-entry moves, using tracked favorable/adverse
         # extremes across the whole life of the trade.
@@ -4334,13 +4475,6 @@ class MartingaleManager:
             mfe_pct = max(mfe_pct, 0.0)
             mae_pct = max(mae_pct, 0.0)
 
-        net_pnl_total = total_rp_for_record  # includes any partial-TP pnl already added to realized_pnl_total separately
-        # total_rp_for_record is the SUM of every close leg's realized pnl
-        # for this trade (usually just one leg; more if close-verification
-        # above needed a retry) per Binance's own accounting; combine with
-        # whatever partial-TP pnl we tracked locally.
-        combined_net_pnl = net_pnl_total
-
         reward = self.reward_calc.compute(
             net_pnl_usdt=combined_net_pnl,
             invested_notional=invested_notional or 1.0,
@@ -4352,7 +4486,8 @@ class MartingaleManager:
         )
 
         print(color(
-            f"{now_str()} POSITION CLOSED @ {fill_price:.2f}  PnL={total_rp_for_record:+.4f} USDT  "
+            f"{now_str()} POSITION CLOSED @ {fill_price:.2f}  PnL={combined_net_pnl:+.4f} USDT "
+            f"(raw={total_rp_for_record:+.4f}, fees={fees_final:.4f} [{fee_source}])  "
             f"(DCA steps used: {p.dca_step}/{MAX_DCA_STEPS})  exit_reason={exit_reason}  "
             f"reward={reward:+.4f}  session_total={self.realized_pnl_total:+.4f}",
             pnl_color,
@@ -4387,8 +4522,8 @@ class MartingaleManager:
             "exit_price": fill_price,
             "qty": p.original_qty or p.total_qty,
             "invested_notional": invested_notional,
-            "gross_pnl_usdt": combined_net_pnl + fees_est,
-            "fees_usdt": fees_est,
+            "gross_pnl_usdt": total_rp_for_record,
+            "fees_usdt": fees_final,
             "net_pnl_usdt": combined_net_pnl,
             "net_pnl_pct": safe_div(combined_net_pnl, invested_notional, 0.0),
             "dca_count": p.dca_step,
@@ -4668,6 +4803,8 @@ async def initialize_sync(
     restored_dca_history: Optional[list] = None
     restored_last_entry_order_id: Optional[int] = None
     restored_last_dca_order_id: Optional[int] = None
+    restored_position_fees_accum: float = 0.0
+    restored_position_fees_reliable: bool = True
     snapshot_restored = False
     snapshot = await manager.load_dca_state_snapshot()
 
@@ -4731,6 +4868,18 @@ async def initialize_sync(
             restored_last_dca_price = snapshot.get("last_dca_price")
             preserved_profit_lock_active = bool(snapshot.get("profit_lock_active", False))
             preserved_peak_unrealized_pnl = float(snapshot.get("peak_unrealized_pnl", 0.0) or 0.0)
+            # 2026-08 realized-PnL/fee-accounting fix: restore actual
+            # commission paid so far this trade's lifecycle - older
+            # snapshots predating this field simply won't have the key, so
+            # this safely defaults to 0.0/reliable=True, identical to a
+            # genuinely fresh trade (falls back to the TAKER_FEE_RATE
+            # estimate at close time in that case, exactly as it always did
+            # before this fix).
+            try:
+                restored_position_fees_accum = float(snapshot.get("position_fees_accum", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                restored_position_fees_accum = 0.0
+            restored_position_fees_reliable = bool(snapshot.get("position_fees_reliable", True))
             # 2026-08 CLOSING-resync opened_at fix: restore the real entry
             # timestamp from the snapshot (present on any snapshot saved by
             # the fixed _dca_state_snapshot() - older snapshots predating
@@ -4922,6 +5071,14 @@ async def initialize_sync(
     # next Profit Lock peak update in _manage_open_position() is measured
     # relative to the correct baseline (2026-07 DCA-state-recovery fix).
     manager._last_dca_state_peak_saved = preserved_peak_unrealized_pnl
+    # 2026-08 realized-PnL/fee-accounting fix: restore the lifecycle fee
+    # accumulator whenever the snapshot matched - independent of whether a
+    # close order happens to be pending, since commission accrues from the
+    # very first entry fill, well before any close is ever placed. A
+    # fresh/mismatched snapshot leaves this at the PositionState default
+    # (0.0/reliable=True), identical to a genuinely new trade.
+    manager._position_fees_accum = restored_position_fees_accum
+    manager._position_fees_reliable = restored_position_fees_reliable
     if restored_pending_order_id is not None:
         # Re-populate the in-memory order index too, so the fill routes
         # through the normal handle_order_update() path directly - the
