@@ -3756,6 +3756,38 @@ class MartingaleManager:
         # --- ATR-adaptive DCA -----------------------------------------------------------
         if pct_move <= -dca_distance_pct:
             if p.dca_step >= MAX_DCA_STEPS:
+                # ================================================================
+                # [dca-risk-debug] TEMPORARY diagnostic only (2026-08 deep-DCA
+                # decision evidence gathering). Printed immediately before this
+                # exact close_position() call, using only values already
+                # computed above in this function (pct_move, dynamic_tp_pct,
+                # dca_distance_pct) plus a direct read of self.last_confidence/
+                # self.last_regime and the existing estimate_net_pnl_usdt()
+                # helper - no new formula, no threshold, no control flow. Does
+                # not gate, delay, or otherwise affect the close_position()
+                # call immediately below it in any way.
+                # ================================================================
+                _dbg_conf = self.last_confidence
+                _dbg_regime = self.last_regime
+                _dbg_notional = (p.total_qty * p.avg_entry_price) if p.avg_entry_price else 0.0
+                _dbg_adverse_to_tp = (abs(pct_move) / dynamic_tp_pct) if dynamic_tp_pct > 0 else float("nan")
+                _dbg_dca_to_tp = (dca_distance_pct / dynamic_tp_pct) if dynamic_tp_pct > 0 else float("nan")
+                _dbg_est_net_pnl = self.estimate_net_pnl_usdt(price)
+                print(color(
+                    f"[dca-risk-debug] exit_candidate=max_dca_exhausted side={p.side} "
+                    f"dca_step={p.dca_step}/{MAX_DCA_STEPS} avg_entry={p.avg_entry_price:.2f} "
+                    f"price={price:.2f} total_qty={p.total_qty:.6f} notional={_dbg_notional:.2f} "
+                    f"pct_move={pct_move*100:.4f}% dynamic_tp={dynamic_tp_pct*100:.4f}% "
+                    f"dca_distance={dca_distance_pct*100:.4f}% "
+                    f"adverse_to_tp_ratio={_dbg_adverse_to_tp:.3f} dca_to_tp_ratio={_dbg_dca_to_tp:.3f} "
+                    f"regime={_dbg_regime.regime} atr_pct={_dbg_regime.atr_pct:.5f} "
+                    f"atr_ratio={_dbg_regime.atr_ratio:.2f} risk={_dbg_conf.risk_score:.2f} "
+                    f"trend_direction={_dbg_conf.trend_direction} "
+                    f"trend_confidence={_dbg_conf.trend_confidence:.2f} "
+                    f"confidence={_dbg_conf.confidence_score:.2f} "
+                    f"profit_lock_active={p.profit_lock_active} est_net_pnl={_dbg_est_net_pnl:.4f} "
+                    f"dca_exhausted=True", CYAN,
+                ))
                 await self.close_position(
                     f"max DCA steps ({MAX_DCA_STEPS}) exhausted and price still adverse "
                     f"({pct_move*100:.2f}%, dca_distance={dca_distance_pct*100:.3f}%)",
@@ -3824,6 +3856,37 @@ class MartingaleManager:
                 low_probability_recovery = agree_count >= 2
 
                 if low_probability_recovery:
+                    # ================================================================
+                    # [dca-risk-debug] TEMPORARY diagnostic only (2026-08 deep-DCA
+                    # decision evidence gathering). Printed immediately before this
+                    # exact close_position() call, reusing conf/regime/agree_count/
+                    # recovery_risk_signals already computed above for the real
+                    # decision, plus pct_move/dynamic_tp_pct/dca_distance_pct already
+                    # computed earlier in this function and the existing
+                    # estimate_net_pnl_usdt() helper - no new formula, no threshold,
+                    # no control flow. Does not gate, delay, or otherwise affect the
+                    # close_position() call immediately below it in any way.
+                    # ================================================================
+                    _dbg_notional = (p.total_qty * p.avg_entry_price) if p.avg_entry_price else 0.0
+                    _dbg_adverse_to_tp = (abs(pct_move) / dynamic_tp_pct) if dynamic_tp_pct > 0 else float("nan")
+                    _dbg_dca_to_tp = (dca_distance_pct / dynamic_tp_pct) if dynamic_tp_pct > 0 else float("nan")
+                    _dbg_est_net_pnl = self.estimate_net_pnl_usdt(price)
+                    print(color(
+                        f"[dca-risk-debug] exit_candidate=final_dca_skipped_low_probability "
+                        f"side={p.side} dca_step={p.dca_step}/{MAX_DCA_STEPS} "
+                        f"avg_entry={p.avg_entry_price:.2f} price={price:.2f} "
+                        f"total_qty={p.total_qty:.6f} notional={_dbg_notional:.2f} "
+                        f"pct_move={pct_move*100:.4f}% dynamic_tp={dynamic_tp_pct*100:.4f}% "
+                        f"dca_distance={dca_distance_pct*100:.4f}% "
+                        f"adverse_to_tp_ratio={_dbg_adverse_to_tp:.3f} dca_to_tp_ratio={_dbg_dca_to_tp:.3f} "
+                        f"regime={regime.regime} atr_pct={regime.atr_pct:.5f} atr_ratio={regime.atr_ratio:.2f} "
+                        f"risk={conf.risk_score:.2f} trend_direction={conf.trend_direction} "
+                        f"trend_confidence={conf.trend_confidence:.2f} confidence={conf.confidence_score:.2f} "
+                        f"profit_lock_active={p.profit_lock_active} est_net_pnl={_dbg_est_net_pnl:.4f} "
+                        f"trend_against={trend_against} momentum_against={momentum_against} "
+                        f"high_risk={high_risk} extreme_volatility={extreme_volatility} "
+                        f"agree_count={agree_count}/4", CYAN,
+                    ))
                     await self.close_position(
                         f"final DCA step skipped: low-probability recovery "
                         f"({agree_count}/{len(recovery_risk_signals)} signals agree: "
