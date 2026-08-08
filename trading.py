@@ -1574,6 +1574,8 @@ class MartingaleManager:
         self.last_trade_open_ts: float = 0.0
         self._last_warmup_skip_log_ts: float = 0.0  # throttles the pre-warmup "no entry" log line
         self._last_max_hold_review_log_ts: float = 0.0  # throttles the Max Hold Time V2 "kept alive" diagnostic line
+        self._last_max_hold_fee_net_review_log_ts: float = 0.0  # throttles the [max-hold-review] fee-net meaningful_loss diagnostic line
+        self._last_max_dca_exhausted_review_log_ts: float = 0.0  # throttles the [max-dca-exhausted-review] diagnostic line
         self._last_max_hold_dca_defer_log_ts: float = 0.0  # throttles the Max Hold Time V2 "DCA opportunity available" diagnostic line
         self._max_hold_dca_defer_pending: bool = False  # set True when Max Hold Time V2 defers for a DCA opportunity this tick; consumed by _on_entry_filled() to log "[dca] executed after max-hold defer"
         self._last_profit_lock_debug_log_ts: float = 0.0  # throttles the [profit-lock-debug] diagnostic line
@@ -2787,6 +2789,30 @@ class MartingaleManager:
             return True
         return False
 
+    def _should_log_max_hold_fee_net_review(self, interval_sec: float = 30.0) -> bool:
+        """Throttle for the [max-hold-review] fee-net meaningful_loss
+        diagnostic line (2026-08 fee-net meaningful_loss fix) - debugging
+        only, does not affect meaningful_loss/still_deferring/any decision.
+        Only throttles repeated DEFER ticks; the CLOSE decision (a one-time
+        terminal event per position) always logs regardless."""
+        now = time.time()
+        if now - self._last_max_hold_fee_net_review_log_ts >= interval_sec:
+            self._last_max_hold_fee_net_review_log_ts = now
+            return True
+        return False
+
+    def _should_log_max_dca_exhausted_review(self, interval_sec: float = 30.0) -> bool:
+        """Throttle for the [max-dca-exhausted-review] diagnostic line
+        (2026-08 max_dca_exhausted recovery-risk review fix) - debugging
+        only, does not affect the recovery-risk decision itself. Only
+        throttles repeated DEFER ticks; the caller always logs the CLOSE
+        decision regardless (see its own condition)."""
+        now = time.time()
+        if now - self._last_max_dca_exhausted_review_log_ts >= interval_sec:
+            self._last_max_dca_exhausted_review_log_ts = now
+            return True
+        return False
+
     def _should_log_max_hold_dca_defer(self, interval_sec: float = 30.0) -> bool:
         """Throttle for the Max Hold Time V2 'deferred: DCA opportunity
         available' diagnostic line (2026-08 DCA-awareness fix) - debugging
@@ -3630,7 +3656,26 @@ class MartingaleManager:
                 unrealized_pnl_usdt > 0
                 and self.last_regime.regime in (REGIME_STRONG_TREND, REGIME_WEAK_TREND)
             )
-            meaningful_loss = unrealized_pnl_usdt < 0 and abs(pct_move) > MAX_HOLD_TIME_SMALL_LOSS_PCT
+            # 2026-08 Max Hold Time V2 fee-net meaningful_loss fix (this
+            # line only - MAX_HOLD_TIME_SMALL_LOSS_PCT itself, the
+            # recovery-risk signals below, DCA sizing/spacing, TP, Profit
+            # Lock, Smart Exit, Hard Stop, and Brain are all untouched):
+            # previously the sign check (unrealized_pnl_usdt < 0) was
+            # fee-net but the magnitude check (abs(pct_move)) was raw
+            # price-only - an inconsistent basis. Confirmed via forensic
+            # trace against real trades: a position whose RAW price move
+            # was under the 0.15% "too small to bother reviewing" bar but
+            # whose FEE-NET loss was already meaningfully above it (e.g.
+            # 0.106% raw vs 0.186% fee-net, 0.140% raw vs 0.220% fee-net)
+            # was misclassified as trivial and closed with ZERO recovery
+            # review - not a failed review, no review at all. Now both the
+            # sign and magnitude checks use the same fee-net basis, reusing
+            # the exact invested_notional/safe_div pattern already used
+            # elsewhere in this file (e.g. _on_close_filled()) rather than
+            # inventing a new formula.
+            invested_notional_for_loss_check = sum(price * qty for price, qty in p.entries)
+            fee_net_pnl_pct = safe_div(unrealized_pnl_usdt, invested_notional_for_loss_check, 0.0)
+            meaningful_loss = unrealized_pnl_usdt < 0 and fee_net_pnl_pct < -MAX_HOLD_TIME_SMALL_LOSS_PCT
 
             # 2026-08 Max Hold Time V2 DCA-awareness fix (isolated to this
             # still_deferring expression and this diagnostic log only - the
@@ -3728,6 +3773,29 @@ class MartingaleManager:
                 or dca_opportunity_available
                 or (meaningful_loss and not low_probability_recovery)
             )
+
+            # 2026-08 fee-net meaningful_loss fix - validation diagnostic
+            # (logging only, does not affect still_deferring/meaningful_loss/
+            # any decision above, which are already fully computed by this
+            # point): lets a Testnet run confirm the fix directly - a
+            # position whose raw pct_move is under MAX_HOLD_TIME_SMALL_LOSS_PCT
+            # but whose fee_net_pnl_pct is beyond it should now show
+            # meaningful_loss=True here (it would previously never have
+            # reached this line at all, since the old raw-pct_move check
+            # would have made meaningful_loss=False and skipped the
+            # recovery-risk block entirely). Always logs on the CLOSE
+            # decision (a one-time terminal event); throttled on repeated
+            # DEFER ticks so it doesn't spam every tick while a position
+            # sits in review.
+            if meaningful_loss and (not still_deferring or self._should_log_max_hold_fee_net_review()):
+                print(color(
+                    f"{now_str()} [max-hold-review] dca_step={p.dca_step}/{MAX_DCA_STEPS} "
+                    f"pct_move={pct_move*100:.4f}% fee_net_pnl_usdt={unrealized_pnl_usdt:+.4f} "
+                    f"fee_net_pnl_pct={fee_net_pnl_pct*100:.4f}% meaningful_loss={meaningful_loss} "
+                    f"signals={','.join(k for k, v in recovery_risk_signals.items() if v) or 'none'} "
+                    f"agree_count={recovery_agree_count}/{MAX_HOLD_TIME_RECOVERY_MIN_AGREE} "
+                    f"action={'CLOSE' if not still_deferring else 'DEFER'}", CYAN,
+                ))
             if not still_deferring:
                 review_suffix = ""
                 if meaningful_loss:
@@ -3956,9 +4024,81 @@ class MartingaleManager:
                     f"profit_lock_active={p.profit_lock_active} est_net_pnl={_dbg_est_net_pnl:.4f} "
                     f"dca_exhausted=True", CYAN,
                 ))
+                # ================================================================
+                # 2026-08 Fix 2 - max_dca_exhausted recovery-risk review (this
+                # block only - DCA sizing/spacing/distance formula,
+                # MAX_DCA_STEPS, TP, Profit Lock, Smart Exit, Hard Stop, and
+                # Brain are all untouched; no further DCA order is ever
+                # placed here either way - DCA is already exhausted by
+                # definition at this point): previously this closed
+                # unconditionally the instant price crossed the exhaustion
+                # distance - the only one of the bot's three "give up on a
+                # deep-DCA position" mechanisms (the other two being
+                # Max Hold Time V2 and the final-DCA low-probability-
+                # recovery gate) with zero signal review at all. Now reuses
+                # the SAME genuine market-risk signals, identical
+                # formulas/thresholds, as Max Hold Time V2's own recovery-
+                # risk block above (trend_against, high_risk,
+                # momentum_against, extreme_volatility) and the SAME
+                # existing MAX_HOLD_TIME_RECOVERY_MIN_AGREE agreement
+                # threshold - no new formula, no new config value.
+                # dca_exhausted is deliberately NOT included as a vote here:
+                # it is guaranteed True by construction (that is the entire
+                # reason this branch is running), so counting it would be
+                # voting on position state rather than independent market
+                # evidence - it remains implicit context (this whole code
+                # path only runs when it's true) rather than a signal.
+                # ================================================================
+                velocity_for_exhausted_review = 0.0
+                if self.prev_price and self.current_price:
+                    velocity_for_exhausted_review = (self.current_price - self.prev_price) / self.prev_price
+                exhausted_recovery_signals = {
+                    "trend_against": (
+                        _dbg_conf.trend_direction is not None
+                        and _dbg_conf.trend_direction != p.side
+                        and _dbg_conf.trend_confidence >= 0.55
+                    ),
+                    "high_risk": _dbg_conf.risk_score >= 0.75,
+                    "momentum_against": (
+                        (p.side == "LONG" and velocity_for_exhausted_review < -0.0008)
+                        or (p.side == "SHORT" and velocity_for_exhausted_review > 0.0008)
+                    ),
+                    "extreme_volatility": (
+                        _dbg_regime.regime == REGIME_HIGH_VOL
+                        and _dbg_regime.atr_ratio >= REGIME_ATR_HIGH_MULT * 1.25
+                    ),
+                }
+                exhausted_agree_count = sum(1 for v in exhausted_recovery_signals.values() if v)
+                exhausted_low_probability_recovery = exhausted_agree_count >= MAX_HOLD_TIME_RECOVERY_MIN_AGREE
+
+                if exhausted_low_probability_recovery or self._should_log_max_dca_exhausted_review():
+                    print(color(
+                        f"{now_str()} [max-dca-exhausted-review] dca_step={p.dca_step}/{MAX_DCA_STEPS} "
+                        f"pct_move={pct_move*100:.4f}% dca_distance={dca_distance_pct*100:.4f}% "
+                        f"regime={_dbg_regime.regime} "
+                        f"trend_against={exhausted_recovery_signals['trend_against']} "
+                        f"momentum_against={exhausted_recovery_signals['momentum_against']} "
+                        f"high_risk={exhausted_recovery_signals['high_risk']} "
+                        f"extreme_volatility={exhausted_recovery_signals['extreme_volatility']} "
+                        f"agree_count={exhausted_agree_count}/{MAX_HOLD_TIME_RECOVERY_MIN_AGREE} "
+                        f"decision={'CLOSE' if exhausted_low_probability_recovery else 'DEFER'}", CYAN,
+                    ))
+
+                if not exhausted_low_probability_recovery:
+                    # Fewer than the required signals agree - defer safely
+                    # for this tick. No new DCA is placed (already
+                    # exhausted either way). Hard Stop, Smart Exit, TP,
+                    # Profit Lock, and Max Hold Time V2 (including its own
+                    # unconditional hard cap) all remain fully active on
+                    # subsequent ticks - this only withholds THIS specific
+                    # close.
+                    return
+
                 await self.close_position(
                     f"max DCA steps ({MAX_DCA_STEPS}) exhausted and price still adverse "
-                    f"({pct_move*100:.2f}%, dca_distance={dca_distance_pct*100:.3f}%)",
+                    f"({pct_move*100:.2f}%, dca_distance={dca_distance_pct*100:.3f}%, "
+                    f"recovery_review={exhausted_agree_count}/{len(exhausted_recovery_signals)} signals agree: "
+                    f"{', '.join(k for k, v in exhausted_recovery_signals.items() if v)})",
                     emergency=True, exit_reason_tag="max_dca_exhausted",
                 )
                 return
