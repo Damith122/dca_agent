@@ -32,47 +32,48 @@ SYMBOL = os.environ.get("SYMBOL", "BTCUSDT").strip().upper()
 # 2026-08 multi-symbol state isolation: SYMBOL is now the single source of
 # truth for which instrument this bot instance trades - switching it (via
 # Railway ENV + redeploy, no code change) must never let one symbol's
-# Brain/DCA-state/trade-sync-cursor be silently loaded by another. See
-# _symbol_scoped_default() below, used by every symbol-specific persistence
-# path's default value.
+# Brain/DCA-state/trade-sync-cursor/trade-log/stats be silently loaded by
+# another. See _symbol_scoped_default() below, used by every
+# symbol-specific persistence path's default value.
+#
+# 2026-08 (later revision): the original version of this mechanism kept a
+# BTCUSDT special case (unsuffixed legacy filenames like "brain.pkl") for
+# backward compatibility with the Brain that existed at the time. That
+# special case has been deliberately removed - the old unsuffixed legacy
+# runtime files are retired and are never read, written, migrated, or
+# fallen back to for ANY symbol, including BTCUSDT. Every symbol, with no
+# exception, now uses the identical "<name>_<SYMBOL>.<ext>" convention.
 
 
 def _symbol_scoped_default(base_name: str) -> str:
-    """Returns `base_name` UNCHANGED when SYMBOL is the original default
-    (BTCUSDT) - full backward compatibility, so the existing trained BTC
-    Brain / DCA state / trade-sync cursor (already on disk/GitHub under
-    these exact legacy filenames, e.g. "brain.pkl") is never orphaned or
-    silently abandoned by this change. For any OTHER symbol, returns a
-    symbol-suffixed variant (e.g. "brain.pkl" -> "brain_SOLUSDT.pkl") so a
-    different symbol can never accidentally read or overwrite BTC's (or
-    any other symbol's) files - each symbol gets its own dedicated file
-    the very first time it's ever used, guaranteed distinct by
-    construction.
+    """Returns a symbol-suffixed variant of `base_name` for the ACTIVE
+    SYMBOL, with no exception for any particular symbol (e.g.
+    "brain.pkl" -> "brain_BTCUSDT.pkl" or "brain_SOLUSDT.pkl") - every
+    symbol gets its own dedicated file, guaranteed distinct by
+    construction, so one symbol's Brain/DCA-state/trade-log/etc. can never
+    be silently read, written, or mixed with another's.
 
     Only used to compute env-var DEFAULTS below - an operator who has
     explicitly set the corresponding env var themselves always gets
     exactly the value they set, completely untouched by SYMBOL (see
     _warn_if_explicit_path_bypasses_isolation() below for the
     accompanying safety-net warning)."""
-    if SYMBOL == "BTCUSDT":
-        return base_name
     stem, ext = os.path.splitext(base_name)
     return f"{stem}_{SYMBOL}{ext}"
 
 
 def _warn_if_explicit_path_bypasses_isolation(env_var_name: str) -> None:
     """2026-08 multi-symbol state isolation safety net: if an operator has
-    EXPLICITLY set one of the symbol-specific path env vars (BRAIN_LOCAL_PATH,
-    DCA_STATE_PATH, etc.) while running a non-BTC symbol, that explicit
-    value is still honored exactly as before - explicit always wins over
-    the computed default, no forced suffixing, no behavior change. But
-    since an explicit value bypasses the automatic per-symbol isolation
-    this whole mechanism exists for, print a clear one-time startup
-    warning so an explicit path accidentally left over from a different
-    symbol's config doesn't silently mix state across symbols. Only
-    checked for non-BTC symbols - an explicit BTCUSDT path is the normal,
-    already-expected legacy case and needs no warning."""
-    if SYMBOL != "BTCUSDT" and os.environ.get(env_var_name):
+    EXPLICITLY set one of the symbol-specific path env vars (DCA_STATE_PATH,
+    GITHUB_TRADE_SYNC_CURSOR_PATH, etc.) for ANY symbol, that explicit
+    value is still honored exactly as set - explicit always wins over the
+    computed default, no forced suffixing, no behavior change. But since
+    an explicit value bypasses the automatic per-symbol isolation this
+    whole mechanism exists for, print a clear one-time startup warning so
+    a path accidentally left over from a different symbol's config
+    doesn't silently mix state across symbols. Applies uniformly to every
+    symbol - there is no BTC exception anymore."""
+    if os.environ.get(env_var_name):
         print(
             f"[symbol] WARNING: {env_var_name}={os.environ[env_var_name]!r} is explicitly set "
             f"while SYMBOL={SYMBOL} - this path bypasses automatic per-symbol isolation. Make "
@@ -349,17 +350,19 @@ TRAILING_STOP_ENABLED = os.environ.get("TRAILING_STOP_ENABLED", "true").lower() 
 TRAILING_STOP_ATR_MULT = float(os.environ.get("TRAILING_STOP_ATR_MULT", "1.0"))
 
 # --- Trade logging / offline dataset / performance stats ---------------------
-# 2026-08 multi-symbol state isolation: trade logs are deliberately left
-# SHARED/unscoped across symbols (not symbol-suffixed like the paths
-# below) - every record already carries its own "symbol" field, and dedup
-# (TradeLogger.logged_binance_order_ids()) keys off globally-unique
-# Binance order ids, so mixing symbols in the raw log carries no
-# correctness risk. PerformanceStats.compute() below filters by symbol
-# before aggregating, so the DERIVED stats output (which would otherwise
-# blend two different instruments into one misleading rollup) is
-# symbol-scoped even though the underlying log file is not.
-TRADE_LOG_JSON_PATH = os.environ.get("TRADE_LOG_JSON_PATH", "trades_log.jsonl")
-TRADE_LOG_CSV_PATH = os.environ.get("TRADE_LOG_CSV_PATH", "trades_log.csv")
+# 2026-08 (later revision): trade logs are now symbol-scoped, not shared.
+# A prior version of this mechanism deliberately kept them shared (every
+# record already carries its own "symbol" field and dedup keys off
+# globally-unique Binance order ids, so mixing was not a correctness risk
+# in principle) - but in practice a stale local/GitHub BTC trade log was
+# re-uploaded during a SOL deployment, which is exactly the kind of
+# cross-symbol contamination this whole isolation mechanism exists to
+# prevent. Trade logs now follow the identical "<name>_<SYMBOL>.<ext>"
+# convention as every other persistence path below.
+TRADE_LOG_JSON_PATH = os.environ.get("TRADE_LOG_JSON_PATH", _symbol_scoped_default("trades_log.jsonl"))
+TRADE_LOG_CSV_PATH = os.environ.get("TRADE_LOG_CSV_PATH", _symbol_scoped_default("trades_log.csv"))
+_warn_if_explicit_path_bypasses_isolation("TRADE_LOG_JSON_PATH")
+_warn_if_explicit_path_bypasses_isolation("TRADE_LOG_CSV_PATH")
 STATS_JSON_PATH = os.environ.get("STATS_JSON_PATH", _symbol_scoped_default("performance_stats.json"))
 STATS_CSV_PATH = os.environ.get("STATS_CSV_PATH", _symbol_scoped_default("performance_stats.csv"))
 _warn_if_explicit_path_bypasses_isolation("STATS_JSON_PATH")
@@ -376,7 +379,7 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
 GITHUB_BRAIN_PATH = os.environ.get("GITHUB_BRAIN_PATH", _symbol_scoped_default("brain.pkl"))
 _warn_if_explicit_path_bypasses_isolation("GITHUB_BRAIN_PATH")
-# IMPORTANT (Railway deploy-loop fix): runtime state (brain.pkl, trade logs,
+# IMPORTANT (Railway deploy-loop fix): runtime state (Brain, trade logs,
 # performance stats, sync cursor) is committed by the bot itself while it is
 # running. Railway's GitHub integration redeploys on every push to the branch
 # it is connected to (normally "main"). If GITHUB_BRANCH == that branch, each
@@ -390,21 +393,26 @@ _warn_if_explicit_path_bypasses_isolation("GITHUB_BRAIN_PATH")
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "brain-state")
 BRAIN_AUTO_PUSH_INTERVAL_SEC = int(os.environ.get("BRAIN_AUTO_PUSH_INTERVAL_SEC", "300"))
 
-# CSV analytics sync (same repo/session as brain.pkl - see GithubBrainSync).
-# Default: same directory as GITHUB_BRAIN_PATH, so they live beside brain.pkl.
+# CSV analytics sync (same repo/session as the Brain snapshot - see
+# GithubBrainSync). Default: same directory as GITHUB_BRAIN_PATH, so they
+# live beside it. Symbol-scoped filenames, same convention as everywhere
+# else in this file - no shared trade-log/stats path across symbols.
 _GITHUB_BRAIN_DIR = os.path.dirname(GITHUB_BRAIN_PATH)
 GITHUB_TRADES_LOG_CSV_PATH = os.environ.get(
     "GITHUB_TRADES_LOG_CSV_PATH",
-    "/".join(p for p in (_GITHUB_BRAIN_DIR, "trades_log.csv") if p),
+    "/".join(p for p in (_GITHUB_BRAIN_DIR, _symbol_scoped_default("trades_log.csv")) if p),
 )
 GITHUB_STATS_CSV_PATH = os.environ.get(
     "GITHUB_STATS_CSV_PATH",
-    "/".join(p for p in (_GITHUB_BRAIN_DIR, "performance_stats.csv") if p),
+    "/".join(p for p in (_GITHUB_BRAIN_DIR, _symbol_scoped_default("performance_stats.csv")) if p),
 )
 GITHUB_TRADES_LOG_JSON_PATH = os.environ.get(
     "GITHUB_TRADES_LOG_JSON_PATH",
-    "/".join(p for p in (_GITHUB_BRAIN_DIR, "trades_log.jsonl") if p),
+    "/".join(p for p in (_GITHUB_BRAIN_DIR, _symbol_scoped_default("trades_log.jsonl")) if p),
 )
+_warn_if_explicit_path_bypasses_isolation("GITHUB_TRADES_LOG_CSV_PATH")
+_warn_if_explicit_path_bypasses_isolation("GITHUB_STATS_CSV_PATH")
+_warn_if_explicit_path_bypasses_isolation("GITHUB_TRADES_LOG_JSON_PATH")
 
 # --- Trade-log reconciliation (Binance trade history is the source of
 # truth; recovers any closed trade the live websocket stream missed) -------
