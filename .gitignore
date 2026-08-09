@@ -7,3 +7,30 @@ __pycache__/
 venv/
 .venv/
 *.log
+
+# 2026-08 multi-symbol state isolation: generated runtime state files
+# (Brain snapshots, DCA state, trade-sync cursor, trade logs, performance
+# stats) are written by the bot itself while running and must never be
+# committed to `main` - they're synced to the dedicated `brain-state`
+# branch instead (see config.py's GITHUB_BRANCH). Symbol-scoped patterns
+# cover every active/future symbol (e.g. brain_BTCUSDT.pkl,
+# brain_SOLUSDT.pkl, brain_ETHUSDT.pkl, ...) without needing to list each
+# one individually.
+brain_*.pkl
+dca_state_*.json
+trade_sync_cursor_*.json
+trades_log_*.csv
+trades_log_*.jsonl
+performance_stats_*.csv
+performance_stats_*.json
+
+# Retired legacy unsuffixed runtime filenames (safety net only - these are
+# no longer read, written, or migrated to by the bot; ignored here purely
+# to prevent an accidental re-commit if one still exists locally).
+brain.pkl
+dca_state.json
+trade_sync_cursor.json
+trades_log.csv
+trades_log.jsonl
+performance_stats.csv
+performance_stats.json
