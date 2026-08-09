@@ -1329,10 +1329,19 @@ class TradeLogger:
 
 
 class PerformanceStats:
-    def __init__(self, logger: TradeLogger, json_path: str = STATS_JSON_PATH, csv_path: str = STATS_CSV_PATH):
+    def __init__(
+        self, logger: TradeLogger, json_path: str = STATS_JSON_PATH, csv_path: str = STATS_CSV_PATH,
+        symbol: str = SYMBOL,
+    ):
         self.logger = logger
         self.json_path = json_path
         self.csv_path = csv_path
+        # 2026-08 multi-symbol state isolation: the underlying trade log
+        # (self.logger) is intentionally shared across symbols (see
+        # config.py's TRADE_LOG_*_PATH comment) - filtering here is what
+        # keeps this DERIVED stats output correct instead of blending two
+        # different symbols' trades into one misleading rollup.
+        self.symbol = symbol
 
     @staticmethod
     def _safe_float(value, default: float = 0.0) -> float:
@@ -1354,7 +1363,12 @@ class PerformanceStats:
             return default
 
     def compute(self) -> dict:
-        trades = self.logger.load_all()
+        # 2026-08 multi-symbol state isolation: only this symbol's trades
+        # participate in the rollup below - everything from this point on
+        # in compute() is completely unchanged (same formulas, same
+        # fields), just fed a pre-filtered list instead of every trade
+        # ever logged across every symbol.
+        trades = [t for t in self.logger.load_all() if t.get("symbol") == self.symbol]
         n = len(trades)
         if n == 0:
             return {"trade_count": 0, "generated_at": now_str()}
@@ -1599,7 +1613,7 @@ class MartingaleManager:
         self.entry_engine = EntryEngineV2()
         self.reward_calc = RewardCalculator()
         self.trade_logger = TradeLogger()
-        self.perf_stats = PerformanceStats(self.trade_logger)
+        self.perf_stats = PerformanceStats(self.trade_logger, symbol=self.symbol)
 
         self._feature_buffer: Deque[Tuple[float, np.ndarray, float]] = deque(
             maxlen=LABEL_HORIZON_TICKS + 1
@@ -1717,6 +1731,18 @@ class MartingaleManager:
     # -- Persistent Adaptive Learning: startup load / ongoing persistence ----
 
     async def load_or_init_brain(self) -> None:
+        # 2026-08 multi-symbol state isolation: explicit, unmissable log of
+        # which symbol is active and which symbol-specific persistence
+        # files it maps to - printed once at startup, before any
+        # local/remote Brain candidate is even read, so a symbol switch
+        # (Railway ENV SYMBOL=... + redeploy) is immediately verifiable
+        # from the logs rather than inferred later.
+        print(color(
+            f"{now_str()} [symbol] active SYMBOL={self.symbol} | "
+            f"brain: local={BRAIN_LOCAL_PATH} github={GITHUB_BRAIN_PATH} | "
+            f"dca_state: local={DCA_STATE_PATH} github={GITHUB_DCA_STATE_PATH} | "
+            f"trade_sync_cursor: local={TRADE_SYNC_CURSOR_PATH}", MAGENTA,
+        ))
         # Start (or reuse) the single shared GitHub session up front, so it's
         # available for the CSV log/stats restore that runs right after this,
         # regardless of which candidate below actually wins the selection.
