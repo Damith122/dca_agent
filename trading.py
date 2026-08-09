@@ -1667,7 +1667,14 @@ class MartingaleManager:
         # Does not change entry/exit/DCA/risk decisions - purely a delivery
         # guarantee for fill events this process's own orders generate.
         self._unmatched_fills: Dict[int, Tuple[dict, float]] = {}
-        self._UNMATCHED_FILL_TTL_SEC: float = 15.0
+        # 2026-08 close-fill reliability fix: widened from 15s to 30s.
+        # Root cause of a real missed replay: the websocket connection
+        # typically delivers a FILLED event faster than a REST place_order()
+        # round trip completes, so this buffer's original purpose (closing
+        # that ordering race) is common, not rare - 15s left less margin
+        # than warranted for occasional REST latency. Purely a wider window
+        # on the same existing buffer-and-replay mechanism; no new logic.
+        self._UNMATCHED_FILL_TTL_SEC: float = 30.0
 
         # 2026-08 Smart Exit diagnostics (logging-only, added alongside the
         # Smart Exit V2 retune): captures the signal agree_count/
@@ -2300,8 +2307,15 @@ class MartingaleManager:
         trades_log.jsonl (deduped by Binance order id via
         TradeLogger.logged_binance_order_ids()). Safe to call frequently -
         it is a no-op (single cheap REST call, empty result) once caught
-        up. Never raises; never touches PositionState or any strategy
-        state - purely a logging safety net.
+        up. Never raises; never touches self.position/PositionState or
+        Brain training - still purely a logging/bookkeeping safety net, not
+        a trading decision. 2026-08 close-fill reliability fix: now also
+        updates trade_count/realized_pnl_total/daily_realized_pnl (using
+        the same fee-net PnL logged to the trade record) for exactly the
+        lifecycles this pass actually recovers, gated by the same dedup
+        check that already prevents re-logging a trade the live path
+        already processed - so this can never double-count against a
+        normal close.
 
         2026-07 reconcile-backoff fix (this method only - see module
         docstring): guarded by self._reconcile_cooldown_until /
@@ -2463,6 +2477,25 @@ class MartingaleManager:
                 # available, same as the live-close path's exit_order_id.
                 exit_order_id = int(exit_fills[-1]["orderId"]) if exit_fills[-1].get("orderId") is not None else None
 
+                # 2026-08 close-fill reliability fix: if this bot is
+                # CURRENTLY still tracking one of this lifecycle's own
+                # order_ids as its own pending close (self.position.
+                # pending_order_id), the real exit reason this process
+                # itself decided on (self._pending_exit_reason, e.g.
+                # "max_hold_time") can be safely recovered instead of the
+                # generic "reconciled_from_exchange" tag. This is narrowly
+                # scoped and safe: it only ever matches the single specific
+                # order THIS process itself just placed and is still
+                # waiting on - never a guess applied to unrelated/older
+                # history. If it doesn't match, exit_reason stays exactly
+                # "reconciled_from_exchange", unchanged from before.
+                recovered_exit_reason = "reconciled_from_exchange"
+                try:
+                    if self.position.pending_order_id is not None and int(self.position.pending_order_id) in order_ids:
+                        recovered_exit_reason = getattr(self, "_pending_exit_reason", None) or "reconciled_from_exchange"
+                except (TypeError, ValueError):
+                    pass
+
                 record = {
                     "close_time": close_dt.strftime("%Y-%m-%d %H:%M:%S UTC"),
                     "symbol": self.symbol,
@@ -2479,11 +2512,11 @@ class MartingaleManager:
                     "holding_time_sec": max((lc["close_time"] - lc["open_time"]) / 1000.0, 0.0),
                     "mfe_pct": None,
                     "mae_pct": None,
-                    "exit_reason": "reconciled_from_exchange",
-                    "tp_hit": None,
-                    "smart_exit": None,
-                    "manual_exit": None,
-                    "hard_stop": None,
+                    "exit_reason": recovered_exit_reason,
+                    "tp_hit": recovered_exit_reason == "take_profit",
+                    "smart_exit": recovered_exit_reason == "smart_exit",
+                    "manual_exit": recovered_exit_reason == "manual",
+                    "hard_stop": recovered_exit_reason in ("hard_stop", "max_dca_exhausted"),
                     "entry_regime": None,
                     "exit_regime": None,
                     "entry_confidence": None,
@@ -2500,6 +2533,28 @@ class MartingaleManager:
                 # _log_completed_trade docstring) - keeps recovered trades in
                 # the exact same JSON/CSV shape as normal closes.
                 self._log_completed_trade(record)
+                # 2026-08 close-fill reliability fix: previously this
+                # function only wrote to the trade log/stats files -
+                # self.trade_count/realized_pnl_total/daily_realized_pnl
+                # (the in-memory counters behind runtime status output and
+                # the MAX_DAILY_LOSS_USDT protection) were never touched,
+                # so a reconciled trade could be correctly logged to CSV
+                # while runtime status still showed trades=0/session_pnl=
+                # +0.0000 - exactly the gap this closes. Uses the same
+                # fee-net net_pnl already computed for this lifecycle
+                # above. Gated by the SAME dedup check already guarding
+                # this loop iteration (order_ids & already_order_ids,
+                # checked before this point) - a trade the live path has
+                # already processed never reaches here, so this can never
+                # double-count against a normal _on_close_filled() finalize.
+                # Deliberately does NOT call brain.learn_success()/
+                # learn_quality() - no entry_features exist for a
+                # reconciled trade to train on, and none are fabricated;
+                # this remains purely a logging/bookkeeping safety net.
+                self.trade_count += 1
+                self._maybe_reset_daily_loss_tracker()
+                self.realized_pnl_total += net_pnl
+                self.daily_realized_pnl += net_pnl
                 # DIAGNOSTIC (no effect on `record` or on what gets logged -
                 # this runs after log_trade() and only prints): for
                 # correlating against [fill-trace] lines from
@@ -2515,9 +2570,10 @@ class MartingaleManager:
                 print(color(
                     f"{now_str()} [reconcile-trace] path=reconciliation({context}) "
                     f"order_id={sorted(order_ids)} trade_id={exit_trade_ids} "
-                    f"close_time={record['close_time']} "
+                    f"close_time={record['close_time']} exit_reason={recovered_exit_reason} "
                     f"reason=not_found_in_local_trade_log (never seen by _on_close_filled(); "
-                    f"recovered via REST /fapi/v1/userTrades)", MAGENTA,
+                    f"recovered via REST /fapi/v1/userTrades) "
+                    f"session_total={self.realized_pnl_total:+.4f}", MAGENTA,
                 ))
                 recorded += 1
 
@@ -3150,7 +3206,48 @@ class MartingaleManager:
             # logic - saving a "close order placed" snapshot afterward would
             # be wrong, hence the guard above instead of an unconditional call.
             return order_id
-        except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            # 2026-08 close-fill reliability fix: this branch means the
+            # REQUEST may have reached Binance even though the RESPONSE
+            # never did (network drop, client-side timeout) - unlike
+            # BinanceApiError below, which means Binance itself
+            # definitively rejected the order (no ambiguity there, no
+            # follow-up needed). If the order actually executed on
+            # Binance's side despite the lost response, this process never
+            # learns its order_id and can never register/replay its FILLED
+            # event through the normal _register_order_and_replay() path -
+            # the buffered event in _unmatched_fills would sit unclaimed
+            # until TTL expiry regardless of how long that TTL is, and the
+            # position would incorrectly stay tracked as OPEN/CLOSING. One
+            # immediate check closes this gap: if the exchange now confirms
+            # flat, trigger the existing reconciliation safety net right
+            # away instead of waiting for the next periodic pass to
+            # discover the mismatch.
+            print(color(
+                f"[position] FAILED to place reduceOnly close order (network/timeout): {e} - "
+                f"checking exchange directly to see if it executed anyway ...", YELLOW,
+            ))
+            try:
+                exchange_state = await self._fetch_exchange_position()
+                if exchange_state is not None and exchange_state[0] is None:
+                    print(color(
+                        f"{now_str()} [position] exchange confirms FLAT despite the lost order "
+                        f"response - the close likely executed; triggering immediate reconciliation "
+                        f"instead of waiting for the next periodic pass.", MAGENTA,
+                    ))
+                    await self.reconcile_trade_history_from_exchange(context="lost_close_response")
+                else:
+                    print(color(
+                        "[position] exchange still shows an open position - the close order "
+                        "genuinely did not execute. POSITION MAY STILL BE OPEN, check manually!", RED,
+                    ))
+            except Exception as verify_err:  # noqa: BLE001 - this follow-up check must never crash the trading loop
+                print(color(
+                    f"[position] could not verify exchange state after lost close response: "
+                    f"{verify_err} - POSITION MAY STILL BE OPEN, check manually!", RED,
+                ))
+            return None
+        except BinanceApiError as e:
             print(color(
                 f"[position] FAILED to place reduceOnly close order: {e} - "
                 f"POSITION MAY STILL BE OPEN, check manually!", RED
@@ -3730,6 +3827,20 @@ class MartingaleManager:
                 velocity = 0.0
                 if self.prev_price and self.current_price:
                     velocity = (self.current_price - self.prev_price) / self.prev_price
+                # 2026-08 Max Hold recovery-vote fix (this dict only - the
+                # separate max_dca_exhausted review below already correctly
+                # excludes dca_exhausted from its own vote, unchanged):
+                # dca_exhausted is position state (p.dca_step >=
+                # MAX_DCA_STEPS is a deterministic fact about the trade),
+                # not independent market evidence, so it no longer counts
+                # toward recovery_agree_count. MAX_HOLD_TIME_RECOVERY_MIN_AGREE
+                # (2) is unchanged - it's now measured against exactly the 4
+                # genuine market-risk signals below. dca_exhausted is still
+                # computed and logged as context (see [max-hold-review]
+                # diagnostic) but is deliberately kept OUT of
+                # recovery_risk_signals so it can never be summed into the
+                # vote.
+                dca_exhausted_context = p.dca_step >= MAX_DCA_STEPS
                 recovery_risk_signals = {
                     "trend_against": (
                         conf.trend_direction is not None
@@ -3745,7 +3856,6 @@ class MartingaleManager:
                         regime.regime == REGIME_HIGH_VOL
                         and regime.atr_ratio >= REGIME_ATR_HIGH_MULT * 1.25
                     ),
-                    "dca_exhausted": p.dca_step >= MAX_DCA_STEPS,
                 }
                 recovery_agree_count = sum(1 for v in recovery_risk_signals.values() if v)
                 low_probability_recovery = recovery_agree_count >= MAX_HOLD_TIME_RECOVERY_MIN_AGREE
