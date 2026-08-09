@@ -1336,11 +1336,13 @@ class PerformanceStats:
         self.logger = logger
         self.json_path = json_path
         self.csv_path = csv_path
-        # 2026-08 multi-symbol state isolation: the underlying trade log
-        # (self.logger) is intentionally shared across symbols (see
-        # config.py's TRADE_LOG_*_PATH comment) - filtering here is what
-        # keeps this DERIVED stats output correct instead of blending two
-        # different symbols' trades into one misleading rollup.
+        # 2026-08 multi-symbol state isolation: trade logs are now
+        # symbol-scoped by filename (config.py's TRADE_LOG_*_PATH), so
+        # self.logger should already only ever contain this symbol's
+        # trades. This filter remains as a defensive extra guard (e.g.
+        # against an explicit env-var override accidentally pointing two
+        # symbols at the same log file) rather than the primary
+        # correctness mechanism - harmless no-op in the normal case.
         self.symbol = symbol
 
     @staticmethod
@@ -1739,9 +1741,11 @@ class MartingaleManager:
         # from the logs rather than inferred later.
         print(color(
             f"{now_str()} [symbol] active SYMBOL={self.symbol} | "
-            f"brain: local={BRAIN_LOCAL_PATH} github={GITHUB_BRAIN_PATH} | "
-            f"dca_state: local={DCA_STATE_PATH} github={GITHUB_DCA_STATE_PATH} | "
-            f"trade_sync_cursor: local={TRADE_SYNC_CURSOR_PATH}", MAGENTA,
+            f"brain={BRAIN_LOCAL_PATH} | "
+            f"dca={DCA_STATE_PATH} | "
+            f"cursor={TRADE_SYNC_CURSOR_PATH} | "
+            f"trades={TRADE_LOG_CSV_PATH}/{TRADE_LOG_JSON_PATH} | "
+            f"stats={STATS_CSV_PATH}/{STATS_JSON_PATH}", MAGENTA,
         ))
         # Start (or reuse) the single shared GitHub session up front, so it's
         # available for the CSV log/stats restore that runs right after this,
