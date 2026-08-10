@@ -44,44 +44,66 @@ SYMBOL = os.environ.get("SYMBOL", "BTCUSDT").strip().upper()
 # fallen back to for ANY symbol, including BTCUSDT. Every symbol, with no
 # exception, now uses the identical "<name>_<SYMBOL>.<ext>" convention.
 
+# 2026-08 USE_TESTNET moved up from the "Safety gates" section below
+# (verbatim - same env var, same parsing, same default) so RUNTIME_ENV and
+# _symbol_scoped_default() can be computed from it. USE_TESTNET's own
+# meaning/behavior as a safety gate is completely unchanged - it is simply
+# read a few lines earlier than before.
+USE_TESTNET = os.environ.get("USE_TESTNET", "true").lower() != "false"
+
+# 2026-08 environment + symbol state isolation: runtime persistence must
+# be isolated by BOTH which Binance environment this process is trading
+# on (Testnet vs Live) AND which symbol - switching either one, via
+# Railway ENV + redeploy, must never let one environment/symbol
+# combination's Brain/DCA-state/trade-sync-cursor/trade-log/stats be
+# silently loaded by another. No new env var is introduced - USE_TESTNET
+# (already the single source of truth for Testnet vs Live) is reused
+# directly.
+RUNTIME_ENV = "TESTNET" if USE_TESTNET else "LIVE"
+
 
 def _symbol_scoped_default(base_name: str) -> str:
-    """Returns a symbol-suffixed variant of `base_name` for the ACTIVE
-    SYMBOL, with no exception for any particular symbol (e.g.
-    "brain.pkl" -> "brain_BTCUSDT.pkl" or "brain_SOLUSDT.pkl") - every
-    symbol gets its own dedicated file, guaranteed distinct by
-    construction, so one symbol's Brain/DCA-state/trade-log/etc. can never
-    be silently read, written, or mixed with another's.
+    """Returns an environment+symbol-suffixed variant of `base_name` for
+    the ACTIVE RUNTIME_ENV and SYMBOL, with no exception for any
+    particular combination (e.g. "brain.pkl" -> "brain_TESTNET_SOLUSDT.pkl"
+    or "brain_LIVE_BTCUSDT.pkl") - every (environment, symbol) pair gets
+    its own dedicated file, guaranteed distinct by construction, so one
+    combination's Brain/DCA-state/trade-log/etc. can never be silently
+    read, written, or mixed with another's - including Testnet vs Live for
+    the SAME symbol.
 
     Only used to compute env-var DEFAULTS below - an operator who has
     explicitly set the corresponding env var themselves always gets
-    exactly the value they set, completely untouched by SYMBOL (see
-    _warn_if_explicit_path_bypasses_isolation() below for the
+    exactly the value they set, completely untouched by RUNTIME_ENV/SYMBOL
+    (see _warn_if_explicit_path_bypasses_isolation() below for the
     accompanying safety-net warning)."""
     stem, ext = os.path.splitext(base_name)
-    return f"{stem}_{SYMBOL}{ext}"
+    return f"{stem}_{RUNTIME_ENV}_{SYMBOL}{ext}"
 
 
 def _warn_if_explicit_path_bypasses_isolation(env_var_name: str) -> None:
-    """2026-08 multi-symbol state isolation safety net: if an operator has
-    EXPLICITLY set one of the symbol-specific path env vars (DCA_STATE_PATH,
-    GITHUB_TRADE_SYNC_CURSOR_PATH, etc.) for ANY symbol, that explicit
-    value is still honored exactly as set - explicit always wins over the
-    computed default, no forced suffixing, no behavior change. But since
-    an explicit value bypasses the automatic per-symbol isolation this
-    whole mechanism exists for, print a clear one-time startup warning so
-    a path accidentally left over from a different symbol's config
-    doesn't silently mix state across symbols. Applies uniformly to every
-    symbol - there is no BTC exception anymore."""
+    """2026-08 environment + symbol state isolation safety net: if an
+    operator has EXPLICITLY set one of the isolation-scoped path env vars
+    (DCA_STATE_PATH, GITHUB_TRADE_SYNC_CURSOR_PATH, etc.) for ANY
+    environment/symbol combination, that explicit value is still honored
+    exactly as set - explicit always wins over the computed default, no
+    forced suffixing, no behavior change. But since an explicit value
+    bypasses BOTH the automatic per-environment (Testnet/Live) AND
+    per-symbol isolation this mechanism exists for, print a clear one-time
+    startup warning so a path accidentally left over from a different
+    environment or symbol's config doesn't silently mix Testnet/Live or
+    cross-symbol state. Applies uniformly - there is no exception for any
+    particular environment or symbol."""
     if os.environ.get(env_var_name):
         print(
             f"[symbol] WARNING: {env_var_name}={os.environ[env_var_name]!r} is explicitly set "
-            f"while SYMBOL={SYMBOL} - this path bypasses automatic per-symbol isolation. Make "
-            f"sure it is not also used by another symbol's deployment, or state could mix."
+            f"while environment={RUNTIME_ENV} SYMBOL={SYMBOL} - this path bypasses automatic "
+            f"per-environment AND per-symbol isolation. It may mix Testnet/Live state or "
+            f"different symbols' state if reused elsewhere. Make sure it is not also used by "
+            f"another environment/symbol deployment."
         )
 
 # --- Safety gates - read the header above before touching these -------------
-USE_TESTNET = os.environ.get("USE_TESTNET", "true").lower() != "false"
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() != "false"
 I_UNDERSTAND_THIS_IS_REAL_MONEY = os.environ.get(
     "I_UNDERSTAND_THIS_IS_REAL_MONEY", ""
