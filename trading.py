@@ -1518,6 +1518,15 @@ class PositionState:
     opened_at: float = 0.0
     last_close_time: float = 0.0
     last_dca_price: Optional[float] = None   # anchor for ATR-based DCA spacing
+    # 2026-08 DCA resync-race fix: wall-clock time.time() of the most
+    # recent locally-confirmed entry/DCA fill (_on_entry_filled). Lets
+    # initialize_sync() tell "exchange REST position data just hasn't
+    # caught up to a fill we already confirmed" apart from a genuine
+    # mismatch - see the OPEN-status grace block in initialize_sync().
+    # Not persisted/restored from the DCA-state snapshot: a fresh process
+    # (restart/redeploy) has no in-flight fill to protect, so it correctly
+    # starts at 0.0 and this grace simply does not apply on that path.
+    last_fill_ts: float = 0.0
     # 2026-08 DCA State Recovery V2: which order_id filled the initial
     # entry / most recent DCA add - audit/recovery fields only, never read
     # by any entry/exit/DCA/risk decision (mirrors initial_entry_price's
@@ -4810,6 +4819,14 @@ class MartingaleManager:
         self.position.status = "OPEN"
         self.position.pending_order_id = None
         self.position.pending_role = None
+        # 2026-08 DCA resync-race fix: stamp the fill so the periodic
+        # initialize_sync() poll can recognize a short window where
+        # Binance's REST position endpoint still reports the pre-fill
+        # qty/avg_entry even though this fill is already confirmed locally
+        # (via the user-data-stream WebSocket) - see that function's
+        # OPEN-status grace block, a few lines below the existing
+        # ENTERING/DCA_PENDING grace it mirrors.
+        self.position.last_fill_ts = time.time()
 
         step_label = "INITIAL" if role == "initial" else f"DCA #{self.position.dca_step}"
         side_color = GREEN if self.position.side == "LONG" else RED
@@ -5217,6 +5234,29 @@ async def initialize_sync(
                     f"for the fill event instead of resetting early.", GRAY,
                 ))
                 return
+        # 2026-08 DCA resync-race fix (exchange-flat variant): an initial
+        # fill can move status straight to "OPEN" (see the OPEN-status
+        # grace block further below, which this mirrors) BEFORE Binance's
+        # REST positionRisk call reflects it at all - i.e. `row is None`
+        # (no open position visible yet), not just a stale/smaller qty.
+        # Without this check, a periodic poll landing in that window would
+        # wipe the just-confirmed OPEN position back to FLAT, discarding
+        # entries/avg_entry_price/dca_step for a position that genuinely
+        # exists on the exchange. Reuses the same last_fill_ts stamp and
+        # SYNC_PENDING_GRACE_SEC window as that later block - once the
+        # grace elapses, a still-flat exchange falls through to the normal
+        # reset-to-FLAT handling immediately below, unchanged.
+        if p.status == "OPEN" and p.last_fill_ts > 0.0:
+            age = time.time() - p.last_fill_ts
+            if age < SYNC_PENDING_GRACE_SEC:
+                print(color(
+                    f"{now_str()} [sync:{context}] exchange reports NO open position yet, but a "
+                    f"fill was confirmed locally only {age:.1f}s ago (< {SYNC_PENDING_GRACE_SEC}s "
+                    f"grace) - local qty={p.total_qty} dca_step={p.dca_step}. REST position data "
+                    f"hasn't caught up yet - waiting for a later sync instead of resetting to FLAT.",
+                    GRAY,
+                ))
+                return
         if p.status != "FLAT":
             print(color(
                 f"{now_str()} [sync:{context}] exchange reports NO open position, but local "
@@ -5305,6 +5345,49 @@ async def initialize_sync(
             f"order (id={p.pending_order_id}) is already pending for this exact position "
             f"(side/qty/avg_entry all match) - its FILLED event just hasn't arrived yet. "
             f"Leaving local state (including opened_at) untouched instead of rebuilding.", GRAY,
+        ))
+        return
+
+    # 2026-08 DCA resync-race fix (this block only - every other branch of
+    # this function, including the ENTERING/DCA_PENDING grace above and
+    # the genuine-mismatch rebuild below, is untouched): _on_entry_filled()
+    # moves a position straight to status="OPEN" the instant a fill is
+    # confirmed locally (via the user-data-stream WebSocket), which is
+    # BEFORE the ENTERING/DCA_PENDING grace above can apply. Binance's own
+    # REST GET /fapi/v1/positionRisk endpoint (what this function polls)
+    # can still echo the PRE-fill qty/avg_entry for a second or two after
+    # that - observed on Testnet: DCA #2 filled locally (total_qty=3.28,
+    # dca_step=2), then ~1.5s later a periodic poll landed mid-lag, saw
+    # the exchange still reporting the pre-DCA qty=1.94, treated it as a
+    # genuine mismatch, and rebuilt the position with dca_step reset to 0
+    # - which then let the bot re-fire a DCA it had already placed.
+    #
+    # Mirrors the ENTERING/DCA_PENDING grace above using the SAME
+    # SYNC_PENDING_GRACE_SEC window (reusing p.last_fill_ts, stamped by
+    # _on_entry_filled() at the moment of the fill, instead of a new ENV
+    # var): while inside that window, a same-side exchange report whose
+    # qty has NOT yet reached what we already hold locally is exactly the
+    # shape of REST lag, not a genuine mismatch - Binance never reports
+    # LESS than reality, only stale/old reality. Skip the rebuild and wait
+    # for a later poll instead; the very next call resumes normal
+    # already_synced / genuine-mismatch handling automatically once the
+    # exchange catches up OR once the grace window itself elapses. A
+    # same-side report with a qty that already MEETS or EXCEEDS local
+    # (or a different side) is never treated as lag and still falls
+    # through to the full rebuild/genuine-mismatch path below, unchanged.
+    if (
+        p.status == "OPEN"
+        and p.side == side
+        and p.last_fill_ts > 0.0
+        and (time.time() - p.last_fill_ts) < SYNC_PENDING_GRACE_SEC
+        and qty < p.total_qty
+    ):
+        fill_age = time.time() - p.last_fill_ts
+        print(color(
+            f"{now_str()} [sync:{context}] exchange still shows {side} qty={qty} (avg={entry_price:.4f}) "
+            f"but a fill was confirmed locally only {fill_age:.1f}s ago (< {SYNC_PENDING_GRACE_SEC}s "
+            f"grace) - local qty={p.total_qty} dca_step={p.dca_step}. REST position data hasn't "
+            f"caught up yet - waiting for a later sync instead of rebuilding.", GRAY,
         ))
         return
 
