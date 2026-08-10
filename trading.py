@@ -1593,6 +1593,7 @@ class MartingaleManager:
         self._last_max_hold_review_log_ts: float = 0.0  # throttles the Max Hold Time V2 "kept alive" diagnostic line
         self._last_max_hold_fee_net_review_log_ts: float = 0.0  # throttles the [max-hold-review] fee-net meaningful_loss diagnostic line
         self._last_max_dca_exhausted_review_log_ts: float = 0.0  # throttles the [max-dca-exhausted-review] diagnostic line
+        self._last_dca_spacing_log_ts: float = 0.0  # throttles the [dca-spacing] diagnostic line
         self._last_max_hold_dca_defer_log_ts: float = 0.0  # throttles the Max Hold Time V2 "DCA opportunity available" diagnostic line
         self._max_hold_dca_defer_pending: bool = False  # set True when Max Hold Time V2 defers for a DCA opportunity this tick; consumed by _on_entry_filled() to log "[dca] executed after max-hold defer"
         self._last_profit_lock_debug_log_ts: float = 0.0  # throttles the [profit-lock-debug] diagnostic line
@@ -2907,6 +2908,17 @@ class MartingaleManager:
         now = time.time()
         if now - self._last_max_dca_exhausted_review_log_ts >= interval_sec:
             self._last_max_dca_exhausted_review_log_ts = now
+            return True
+        return False
+
+    def _should_log_dca_spacing(self, interval_sec: float = 15.0) -> bool:
+        """Throttle for the [dca-spacing] diagnostic line (2026-08 DCA
+        re-fire spacing fix) - debugging only, does not affect the spacing
+        decision itself. Only throttles repeated WAIT ticks; a TRIGGER
+        decision always logs regardless (see the caller's own condition)."""
+        now = time.time()
+        if now - self._last_dca_spacing_log_ts >= interval_sec:
+            self._last_dca_spacing_log_ts = now
             return True
         return False
 
@@ -4285,6 +4297,53 @@ class MartingaleManager:
                 )
                 return
 
+            # --- 2026-08 DCA re-fire spacing fix (this block only - sizing,
+            # DCA_MULTIPLIER, MAX_DCA_STEPS, the dca_distance_pct formula
+            # itself, TP, Hard Stop, Smart Exit, Max Hold, Profit Lock, and
+            # everything else in this function are all untouched) --------
+            # Scoped to DCA #2 and later (p.dca_step >= 1) only - DCA #1
+            # (the first add after the initial entry) still fires purely
+            # off the pct_move-vs-avg_entry_price check above, exactly as
+            # before this fix.
+            #
+            # Root cause: avg_entry_price recalculates the instant a DCA
+            # fill lands, blending toward that fill's price. That can
+            # leave price ALREADY beyond -dca_distance_pct of the NEW
+            # avg_entry even though price has barely moved since the
+            # PREVIOUS DCA fill itself - letting two DCA steps consume the
+            # same adverse move within a fraction of a second (observed:
+            # DCA #1 and #2 both filling ~77.08, ~0.09s apart). This adds
+            # a second, independent requirement for step 2+: price must
+            # move another FULL dca_distance_pct beyond the anchor set by
+            # the previous DCA fill (last_dca_price) - the exact existing
+            # field already documented and persisted for this purpose,
+            # not a parallel system. Uses the SAME dca_distance_pct value
+            # computed above (ATR-adaptive formula itself untouched).
+            if p.dca_step >= 1 and p.last_dca_price is not None:
+                if p.side == "LONG":
+                    next_dca_trigger_price = p.last_dca_price * (1 - dca_distance_pct)
+                    spacing_satisfied = price <= next_dca_trigger_price
+                else:
+                    next_dca_trigger_price = p.last_dca_price * (1 + dca_distance_pct)
+                    spacing_satisfied = price >= next_dca_trigger_price
+
+                if spacing_satisfied or self._should_log_dca_spacing():
+                    print(color(
+                        f"{now_str()} [dca-spacing] dca_step={p.dca_step}/{MAX_DCA_STEPS} "
+                        f"side={p.side} price={price:.4f} last_dca_price={p.last_dca_price:.4f} "
+                        f"required_next_trigger={next_dca_trigger_price:.4f} "
+                        f"dca_distance_pct={dca_distance_pct*100:.4f}% "
+                        f"decision={'TRIGGER' if spacing_satisfied else 'WAIT'}", CYAN,
+                    ))
+
+                if not spacing_satisfied:
+                    # Not yet another full dca_distance_pct beyond the
+                    # previous DCA fill - wait for a later tick. No order
+                    # placed, dca_step unchanged, position stays exactly as
+                    # it is. Hard Stop/Smart Exit/TP/Profit Lock/Max Hold
+                    # all remain fully active in the meantime.
+                    return
+
             # --- Final-DCA low-probability-recovery gate (2026-07 final-DCA
             # gate fix - see module docstring) ----------------------------------
             # Scoped ONLY to the last allowed DCA step. Before committing the
@@ -4391,7 +4450,10 @@ class MartingaleManager:
 
             size_mult = self.confidence_size_multiplier(self.last_confidence, self.last_regime)
             await self._place_step_order(step=p.dca_step + 1, side_signal=p.side, size_mult=size_mult)
-            p.last_dca_price = price
+            # 2026-08 DCA re-fire spacing fix: last_dca_price is now set
+            # from the ACTUAL fill price in _on_entry_filled()'s "dca"
+            # branch below (once the order actually fills), not here from
+            # the pre-order mark price - see that function for why.
 
     def _smart_exit_v2_signals(self, pct_move: float, dynamic_tp_pct: float) -> Dict[str, bool]:
         """Six independent, cheap-to-evaluate signals. Exit only fires when
@@ -4712,6 +4774,14 @@ class MartingaleManager:
         if role == "dca":
             self.position.dca_step += 1
             self.position.last_dca_order_id = order_id
+            # 2026-08 DCA re-fire spacing fix: anchor last_dca_price to the
+            # ACTUAL fill price (already available here, from Binance's
+            # own reported average fill price - "ap" on the order event),
+            # rather than the pre-order mark price previously used. This
+            # is the value the spacing gate in _manage_open_position()
+            # compares the next tick's price against before allowing
+            # another DCA add.
+            self.position.last_dca_price = fill_price
             # 2026-08 Max Hold Time <-> DCA debug logging: if Max Hold Time
             # V2 deferred specifically because this DCA opportunity was
             # available (set/refreshed every tick in _manage_open_position(),
