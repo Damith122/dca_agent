@@ -242,6 +242,7 @@ import numpy as np
 
 from config import (
     SYMBOL,
+    RUNTIME_ENV,
     DRY_RUN,
     LEVERAGE,
     MARGIN_TYPE,
@@ -1665,6 +1666,15 @@ class MartingaleManager:
         # estimate_round_trip_fee_usdt() estimate for the whole trade
         # instead of silently mixing a foreign-currency number into USDT.
         self._position_fees_reliable: bool = True
+        # 2026-08 entry-context/commission race fix: per-role commission
+        # breakdown, purely for the final-close diagnostic (does not affect
+        # any accounting decision - _position_fees_accum above remains the
+        # single authoritative total used for combined_net_pnl). Same
+        # reset/consume lifecycle as _position_fees_accum: zeroed on a
+        # fresh "initial" entry, read (not reset individually) at finalize.
+        self._entry_commission_accum: float = 0.0
+        self._dca_commission_accum: float = 0.0
+        self._exit_commission_accum: float = 0.0
 
         # --- Unmatched-fill buffer (2026-08 fill-tracking race fix) --------
         # Bridges the gap between placing an order (REST call returns an
@@ -1733,14 +1743,15 @@ class MartingaleManager:
     # -- Persistent Adaptive Learning: startup load / ongoing persistence ----
 
     async def load_or_init_brain(self) -> None:
-        # 2026-08 multi-symbol state isolation: explicit, unmissable log of
-        # which symbol is active and which symbol-specific persistence
-        # files it maps to - printed once at startup, before any
-        # local/remote Brain candidate is even read, so a symbol switch
-        # (Railway ENV SYMBOL=... + redeploy) is immediately verifiable
+        # 2026-08 environment + symbol state isolation: explicit,
+        # unmissable log of which environment (Testnet/Live) AND symbol
+        # are active and which persistence files they map to - printed
+        # once at startup, before any local/remote Brain candidate is even
+        # read, so an environment or symbol switch (Railway ENV
+        # USE_TESTNET=.../SYMBOL=... + redeploy) is immediately verifiable
         # from the logs rather than inferred later.
         print(color(
-            f"{now_str()} [symbol] active SYMBOL={self.symbol} | "
+            f"{now_str()} [symbol] environment={RUNTIME_ENV} SYMBOL={self.symbol} | "
             f"brain={BRAIN_LOCAL_PATH} | "
             f"dca={DCA_STATE_PATH} | "
             f"cursor={TRADE_SYNC_CURSOR_PATH} | "
@@ -2191,9 +2202,9 @@ class MartingaleManager:
         PerformanceStats already create the file with proper headers
         automatically on their first natural write (unchanged behavior)."""
         for local_path, remote_path, label in (
-            (TRADE_LOG_CSV_PATH, GITHUB_TRADES_LOG_CSV_PATH, "trades_log.csv"),
-            (STATS_CSV_PATH, GITHUB_STATS_CSV_PATH, "performance_stats.csv"),
-            (TRADE_LOG_JSON_PATH, GITHUB_TRADES_LOG_JSON_PATH, "trades_log.jsonl"),
+            (TRADE_LOG_CSV_PATH, GITHUB_TRADES_LOG_CSV_PATH, os.path.basename(TRADE_LOG_CSV_PATH)),
+            (STATS_CSV_PATH, GITHUB_STATS_CSV_PATH, os.path.basename(STATS_CSV_PATH)),
+            (TRADE_LOG_JSON_PATH, GITHUB_TRADES_LOG_JSON_PATH, os.path.basename(TRADE_LOG_JSON_PATH)),
         ):
             if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
                 continue  # local copy already present - don't clobber it
@@ -2256,11 +2267,11 @@ class MartingaleManager:
             print(color(f"[csv-sync] unexpected error pushing {label} (bot keeps trading): {e}", RED))
 
     async def sync_trade_log_to_github(self) -> None:
-        await self._sync_csv_to_github(TRADE_LOG_CSV_PATH, GITHUB_TRADES_LOG_CSV_PATH, "trades_log.csv")
-        await self._sync_csv_to_github(TRADE_LOG_JSON_PATH, GITHUB_TRADES_LOG_JSON_PATH, "trades_log.jsonl")
+        await self._sync_csv_to_github(TRADE_LOG_CSV_PATH, GITHUB_TRADES_LOG_CSV_PATH, os.path.basename(TRADE_LOG_CSV_PATH))
+        await self._sync_csv_to_github(TRADE_LOG_JSON_PATH, GITHUB_TRADES_LOG_JSON_PATH, os.path.basename(TRADE_LOG_JSON_PATH))
 
     async def sync_performance_stats_to_github(self) -> None:
-        await self._sync_csv_to_github(STATS_CSV_PATH, GITHUB_STATS_CSV_PATH, "performance_stats.csv")
+        await self._sync_csv_to_github(STATS_CSV_PATH, GITHUB_STATS_CSV_PATH, os.path.basename(STATS_CSV_PATH))
 
     # -- Trade-log reconciliation (Binance is the source of truth) -----------
     # Root-cause fix for trades that go missing from trades_log.jsonl/csv:
@@ -3125,6 +3136,31 @@ class MartingaleManager:
             self.last_trade_action_ts = time.time()
             return
 
+        # 2026-08 entry-context/commission race fix: transition status
+        # (and side/pending_order_ts) to the pending state BEFORE placing
+        # the order, not after the REST round-trip returns. Root cause:
+        # initialize_sync() already has a grace-period guard
+        # (SYNC_PENDING_GRACE_SEC) specifically to defer its position
+        # rebuild while an order is known to be in flight - but it only
+        # recognizes p.status in ("ENTERING", "DCA_PENDING", "CLOSING").
+        # With status left at "FLAT"/"OPEN" for the entire place_order()
+        # REST call (as it was before this fix), a concurrent
+        # initialize_sync() poll landing in that window saw no reason to
+        # defer and fell through to a full position rebuild - silently
+        # replacing self.position (losing entry_confidence/entry_features/
+        # entry_regime/entry_dynamic_tp_pct, none of which are part of the
+        # DCA-state snapshot schema) and unconditionally resetting
+        # _position_fees_accum/_position_fees_reliable, discarding any
+        # entry-side commission already accumulated. Setting these fields
+        # here reuses that EXISTING grace-period protection immediately -
+        # initialize_sync() itself needed no changes at all.
+        prior_status = self.position.status
+        prior_side = self.position.side
+        prior_pending_ts = self.position.pending_order_ts
+        self.position.status = "ENTERING" if step == 0 else "DCA_PENDING"
+        self.position.side = side_signal
+        self.position.pending_order_ts = time.time()
+
         try:
             resp = await self.client.place_order(
                 symbol=self.symbol, side=order_side, type="MARKET", quantity=qty,
@@ -3143,9 +3179,6 @@ class MartingaleManager:
             if not already_filled:
                 self.position.pending_order_id = order_id
                 self.position.pending_role = role
-                self.position.pending_order_ts = time.time()
-                self.position.side = side_signal
-                self.position.status = "ENTERING" if step == 0 else "DCA_PENDING"
                 self.last_trade_action_ts = time.time()
             print(color(
                 f"{now_str()} {step_label} PLACED  {order_side} {qty} {self.symbol} "
@@ -3155,6 +3188,15 @@ class MartingaleManager:
             ))
         except BinanceApiError as e:
             print(color(f"[dca] {step_label} order FAILED: {e}", RED))
+            # The order was never placed (or Binance definitively rejected
+            # it) - revert the early pending-state transition above so the
+            # position doesn't get stuck thinking an order is in flight
+            # when none exists. Restores exactly what was there before this
+            # call, for both the fresh-entry (step 0, FLAT->ENTERING) and
+            # DCA-add (OPEN->DCA_PENDING) cases.
+            self.position.status = prior_status
+            self.position.side = prior_side
+            self.position.pending_order_ts = prior_pending_ts
 
     async def _fetch_exchange_position(self) -> Optional[Tuple[Optional[str], float]]:
         """Fetches THIS symbol's authoritative position from Binance.
@@ -4627,7 +4669,19 @@ class MartingaleManager:
         if role == "initial":
             self._position_fees_accum = 0.0
             self._position_fees_reliable = True
+            self._entry_commission_accum = 0.0
+            self._dca_commission_accum = 0.0
+            self._exit_commission_accum = 0.0
         self._position_fees_accum += total_fee_this_order
+        # 2026-08 entry-context/commission race fix: per-role breakdown,
+        # diagnostic only - does not change combined_net_pnl/fees_final,
+        # which still come entirely from _position_fees_accum above.
+        if role == "initial":
+            self._entry_commission_accum += total_fee_this_order
+        elif role == "dca":
+            self._dca_commission_accum += total_fee_this_order
+        elif role in ("close", "partial_close"):
+            self._exit_commission_accum += total_fee_this_order
 
         if role in ("initial", "dca"):
             await self._on_entry_filled(role, fill_price, fill_qty, order_id=order_id)
@@ -4833,8 +4887,17 @@ class MartingaleManager:
         else:
             fees_final = self.estimate_round_trip_fee_usdt(p.original_qty or p.total_qty, p.avg_entry_price or fill_price, fill_price)
             fee_source = "estimated_fallback"
+        # 2026-08 entry-context/commission race fix: capture the per-role
+        # breakdown for the diagnostic below before resetting it alongside
+        # _position_fees_accum - diagnostic only, does not affect fees_final.
+        entry_commission_for_record = self._entry_commission_accum
+        dca_commission_for_record = self._dca_commission_accum
+        exit_commission_for_record = self._exit_commission_accum
         self._position_fees_accum = 0.0
         self._position_fees_reliable = True
+        self._entry_commission_accum = 0.0
+        self._dca_commission_accum = 0.0
+        self._exit_commission_accum = 0.0
 
         # THE FIX: true economic result = raw realized PnL minus actual
         # full-lifecycle commission - previously this was left as the raw
@@ -4880,6 +4943,20 @@ class MartingaleManager:
             f"reward={reward:+.4f}  session_total={self.realized_pnl_total:+.4f}",
             pnl_color,
         ))
+        # 2026-08 entry-context/commission race fix: requested final-close
+        # diagnostic - breaks the actual commission total down by role, so
+        # a missing/incomplete entry-side or DCA-side commission is
+        # immediately visible from the logs instead of only showing up as
+        # an unexplained gap in the total. Printed once per close (not
+        # per-tick) alongside the existing POSITION CLOSED line. Only
+        # meaningful when fee_source=="actual" - the estimated fallback is
+        # a single round-trip figure with no real per-fill breakdown to show.
+        if fee_source == "actual":
+            print(color(
+                f"{now_str()} [commission-breakdown] entry={entry_commission_for_record:.4f} "
+                f"dca={dca_commission_for_record:.4f} exit={exit_commission_for_record:.4f} "
+                f"total={fees_final:.4f}", GRAY,
+            ))
 
         was_success = combined_net_pnl > 0
         self.recent_trade_outcomes.append(1.0 if was_success else 0.0)
