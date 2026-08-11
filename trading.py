@@ -2242,6 +2242,106 @@ class MartingaleManager:
         self._last_synced_csv_hash[GITHUB_STATS_CSV_PATH] = self._file_sha256(STATS_CSV_PATH)
         self._last_synced_csv_hash[GITHUB_TRADES_LOG_JSON_PATH] = self._file_sha256(TRADE_LOG_JSON_PATH)
 
+    # -- Restart-safe runtime accounting restoration --------------------------
+    # Root cause fixed here: TradeLogger.load_all() / restore_csv_logs_from_github()
+    # above already restore the PERMANENT trades_log_<ENV>_<SYMBOL>.jsonl
+    # history across a restart, but MartingaleManager's own in-memory
+    # RUNTIME counters (trade_count, realized_pnl_total, daily_realized_pnl)
+    # always started a fresh process at 0/0.0/0.0 regardless - nothing ever
+    # re-derived them from that restored history. Beyond the cosmetic
+    # status-line impact (trades=0 / session_pnl=+0.0000 after a restart
+    # with real history behind it), daily_realized_pnl backs
+    # MAX_DAILY_LOSS_USDT (a NEW-ENTRY-only gate - see on_price_tick()), so
+    # this could silently let a Railway restart/crash/redeploy bypass
+    # Daily Loss Protection for the rest of that UTC day. This method
+    # closes that gap. Pure bookkeeping restoration only - does not read
+    # or write DCA/position state, and does not touch Partial TP in any
+    # way (PARTIAL_TP_ENABLED is off in this deployment and its existing
+    # code path - _apply_partial_close() - is completely untouched by
+    # this fix).
+
+    async def restore_runtime_accounting_from_history(self) -> None:
+        """Rebuilds trade_count / realized_pnl_total / daily_realized_pnl
+        from the already-restored trades_log JSONL (TradeLogger.load_all()
+        - the existing source of truth), and sets _daily_loss_tracker_date
+        to today's UTC date so the very next _maybe_reset_daily_loss_tracker()
+        call does not immediately wipe the value just restored here.
+
+        MUST run after restore_csv_logs_from_github() (so the JSONL file on
+        disk actually reflects restored history, not an empty fresh file)
+        and BEFORE reconcile_trade_history_from_exchange() ever gets a
+        chance to run (both are satisfied by calling this directly from
+        dca2.py's startup sequence, right after restore_csv_logs_from_github()
+        and before load_trade_sync_cursor()/initialize_sync()). Any trade
+        reconciliation goes on to recover afterward is simply ADDED on top
+        of the base this method establishes (see
+        reconcile_trade_history_from_exchange()) - its existing dedup
+        against trades_log.jsonl via logged_binance_order_ids() already
+        guarantees a trade counted here is never re-added there, so the two
+        can never double-count against each other.
+
+        Only ever reads trades_log.jsonl and mutates the three runtime
+        counters above (plus _daily_loss_tracker_date) - never touches
+        self.position/PositionState, Brain V2, DCA state, or any
+        entry/exit/DCA/risk decision.
+
+        Fail-soft per-row: a single corrupt/missing/None field on one
+        historical JSONL line only zeroes out THAT row's contribution -
+        never raises, never blocks the rest of history from being counted,
+        and never blocks bot startup.
+        """
+        today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        trade_count = 0
+        realized_total = 0.0
+        daily_total = 0.0
+        skipped = 0
+        try:
+            records = self.trade_logger.load_all()
+        except Exception as e:  # noqa: BLE001 - must never block startup
+            print(color(f"[startup-accounting] failed to read trade history: {e}", YELLOW))
+            records = []
+
+        for rec in records:
+            try:
+                # 2026-08 multi-symbol state isolation: same per-symbol
+                # filter PerformanceStats.compute() and
+                # reconcile_trade_history_from_exchange() already apply -
+                # trades_log files are symbol-scoped by filename, so this
+                # is a defensive extra guard, not the primary mechanism.
+                if rec.get("symbol") != self.symbol:
+                    continue
+                raw_pnl = rec.get("net_pnl_usdt")
+                pnl = float(raw_pnl) if raw_pnl is not None else 0.0
+            except (TypeError, ValueError):
+                # Corrupt/non-numeric historical row - fail soft: skip only
+                # this row's contribution, never crash startup.
+                skipped += 1
+                continue
+            trade_count += 1
+            realized_total += pnl
+            close_time = rec.get("close_time")
+            if close_time and str(close_time)[:10] == today_utc:
+                daily_total += pnl
+
+        self.trade_count = trade_count
+        self.realized_pnl_total = realized_total
+        self._daily_loss_tracker_date = today_utc
+        self.daily_realized_pnl = daily_total
+
+        print(color(
+            f"{now_str()} [startup-accounting] rebuilt runtime counters from history: "
+            f"trades={trade_count} session_pnl={realized_total:+.4f} "
+            f"today_pnl={daily_total:+.4f} (UTC day {today_utc}, {len(records)} row(s) read"
+            f"{f', {skipped} skipped as corrupt' if skipped else ''}).", MAGENTA,
+        ))
+        if MAX_DAILY_LOSS_USDT > 0 and daily_total <= -MAX_DAILY_LOSS_USDT:
+            print(color(
+                f"{now_str()} [startup-accounting] WARNING: today's restored realized PnL "
+                f"(${daily_total:+.4f}) already breaches MAX_DAILY_LOSS_USDT "
+                f"(-${MAX_DAILY_LOSS_USDT:.2f}) - new entries stay blocked until the next "
+                f"UTC day (existing on_price_tick() gate - unchanged).", YELLOW,
+            ))
+
     @staticmethod
     def _file_sha256(path: str) -> Optional[str]:
         try:
