@@ -2288,7 +2288,11 @@ class MartingaleManager:
         Fail-soft per-row: a single corrupt/missing/None field on one
         historical JSONL line only zeroes out THAT row's contribution -
         never raises, never blocks the rest of history from being counted,
-        and never blocks bot startup.
+        and never blocks bot startup. This includes a JSON line that
+        parsed successfully but isn't an object (null/list/bare string or
+        number) and a PnL value that parses to NaN/+-Infinity - both are
+        skipped exactly like any other corrupt row, never allowed to enter
+        realized_pnl_total/daily_realized_pnl.
         """
         today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         trade_count = 0
@@ -2302,6 +2306,14 @@ class MartingaleManager:
             records = []
 
         for rec in records:
+            # A JSONL line can be syntactically valid JSON without being an
+            # object (null, a list, a bare string/number, ...) - TradeLogger
+            # .load_all() only guarantees each line parsed as JSON, not that
+            # it's a dict. Guard this explicitly so rec.get(...) below can
+            # never raise AttributeError and break startup.
+            if not isinstance(rec, dict):
+                skipped += 1
+                continue
             try:
                 # 2026-08 multi-symbol state isolation: same per-symbol
                 # filter PerformanceStats.compute() and
@@ -2315,6 +2327,14 @@ class MartingaleManager:
             except (TypeError, ValueError):
                 # Corrupt/non-numeric historical row - fail soft: skip only
                 # this row's contribution, never crash startup.
+                skipped += 1
+                continue
+            if not math.isfinite(pnl):
+                # NaN/+-Infinity parses successfully via float() but must
+                # never enter realized_pnl_total/daily_realized_pnl - it
+                # would corrupt every downstream comparison (including the
+                # MAX_DAILY_LOSS_USDT check) for the rest of the process.
+                # Fail soft exactly like any other corrupt row.
                 skipped += 1
                 continue
             trade_count += 1
