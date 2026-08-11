@@ -699,6 +699,18 @@ async def main() -> None:
         # trades_log.csv / performance_stats.csv so trade history and
         # analytics survive an ephemeral restart exactly like brain.pkl does.
         await manager.restore_csv_logs_from_github()
+        # 2026-08 restart-safe accounting fix: rebuilds trade_count /
+        # realized_pnl_total / daily_realized_pnl (and
+        # _daily_loss_tracker_date) from the trades_log JSONL just restored
+        # above - MUST run after restore_csv_logs_from_github() (so it
+        # reads restored history, not an empty fresh file) and before
+        # load_trade_sync_cursor()/reconcile_trade_history_from_exchange()
+        # ever gets a chance to run, so anything reconciliation goes on to
+        # recover afterward is simply added on top of this base (see that
+        # method's own docstring in trading.py for why this can never
+        # double-count). Pure bookkeeping restore only - does not touch
+        # DCA/position state, Brain V2, or any trading decision.
+        await manager.restore_runtime_accounting_from_history()
         # Restores the trade-log reconciliation cursor (see
         # reconcile_trade_history_from_exchange) the same way, so a Railway
         # restart resumes catching up on Binance trade history from where
