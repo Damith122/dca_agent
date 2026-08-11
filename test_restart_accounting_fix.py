@@ -51,6 +51,7 @@ os.environ.setdefault("PARTIAL_TP_ENABLED", "false")
 
 import asyncio
 import json
+import math
 import os as _os
 import time
 from datetime import datetime, timedelta, timezone
@@ -305,8 +306,124 @@ async def test_missing_trade_log_file_is_a_no_op():
 
 
 # ============================================================================
+# Hardening: a JSONL line can be syntactically valid JSON without being an
+# object (null / list / bare string / bare number), and float() can
+# successfully parse "NaN"/"Infinity" strings or accept a NaN/inf number
+# straight from JSON. Neither may raise, and neither may ever enter
+# realized_pnl_total/daily_realized_pnl.
+# ============================================================================
+
+async def test_non_dict_json_lines_fail_soft():
+    print("\n=== test_non_dict_json_lines_fail_soft ===")
+    _reset_files()
+    today = today_utc_str()
+    write_trade(0.1000, f"{today} 08:00:00 UTC", order_id=1)
+    with open(TRADE_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(None) + "\n")       # valid JSON null
+        f.write(json.dumps([]) + "\n")          # valid JSON list
+        f.write(json.dumps([1, 2, 3]) + "\n")   # valid JSON non-empty list
+        f.write(json.dumps("just a string") + "\n")  # valid JSON string
+        f.write(json.dumps(123) + "\n")         # valid JSON number
+    write_trade(0.2000, f"{today} 10:00:00 UTC", order_id=2)
+
+    manager = await make_manager()
+    await manager.restore_runtime_accounting_from_history()  # must not raise (AttributeError on rec.get(...))
+
+    assert manager.trade_count == 2, (
+        f"expected only the 2 well-formed dict rows counted, got {manager.trade_count}"
+    )
+    assert abs(manager.realized_pnl_total - 0.3) < 1e-9, (
+        f"expected realized_pnl_total=0.3 (non-dict rows contribute 0), got {manager.realized_pnl_total:.4f}"
+    )
+    assert math.isfinite(manager.realized_pnl_total)
+    assert math.isfinite(manager.daily_realized_pnl)
+    print(f"PASS: null/list/string/number JSON lines skipped fail-soft (no AttributeError) - "
+          f"trade_count={manager.trade_count} realized_pnl_total={manager.realized_pnl_total:+.4f}")
+
+
+async def test_nonfinite_pnl_fails_soft():
+    print("\n=== test_nonfinite_pnl_fails_soft ===")
+    _reset_files()
+    today = today_utc_str()
+    write_trade(0.1000, f"{today} 08:00:00 UTC", order_id=1)
+    with open(TRADE_LOG_PATH, "a", encoding="utf-8") as f:
+        # json.dumps(float("nan")) emits the non-standard-but-Python-parseable
+        # "NaN"/"Infinity"/"-Infinity" tokens - json.loads() (and therefore
+        # TradeLogger.load_all()) accepts them by default, and float() on
+        # the resulting Python float is a no-op pass-through - so these
+        # rows DO reach this method as real dicts with a real float
+        # net_pnl_usdt, not a TypeError/ValueError case.
+        f.write(json.dumps({"symbol": "SOLUSDT", "net_pnl_usdt": float("nan"), "close_time": f"{today} 09:00:00 UTC"}) + "\n")
+        f.write(json.dumps({"symbol": "SOLUSDT", "net_pnl_usdt": float("inf"), "close_time": f"{today} 09:30:00 UTC"}) + "\n")
+        f.write(json.dumps({"symbol": "SOLUSDT", "net_pnl_usdt": float("-inf"), "close_time": f"{today} 09:45:00 UTC"}) + "\n")
+        # Also cover the string-token spelling directly, in case a
+        # historical row was ever hand-edited or produced by another tool.
+        f.write('{"symbol": "SOLUSDT", "net_pnl_usdt": "NaN", "close_time": "%s 09:50:00 UTC"}\n' % today)
+    write_trade(0.2000, f"{today} 10:00:00 UTC", order_id=2)
+
+    manager = await make_manager()
+    await manager.restore_runtime_accounting_from_history()  # must not raise, must not corrupt totals
+
+    assert manager.trade_count == 2, (
+        f"expected only the 2 well-formed finite-PnL rows counted, got {manager.trade_count}"
+    )
+    assert abs(manager.realized_pnl_total - 0.3) < 1e-9, (
+        f"expected realized_pnl_total=0.3 (NaN/Infinity rows contribute 0, not NaN), "
+        f"got {manager.realized_pnl_total!r}"
+    )
+    assert abs(manager.daily_realized_pnl - 0.3) < 1e-9
+    assert math.isfinite(manager.realized_pnl_total), (
+        f"realized_pnl_total must remain finite, got {manager.realized_pnl_total!r}"
+    )
+    assert math.isfinite(manager.daily_realized_pnl), (
+        f"daily_realized_pnl must remain finite, got {manager.daily_realized_pnl!r}"
+    )
+    # A NaN daily_realized_pnl would make MAX_DAILY_LOSS_USDT's
+    # `daily_realized_pnl <= -MAX_DAILY_LOSS_USDT` comparison always False
+    # (NaN compares False to everything) - silently defeating Daily Loss
+    # Protection. Confirm the restored value is a normal, comparable float.
+    gate_condition_is_well_defined = (
+        (manager.daily_realized_pnl <= -trading.MAX_DAILY_LOSS_USDT) is True
+        or (manager.daily_realized_pnl <= -trading.MAX_DAILY_LOSS_USDT) is False
+    )
+    assert gate_condition_is_well_defined
+    print(f"PASS: NaN/+-Infinity PnL rows skipped fail-soft - trade_count={manager.trade_count} "
+          f"realized_pnl_total={manager.realized_pnl_total:+.4f} (finite) "
+          f"daily_realized_pnl={manager.daily_realized_pnl:+.4f} (finite)")
+
+
+async def test_valid_rows_before_and_after_malformed_rows_still_restore():
+    """Malformed rows anywhere in the file (start, middle, end, mixed) must
+    never prevent the well-formed rows around them from being counted."""
+    print("\n=== test_valid_rows_before_and_after_malformed_rows_still_restore ===")
+    _reset_files()
+    today = today_utc_str()
+    with open(TRADE_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(None) + "\n")  # malformed BEFORE any valid row
+    write_trade(0.1000, f"{today} 08:00:00 UTC", order_id=1)
+    with open(TRADE_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"net_pnl_usdt": float("nan"), "symbol": "SOLUSDT", "close_time": f"{today} 08:30:00 UTC"}) + "\n")
+    write_trade(0.2000, f"{today} 09:00:00 UTC", order_id=2)
+    with open(TRADE_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps([1, 2]) + "\n")  # malformed AFTER the last valid row
+
+    manager = await make_manager()
+    await manager.restore_runtime_accounting_from_history()
+
+    assert manager.trade_count == 2, f"expected 2 valid trades despite surrounding malformed rows, got {manager.trade_count}"
+    assert abs(manager.realized_pnl_total - 0.3) < 1e-9, (
+        f"expected realized_pnl_total=0.3, got {manager.realized_pnl_total:.4f}"
+    )
+    assert math.isfinite(manager.realized_pnl_total) and math.isfinite(manager.daily_realized_pnl)
+    print(f"PASS: valid rows before/after malformed rows both restore correctly - "
+          f"trade_count={manager.trade_count} realized_pnl_total={manager.realized_pnl_total:+.4f}")
+
+
+# ============================================================================
 # 8) Reconciliation after startup does not double-count already-restored
-#    historical trades.
+#    historical trades - exercises the REAL reconcile_trade_history_from_exchange()
+#    dedup path (logged_binance_order_ids()) against a real flat->open->flat
+#    Binance fill lifecycle, not a client=None early-return no-op.
 # ============================================================================
 
 async def test_reconciliation_does_not_double_count():
@@ -320,23 +437,62 @@ async def test_reconciliation_does_not_double_count():
     assert manager.trade_count == 1
     assert abs(manager.realized_pnl_total - 0.5) < 1e-9
 
-    # reconcile_trade_history_from_exchange() fetches userTrades from
-    # Binance and only ever logs a lifecycle whose order id(s) are NOT
-    # already in trades_log.jsonl (see logged_binance_order_ids()). With no
-    # client (client=None), DRY_RUN=false, it takes the
-    # `if DRY_RUN or self.client is None: return` early-out - a fast no-op
-    # that must leave the restored counters untouched.
+    # A real Binance flat->open->flat fill lifecycle whose EXIT order id
+    # (42) is already represented in trades_log.jsonl (see write_trade()
+    # above, which writes binance_order_ids=[42]) - the existing
+    # logged_binance_order_ids() dedup inside
+    # reconcile_trade_history_from_exchange() must recognize this and skip
+    # the whole lifecycle, not just avoid re-adding order_id=42 in
+    # isolation. Entry leg uses a DIFFERENT order id (41) on purpose, so
+    # this actually exercises the "any fill already logged -> skip the
+    # WHOLE lifecycle" branch (order_ids & already_order_ids), not a
+    # trivial single-id match.
+    now_ms = int(time.time() * 1000)
+    fills = [
+        {
+            "id": 9001, "orderId": 41, "side": "BUY", "qty": "1.0", "price": "100.0",
+            "time": now_ms, "realizedPnl": "0", "commission": "0.05", "commissionAsset": "USDT",
+        },
+        {
+            "id": 9002, "orderId": 42, "side": "SELL", "qty": "1.0", "price": "101.0",
+            "time": now_ms + 1000, "realizedPnl": "0.55", "commission": "0.05", "commissionAsset": "USDT",
+        },
+    ]
+
+    class FillsClient:
+        """Stands in for RestClient - only get_user_trades() is exercised
+        by reconcile_trade_history_from_exchange() in this test."""
+        async def get_user_trades(self, symbol, from_id=None, limit=1000):
+            return fills
+
+    manager.client = FillsClient()  # DRY_RUN=false + a real client -> the actual reconcile path runs, not its early-return no-op
+    trade_log_size_before = _os.path.getsize(TRADE_LOG_PATH)
+
     await manager.reconcile_trade_history_from_exchange(context="test")
 
     assert manager.trade_count == 1, (
-        f"reconciliation must not double-count order_id=42 (already in trades_log.jsonl), "
-        f"got trade_count={manager.trade_count}"
+        f"reconciliation must skip a lifecycle already represented via order_id=42 "
+        f"(existing logged_binance_order_ids() dedup), got trade_count={manager.trade_count}"
     )
     assert abs(manager.realized_pnl_total - 0.5) < 1e-9, (
-        f"reconciliation must not double-count order_id=42's PnL, got {manager.realized_pnl_total:.4f}"
+        f"reconciliation must not double-count order_id=42's PnL into realized_pnl_total, "
+        f"got {manager.realized_pnl_total:.4f}"
     )
+    assert abs(manager.daily_realized_pnl - 0.5) < 1e-9, (
+        f"reconciliation must not double-count order_id=42's PnL into daily_realized_pnl, "
+        f"got {manager.daily_realized_pnl:.4f}"
+    )
+    trade_log_size_after = _os.path.getsize(TRADE_LOG_PATH)
+    assert trade_log_size_after == trade_log_size_before, (
+        "reconciliation must not append a duplicate row to trades_log.jsonl for an "
+        "already-logged lifecycle"
+    )
+    logged = trading.TradeLogger().load_all()
+    assert len(logged) == 1, f"expected exactly 1 trade in trades_log.jsonl after reconcile, got {len(logged)}"
     print(f"PASS: trade_count={manager.trade_count} realized_pnl_total={manager.realized_pnl_total:+.4f} "
-          f"unchanged after a reconcile pass over an already-logged trade")
+          f"daily_realized_pnl={manager.daily_realized_pnl:+.4f} unchanged, and no duplicate row "
+          f"appended, after a real reconcile pass over an already-logged lifecycle "
+          f"(entry order_id=41, exit order_id=42)")
 
 
 # ============================================================================
@@ -388,6 +544,9 @@ async def main():
     await test_max_daily_loss_still_blocks_after_restart()
     await test_corrupt_rows_fail_soft()
     await test_missing_trade_log_file_is_a_no_op()
+    await test_non_dict_json_lines_fail_soft()
+    await test_nonfinite_pnl_fails_soft()
+    await test_valid_rows_before_and_after_malformed_rows_still_restore()
     await test_reconciliation_does_not_double_count()
     await test_existing_dca_step_restart_recovery_unchanged()
     print("\nAll test_restart_accounting_fix tests passed.")
