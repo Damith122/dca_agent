@@ -146,17 +146,24 @@ class RestClient:
     async def get_user_trades(
         self, symbol: str, from_id: Optional[int] = None,
         start_time_ms: Optional[int] = None, limit: int = 1000,
+        order_id: Optional[int] = None,
     ) -> list:
         """Actual executed fills for `symbol` (Binance's own account trade
         history - the source of truth for what really happened, independent
         of whatever the local process's in-memory state or the user-data
-        websocket stream did or didn't see). Read-only; used only by the
-        trade-log reconciliation safety net, never by the live strategy.
-        `from_id` and `start_time_ms` are mutually exclusive per Binance's
-        API - `from_id` (incremental cursor) takes priority when both are
-        given."""
+        websocket stream did or didn't see). Read-only; used by the
+        trade-log reconciliation safety net, and (new) by the missed-fill
+        REST recovery path in trading.py's
+        MartingaleManager._resolve_pending_order_via_rest(), which passes
+        `order_id` to fetch only this exact order's own fill(s) (accurate
+        realizedPnl/commission for that one order, not a wider window).
+        `order_id`, `from_id`, and `start_time_ms` are mutually exclusive
+        per Binance's API - `order_id` takes priority when given, then
+        `from_id` (incremental cursor)."""
         params = {"symbol": symbol, "limit": limit}
-        if from_id is not None:
+        if order_id is not None:
+            params["orderId"] = order_id
+        elif from_id is not None:
             params["fromId"] = from_id
         elif start_time_ms is not None:
             params["startTime"] = start_time_ms
@@ -169,6 +176,19 @@ class RestClient:
     async def cancel_order(self, symbol: str, order_id: int) -> dict:
         return await self._request(
             "DELETE", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id}, signed=True
+        )
+
+    async def get_order(self, symbol: str, order_id: int) -> dict:
+        """Signed GET /fapi/v1/order - query a single order's current
+        status by orderId. REST fallback used when a fill's WebSocket
+        ORDER_TRADE_UPDATE event is missed (dropped/decommissioned
+        user-data stream, reconnect race, etc.) so pending local state can
+        be resolved deterministically from Binance's own order record
+        instead of being inferred from a position-snapshot mismatch.
+        Docs: https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/trade
+        """
+        return await self._request(
+            "GET", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id}, signed=True
         )
 
     # --- user data stream ----------------------------------------------------
