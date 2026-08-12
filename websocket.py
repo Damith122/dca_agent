@@ -46,6 +46,7 @@ from config import (
     WS_MARKET_BASE,
     WS_USERDATA_BASE,
     SYMBOL,
+    USE_TESTNET,
     IDLE_DATA_TIMEOUT_SEC,
     USER_WS_IDLE_FALLBACK_SEC,
     MAX_BACKOFF_SEC,
@@ -83,25 +84,48 @@ initialize_sync = None
 
 # ============================================================================
 # MARKET DATA WEBSOCKET (bookTicker for price/spread/book-imbalance,
-# aggTrade for buy/sell volume delta - combined stream, single connection)
+# aggTrade for buy/sell volume delta)
+#
+# 2026-08 WS route-migration fix: Binance permanently decommissioned the
+# legacy combined-stream URL (wss://fstream.binance.com/stream?streams=...)
+# for LIVE on 2026-04-23, splitting traffic into three dedicated base
+# paths - /public (high-frequency public data, incl. bookTicker),
+# /market (regular market data, incl. aggTrade), and /private (user-data/
+# listenKey streams). An unrouted connection (the old bare host) now only
+# ever receives /public data - so on Live, the pre-fix code above silently
+# kept receiving bookTicker (still /public) while aggTrade (now /market)
+# went dark. That alone would not explain the DCA/resync bug (aggTrade only
+# feeds an informational buy/sell-volume signal, not order-fill state), but
+# it is a real, independently confirmed data-loss bug fixed here as part of
+# the same migration. See module docstring / Binance's own migration notice:
+# https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/websocket-market-streams/Important-WebSocket-Change-Notice
+#
+# Testnet (stream.binancefuture.com) is NOT covered by that notice, so its
+# combined-stream behavior is left completely untouched below - only the
+# Live host now splits into two independent connections, one per route
+# category, each with its own identical reconnect/backoff/watchdog logic
+# (byte-for-byte the same loop shape as the original single connection,
+# just parameterized per stream instead of duplicated by hand).
 # ============================================================================
 
 
-async def market_data_consumer(manager: MartingaleManager) -> None:
-    host_idx = 0
+async def _run_single_market_stream(
+    manager: MartingaleManager, url: str, label: str, stream_suffix: str,
+) -> None:
+    """One reconnecting websocket connection for exactly one market stream
+    category (either the legacy combined connection, or - post migration -
+    one of the two Live /public / /market connections). Reconnect/backoff/
+    watchdog shape is unchanged from the original single-connection
+    version; only parameterized by URL/label so it can be reused for each
+    routed connection without duplicating the loop by hand."""
     backoff = 1.0
-    hosts = [WS_MARKET_BASE]
-    stream_path = f"{SYMBOL.lower()}@bookTicker/{SYMBOL.lower()}@aggTrade"
-
     while True:
-        host = hosts[host_idx % len(hosts)]
-        url = f"{host}/stream?streams={stream_path}"
         try:
-            print(color(f"[market-ws] connecting to {host} ...", GRAY))
+            print(color(f"[market-ws:{label}] connecting to {url} ...", GRAY))
             async with websockets.connect(
                 url, ping_interval=15, ping_timeout=10, max_queue=2048
             ) as ws:
-                print(color("[market-ws] connected (bookTicker + aggTrade).", GREEN))
+                print(color(f"[market-ws:{label}] connected.", GREEN))
                 backoff = 1.0
                 last_msg_time = time.time()
 
@@ -109,7 +133,7 @@ async def market_data_consumer(manager: MartingaleManager) -> None:
                     while True:
                         await asyncio.sleep(5)
                         if time.time() - last_msg_time > IDLE_DATA_TIMEOUT_SEC:
-                            print(color("[market-ws] idle timeout, forcing reconnect ...", RED))
+                            print(color(f"[market-ws:{label}] idle timeout, forcing reconnect ...", RED))
                             await ws_ref.close()
                             return
 
@@ -121,7 +145,7 @@ async def market_data_consumer(manager: MartingaleManager) -> None:
                             msg = json.loads(raw)
                             stream = msg.get("stream", "")
                             data = msg.get("data", {})
-                            if stream.endswith("@bookTicker"):
+                            if stream.endswith("@bookTicker") and stream_suffix in ("bookTicker", "both"):
                                 bid = float(data.get("b", 0) or 0)
                                 ask = float(data.get("a", 0) or 0)
                                 bid_qty = float(data.get("B", 0) or 0)
@@ -129,21 +153,41 @@ async def market_data_consumer(manager: MartingaleManager) -> None:
                                 if bid and ask:
                                     manager.on_book_ticker(bid, ask, bid_qty, ask_qty)
                                     await manager.on_price_tick()
-                            elif stream.endswith("@aggTrade"):
+                            elif stream.endswith("@aggTrade") and stream_suffix in ("aggTrade", "both"):
                                 qty = float(data.get("q", 0) or 0)
                                 is_buyer_maker = bool(data.get("m", False))
                                 if qty > 0:
                                     manager.on_agg_trade(qty, is_buyer_maker)
                         except Exception as e:  # noqa: BLE001 - one bad tick must not kill the socket
-                            print(color(f"[market-ws] error processing message, skipping: {e}", RED))
+                            print(color(f"[market-ws:{label}] error processing message, skipping: {e}", RED))
                 finally:
                     wd_task.cancel()
         except Exception as e:  # noqa: BLE001 - this IS the reconnect boundary; anything
             # that escapes the websocket context should trigger backoff+retry, not a crash.
-            print(color(f"[market-ws] disconnected ({e}), retrying in {backoff:.1f}s ...", RED))
-        host_idx += 1
+            print(color(f"[market-ws:{label}] disconnected ({e}), retrying in {backoff:.1f}s ...", RED))
         await asyncio.sleep(backoff)
         backoff = min(backoff * 2, MAX_BACKOFF_SEC)
+
+
+async def market_data_consumer(manager: MartingaleManager) -> None:
+    """Entry point unchanged (still a single coroutine scheduled once from
+    dca2.py's asyncio.gather()) - internally routes to either the original
+    legacy combined connection (Testnet, unaffected by the migration) or
+    two independent routed connections (Live: /public for bookTicker,
+    /market for aggTrade), each reconnecting/backing off independently so
+    one stream category dropping never silently starves the other."""
+    if USE_TESTNET:
+        book_stream = f"{SYMBOL.lower()}@bookTicker/{SYMBOL.lower()}@aggTrade"
+        url = f"{WS_MARKET_BASE}/stream?streams={book_stream}"
+        await _run_single_market_stream(manager, url, label="testnet-combined", stream_suffix="both")
+        return
+
+    public_url = f"{WS_MARKET_BASE}/public/stream?streams={SYMBOL.lower()}@bookTicker"
+    market_url = f"{WS_MARKET_BASE}/market/stream?streams={SYMBOL.lower()}@aggTrade"
+    await asyncio.gather(
+        _run_single_market_stream(manager, public_url, label="public/bookTicker", stream_suffix="bookTicker"),
+        _run_single_market_stream(manager, market_url, label="market/aggTrade", stream_suffix="aggTrade"),
+    )
 
 
 # ============================================================================
@@ -156,7 +200,27 @@ async def userdata_consumer(client: RestClient, manager: MartingaleManager) -> N
     while True:
         try:
             listen_key = await client.create_listen_key()
-            url = f"{WS_USERDATA_BASE}/ws/{listen_key}"
+            # 2026-08 WS route-migration fix: the legacy raw path
+            # (wss://fstream.binance.com/ws/<listenKey>) was permanently
+            # decommissioned for LIVE user-data streams on 2026-04-23 -
+            # private channels stop pushing data on an unrouted connection
+            # even though the TCP/WebSocket handshake itself still
+            # succeeds (see module docstring). That is the confirmed
+            # primary root cause of the missed-fill/over-DCA bug this
+            # patch fixes: the process looked "connected" while
+            # ORDER_TRADE_UPDATE/ACCOUNT_UPDATE simply never arrived.
+            # Routed through /private with an explicit events= subscription
+            # on Live; Testnet (not covered by that migration notice) keeps
+            # the exact original URL/behavior, unchanged.
+            if USE_TESTNET:
+                url = f"{WS_USERDATA_BASE}/ws/{listen_key}"
+            else:
+                url = (
+                    f"{WS_USERDATA_BASE}/private/ws?listenKey={listen_key}"
+                    f"&events=ORDER_TRADE_UPDATE/ACCOUNT_UPDATE"
+                )
+            # Never log the full URL (it embeds the listenKey) - keep the
+            # existing generic "connecting ..." message exactly as before.
             print(color("[user-ws] connecting ...", GRAY))
             async with websockets.connect(url, ping_interval=15, ping_timeout=10) as ws:
                 print(color("[user-ws] connected - listening for order fills.", GREEN))
