@@ -1534,6 +1534,21 @@ class PositionState:
     last_entry_order_id: Optional[int] = None
     last_dca_order_id: Optional[int] = None
 
+    # 2026-08 hard DCA safety invariant: set instead of guessing dca_step=0
+    # whenever initialize_sync() cannot confidently recover the true
+    # dca_step for an already-open position (REST order-status lookup
+    # failed/ambiguous, or no matching DCA-state snapshot was found at
+    # all). While True, _manage_open_position()'s DCA trigger treats this
+    # position exactly like dca_step >= MAX_DCA_STEPS (no further DCA add
+    # is ever placed) regardless of the numeric dca_step value - but does
+    # NOT touch TP / Hard Stop / Smart Exit / Profit Lock / Max Hold Time,
+    # which all keep managing the position normally. Persisted in the
+    # DCA-state snapshot so it survives a restart instead of silently
+    # clearing. Only ever cleared by a fresh FLAT position (a new trade
+    # starts with dca_blocked=False, the dataclass default).
+    dca_blocked: bool = False
+    dca_block_reason: Optional[str] = None
+
     # -- partial TP / breakeven / trailing -------------------------------------
     partial_tp_done: bool = False
     breakeven_armed: bool = False
@@ -1654,6 +1669,18 @@ class MartingaleManager:
         self._last_synced_csv_hash: Dict[str, Optional[str]] = {}
 
         self._order_index: Dict[int, str] = {}
+        # 2026-08 hard DCA safety invariant: transient scratch field set by
+        # initialize_sync() (via _resolve_pending_order_via_rest()) when a
+        # pending order's REST resolution comes back ambiguous/failed
+        # ("unknown") - read and cleared by initialize_sync() itself in the
+        # same call before it finishes rebuilding PositionState, so the
+        # resulting position is marked dca_blocked=True instead of
+        # silently defaulting to dca_step=0 with DCA still allowed. Not
+        # persisted directly (PositionState.dca_blocked/dca_block_reason
+        # are the persisted fields); this is only the hand-off between the
+        # grace-block REST check and the rebuild further down in the same
+        # function call.
+        self._pending_dca_block_reason: Optional[str] = None
         self._rp_accum: Dict[int, float] = {}
         # 2026-08 realized-PnL/fee-accounting fix: actual Binance commission
         # ("n" field on each fill), accumulated per order_id exactly like
@@ -2028,6 +2055,13 @@ class MartingaleManager:
             # when it eventually closes.
             "position_fees_accum": self._position_fees_accum,
             "position_fees_reliable": self._position_fees_reliable,
+            # 2026-08 hard DCA safety invariant: persisted alongside every
+            # other DCA-state field, restored under the exact same
+            # side/qty/avg_entry_price/symbol match gate in
+            # initialize_sync() - so a conservative DCA block survives a
+            # restart instead of silently clearing back to "DCA allowed".
+            "dca_blocked": p.dca_blocked,
+            "dca_block_reason": p.dca_block_reason,
         }
 
     def _flat_dca_state_snapshot(self) -> dict:
@@ -2062,6 +2096,8 @@ class MartingaleManager:
             "accumulated_close_pnl": 0,
             "position_fees_accum": 0,
             "position_fees_reliable": True,
+            "dca_blocked": False,
+            "dca_block_reason": None,
         }
 
     async def save_dca_state(self, reason: str, payload_override: Optional[dict] = None) -> None:
@@ -4314,7 +4350,30 @@ class MartingaleManager:
 
         # --- ATR-adaptive DCA -----------------------------------------------------------
         if pct_move <= -dca_distance_pct:
-            if p.dca_step >= MAX_DCA_STEPS:
+            # 2026-08 hard DCA safety invariant (this condition only - the
+            # MAX_DCA_STEPS comparison itself, DCA trigger distance, and
+            # DCA sizing are all untouched): a position recovered with
+            # p.dca_blocked=True (see PositionState) - e.g. a REST
+            # order-status lookup during resync came back ambiguous/failed,
+            # or no matching DCA-state snapshot could be found for an
+            # already-open position - is treated exactly like
+            # dca_step >= MAX_DCA_STEPS for entry purposes: no further DCA
+            # add is ever placed, but every branch below (the existing
+            # max-dca-exhausted recovery-risk review / close, and - once
+            # this if-block is skipped entirely for an unblocked position -
+            # TP / Hard Stop / Smart Exit / Profit Lock / Max Hold Time)
+            # continues to manage the position exactly as before. This is
+            # the single point that turns "we don't know the true DCA step
+            # count" into "never add on top of an uncertain count", instead
+            # of silently defaulting to 0 and allowing more adds.
+            if p.dca_step >= MAX_DCA_STEPS or p.dca_blocked:
+                if p.dca_blocked and p.dca_step < MAX_DCA_STEPS:
+                    print(color(
+                        f"{now_str()} [dca-safety-block] side={p.side} "
+                        f"dca_step={p.dca_step}/{MAX_DCA_STEPS} reason="
+                        f"{p.dca_block_reason or 'unresolved recovery state'} - further DCA blocked "
+                        f"(treated as exhausted for entry purposes only).", RED,
+                    ))
                 # ================================================================
                 # [dca-risk-debug] TEMPORARY diagnostic only (2026-08 deep-DCA
                 # decision evidence gathering). Printed immediately before this
@@ -4693,6 +4752,167 @@ class MartingaleManager:
         ))
         await self._on_close_filled(fill_price, rp, order_id=order_id)
         return True
+
+    async def _resolve_pending_order_via_rest(
+        self, client: RestClient, order_id: int, role: str, context: str,
+    ) -> str:
+        """2026-08 REST order-status fallback (the primary fix for the
+        over-DCA/repeated-resync bug this patch addresses): called from
+        initialize_sync() ONLY after SYNC_PENDING_GRACE_SEC has already
+        elapsed with no WebSocket fill event for a pending entry/DCA/close
+        order. Queries this EXACT order_id via signed GET /fapi/v1/order
+        (never guesses from a position-snapshot comparison) and, on a
+        genuine FILLED result, routes the fill through the SAME
+        _on_entry_filled() / _on_close_filled() / _apply_partial_close()
+        functions the live WebSocket path uses - so dca_step/avg_entry/
+        total_qty advance exactly once, through exactly one code path,
+        regardless of whether the fill was learned about via WebSocket or
+        this REST fallback.
+
+        Idempotency: if `order_id` is no longer in self._order_index, it
+        was already consumed by handle_order_update() (which only pops an
+        order_id once its fill has actually been processed) - possibly a
+        moment ago, possibly by an earlier call to this same method.
+        Returns "filled" immediately without processing anything a second
+        time. This is the same idempotency guarantee handle_order_update()
+        already relies on for a duplicate/late WebSocket event.
+
+        Returns exactly one of:
+          "filled"           - genuinely FILLED, and (unless already
+                                processed) has now been routed through the
+                                normal fill path exactly once.
+          "pending"           - still NEW/PARTIALLY_FILLED on Binance's
+                                side; caller must keep waiting, not
+                                resync/rebuild, not place another DCA.
+          "resolved_no_fill"  - CANCELED/EXPIRED/REJECTED; this order
+                                never added anything to the position -
+                                caller may clear pending bookkeeping and
+                                resync normally (no DCA-step impact).
+          "unknown"           - REST error, unknown order, missing/zero
+                                fill data, or any other ambiguous result.
+                                Caller MUST NOT reset dca_step to 0 or
+                                allow further DCA - see
+                                PositionState.dca_blocked, which the
+                                caller sets on this outcome.
+        """
+        if order_id not in self._order_index:
+            return "filled"
+        try:
+            resp = await client.get_order(self.symbol, order_id)
+        except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+            print(color(
+                f"{now_str()} [sync:{context}] [rest-recovery] GET /fapi/v1/order failed for "
+                f"order_id={order_id} role={role}: {e}. Cannot confirm this order's outcome - "
+                f"treating as unresolved rather than assuming it's safe to reset/continue.", RED,
+            ))
+            return "unknown"
+
+        status = resp.get("status")
+        print(color(
+            f"{now_str()} [sync:{context}] [rest-recovery] order_id={order_id} role={role} "
+            f"status={status} (REST fallback after {SYNC_PENDING_GRACE_SEC}s grace with no "
+            f"WebSocket fill event).", CYAN,
+        ))
+
+        if status == "FILLED":
+            try:
+                fills = await client.get_user_trades(self.symbol, order_id=order_id, limit=100)
+            except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+                fills = []
+                print(color(
+                    f"{now_str()} [sync:{context}] [rest-recovery] order_id={order_id} FILLED but "
+                    f"userTrades lookup failed ({e}) - falling back to the order's own avgPrice/"
+                    f"executedQty; this fill's commission will use the TAKER_FEE_RATE estimate "
+                    f"instead of the exact figure.", YELLOW,
+                ))
+
+            fill_qty = float(resp.get("executedQty") or 0.0)
+            fill_price = float(resp.get("avgPrice") or 0.0)
+            total_rp = 0.0
+            total_fee = 0.0
+            fee_reliable_this_fill = True
+            if fills:
+                summed_qty = sum(float(t.get("qty", 0.0) or 0.0) for t in fills)
+                if summed_qty > 0:
+                    fill_qty = summed_qty
+                    notional = sum(
+                        float(t.get("qty", 0.0) or 0.0) * float(t.get("price", 0.0) or 0.0) for t in fills
+                    )
+                    fill_price = safe_div(notional, fill_qty, fill_price)
+                total_rp = sum(float(t.get("realizedPnl", 0.0) or 0.0) for t in fills)
+                for t in fills:
+                    c = float(t.get("commission", 0.0) or 0.0)
+                    if t.get("commissionAsset") in (None, "USDT"):
+                        total_fee += c
+                    else:
+                        fee_reliable_this_fill = False
+            else:
+                fee_reliable_this_fill = False
+
+            if fill_qty <= 0 or fill_price <= 0:
+                print(color(
+                    f"{now_str()} [sync:{context}] [rest-recovery] order_id={order_id} reported "
+                    f"FILLED but returned no usable qty/price - treating as unresolved, blocking "
+                    f"further DCA rather than guessing at a fill that can't be sized.", RED,
+                ))
+                return "unknown"
+
+            role_actual = self._order_index.pop(order_id, role)
+            # Mirrors handle_order_update()'s existing per-role fee-accumulator
+            # reset/breakdown sequence exactly (see that function), so a
+            # REST-recovered fill and a live-WebSocket fill leave
+            # self._position_fees_accum/_entry_commission_accum/etc. in
+            # identical states either way.
+            if role_actual == "initial":
+                self._position_fees_accum = 0.0
+                self._position_fees_reliable = True
+                self._entry_commission_accum = 0.0
+                self._dca_commission_accum = 0.0
+                self._exit_commission_accum = 0.0
+            if not fee_reliable_this_fill:
+                self._position_fees_reliable = False
+            self._position_fees_accum += total_fee
+            if role_actual == "initial":
+                self._entry_commission_accum += total_fee
+            elif role_actual == "dca":
+                self._dca_commission_accum += total_fee
+            elif role_actual in ("close", "partial_close"):
+                self._exit_commission_accum += total_fee
+
+            if role_actual in ("initial", "dca"):
+                print(color(
+                    f"{now_str()} [fill-trace] path=rest_recovery order_id={order_id} "
+                    f"reason=grace_expired_no_ws_event -> routing to _on_entry_filled() "
+                    f"(role={role_actual})", CYAN,
+                ))
+                await self._on_entry_filled(role_actual, fill_price, fill_qty, order_id=order_id)
+            elif role_actual == "close":
+                print(color(
+                    f"{now_str()} [fill-trace] path=rest_recovery order_id={order_id} "
+                    f"reason=grace_expired_no_ws_event -> routing to _on_close_filled()", CYAN,
+                ))
+                await self._on_close_filled(fill_price, total_rp, order_id=order_id)
+            elif role_actual == "partial_close":
+                print(color(
+                    f"{now_str()} [fill-trace] path=rest_recovery order_id={order_id} "
+                    f"reason=grace_expired_no_ws_event -> routing to _apply_partial_close()", CYAN,
+                ))
+                await self._apply_partial_close(
+                    fill_qty, fill_price, actual_rp=total_rp, actual_fee=total_fee,
+                )
+            return "filled"
+
+        if status in ("NEW", "PARTIALLY_FILLED"):
+            return "pending"
+
+        if status in ("CANCELED", "EXPIRED", "REJECTED"):
+            self._order_index.pop(order_id, None)
+            return "resolved_no_fill"
+
+        # Any other/unexpected status string - never observed before, so
+        # treated exactly like a REST failure: assume nothing about this
+        # order rather than guessing.
+        return "unknown"
 
     def _prune_unmatched_fills(self) -> None:
         """2026-08 fill-tracking race fix: drops any buffered unmatched-fill
@@ -5354,6 +5574,54 @@ async def initialize_sync(
                     f"for the fill event instead of resetting early.", GRAY,
                 ))
                 return
+            # 2026-08 REST order-status fallback (the primary fix for the
+            # missed-fill/over-DCA bug): grace has elapsed with no
+            # WebSocket fill event AND the exchange now shows flat, which
+            # is exactly the shape of a missed CLOSE fill (or, for a fresh
+            # ENTERING order, a rejected/never-placed entry). Resolve the
+            # exact pending order_id via REST before assuming anything -
+            # never fall straight to "reset to FLAT" (which would silently
+            # discard dca_step for an ENTERING/DCA_PENDING order that
+            # actually filled but whose event was lost) or straight to
+            # "genuine mismatch" without checking.
+            if p.pending_order_id is not None:
+                resolution = await manager._resolve_pending_order_via_rest(
+                    client, p.pending_order_id, p.pending_role or "unknown", context,
+                )
+                if resolution == "filled":
+                    # Already routed through _on_entry_filled()/_on_close_filled()
+                    # inside the resolver - position state has already advanced;
+                    # nothing further to do this cycle.
+                    return
+                if resolution == "pending":
+                    print(color(
+                        f"{now_str()} [sync:{context}] order_id={p.pending_order_id} still "
+                        f"NEW/PARTIALLY_FILLED per REST - continuing to wait, no resync/DCA yet.",
+                        GRAY,
+                    ))
+                    return
+                if resolution == "unknown":
+                    # Exchange currently shows FLAT here - an ambiguous
+                    # REST result gives no basis to decide whether this
+                    # order filled, was rejected, or is still in flight.
+                    # Do NOT reset to FLAT (that would let a brand new
+                    # entry be evaluated immediately while this order's
+                    # true outcome is still unknown - risking two
+                    # concurrent, conflicting positions) and do NOT clear
+                    # pending_order_id/pending_role - leave state exactly
+                    # as-is and retry this same REST check on the next
+                    # periodic poll, exactly like the "pending" case.
+                    print(color(
+                        f"{now_str()} [sync:{context}] order_id={p.pending_order_id} could not be "
+                        f"confirmed via REST while exchange shows flat - leaving state as-is, "
+                        f"will retry next poll rather than guessing.", RED,
+                    ))
+                    return
+                # resolution == "resolved_no_fill" (CANCELED/EXPIRED/REJECTED):
+                # this order never added anything - clear pending bookkeeping
+                # and fall through to the normal flat/reset handling below.
+                p.pending_order_id = None
+                p.pending_role = None
         # 2026-08 DCA resync-race fix (exchange-flat variant): an initial
         # fill can move status straight to "OPEN" (see the OPEN-status
         # grace block further below, which this mirrors) BEFORE Binance's
@@ -5425,6 +5693,47 @@ async def initialize_sync(
                 f"grace) - waiting for its FILLED event instead of resyncing early.", GRAY,
             ))
             return
+        # 2026-08 REST order-status fallback (this exact case is the
+        # observed live failure this patch fixes): grace has elapsed,
+        # exchange qty/avg_entry has ALREADY moved (a DCA/entry fill did
+        # happen on Binance's side) but this process never saw the
+        # ORDER_TRADE_UPDATE event for it. Resolve the exact pending
+        # order_id via REST BEFORE ever treating this as a "snapshot
+        # doesn't match exchange" mismatch - a confirmed FILLED here
+        # advances dca_step through the normal idempotent fill path
+        # instead of falling through to the full rebuild below (which
+        # would otherwise only trust dca_step from a DCA-state snapshot
+        # saved BEFORE this exact fill, i.e. one step stale, or reset it
+        # to 0 entirely if no snapshot matches).
+        if p.pending_order_id is not None:
+            resolution = await manager._resolve_pending_order_via_rest(
+                client, p.pending_order_id, p.pending_role or "unknown", context,
+            )
+            if resolution == "filled":
+                return  # already advanced via _on_entry_filled() inside the resolver
+            if resolution == "pending":
+                print(color(
+                    f"{now_str()} [sync:{context}] order_id={p.pending_order_id} still "
+                    f"NEW/PARTIALLY_FILLED per REST - continuing to wait, no resync/DCA yet.",
+                    GRAY,
+                ))
+                return
+            if resolution == "unknown":
+                print(color(
+                    f"{now_str()} [sync:{context}] [dca-safety-block] order_id="
+                    f"{p.pending_order_id} could not be confirmed via REST - this position will "
+                    f"be resynced from the exchange but further DCA is blocked rather than "
+                    f"resetting dca_step to 0.", RED,
+                ))
+                manager._pending_dca_block_reason = (
+                    f"REST resolution of order_id={p.pending_order_id} was ambiguous/failed"
+                )
+            # resolution == "resolved_no_fill": this order never filled -
+            # clear pending bookkeeping and fall through to the normal
+            # rebuild below using whatever the exchange actually reports
+            # (unchanged position if it never filled at all).
+            p.pending_order_id = None
+            p.pending_role = None
 
     # 2026-08 CLOSING-resync opened_at fix (this branch only - every other
     # branch of this function is untouched): a position that is CLOSING
@@ -5460,13 +5769,58 @@ async def initialize_sync(
         and entry_price > 0
         and abs(p.avg_entry_price - entry_price) / entry_price < 0.001
     ):
-        print(color(
-            f"{now_str()} [sync:{context}] exchange still shows {side} qty={qty} but a close "
-            f"order (id={p.pending_order_id}) is already pending for this exact position "
-            f"(side/qty/avg_entry all match) - its FILLED event just hasn't arrived yet. "
-            f"Leaving local state (including opened_at) untouched instead of rebuilding.", GRAY,
-        ))
-        return
+        # 2026-08 REST order-status fallback: unchanged quiet-wait behavior
+        # while inside grace (still the common, expected case - a close
+        # fill is normally only milliseconds to a couple of seconds away).
+        # Only once SYNC_PENDING_GRACE_SEC has elapsed with no
+        # ORDER_TRADE_UPDATE for this exact close order is a REST lookup
+        # attempted - this is what lets a missed close FILLED event be
+        # processed through the normal _on_close_filled() bookkeeping
+        # (trade logged, DCA snapshot deleted, position reset to FLAT)
+        # instead of only ever being caught later by
+        # reconcile_trade_history_from_exchange()'s exit_reason=
+        # reconciled_from_exchange fallback.
+        age = time.time() - p.pending_order_ts
+        if age < SYNC_PENDING_GRACE_SEC:
+            print(color(
+                f"{now_str()} [sync:{context}] exchange still shows {side} qty={qty} but a close "
+                f"order (id={p.pending_order_id}) is already pending for this exact position "
+                f"(side/qty/avg_entry all match) - its FILLED event just hasn't arrived yet. "
+                f"Leaving local state (including opened_at) untouched instead of rebuilding.", GRAY,
+            ))
+            return
+        resolution = await manager._resolve_pending_order_via_rest(
+            client, p.pending_order_id, p.pending_role or "close", context,
+        )
+        if resolution == "filled":
+            return  # already routed through _on_close_filled() inside the resolver
+        if resolution == "pending":
+            print(color(
+                f"{now_str()} [sync:{context}] close order_id={p.pending_order_id} still "
+                f"NEW/PARTIALLY_FILLED per REST - continuing to wait.", GRAY,
+            ))
+            return
+        if resolution == "unknown":
+            # Ambiguous REST result for a close order: never force-close
+            # dca_step/state here - just leave status=CLOSING untouched
+            # (no DCA can fire while CLOSING regardless) and let the next
+            # periodic poll retry this same REST check. Risk-reducing exits
+            # (Hard Stop/emergency close) are unaffected since they only
+            # ever act on OPEN positions, and this position was already in
+            # the middle of exiting.
+            print(color(
+                f"{now_str()} [sync:{context}] close order_id={p.pending_order_id} could not be "
+                f"confirmed via REST - leaving CLOSING state as-is, will retry next poll.", YELLOW,
+            ))
+            return
+        # resolution == "resolved_no_fill": the close order itself was
+        # CANCELED/EXPIRED/REJECTED (never filled) - clear pending
+        # bookkeeping and fall through to the normal rebuild below so
+        # _manage_open_position() can evaluate a fresh close attempt on
+        # this still-open position instead of being stuck in CLOSING
+        # forever waiting for an order that will never fill.
+        p.pending_order_id = None
+        p.pending_role = None
 
     # 2026-08 DCA resync-race fix (this block only - every other branch of
     # this function, including the ENTERING/DCA_PENDING grace above and
@@ -5543,6 +5897,16 @@ async def initialize_sync(
     restored_last_dca_order_id: Optional[int] = None
     restored_position_fees_accum: float = 0.0
     restored_position_fees_reliable: bool = True
+    # 2026-08 hard DCA safety invariant: conservative default is BLOCKED,
+    # not "DCA allowed" - only cleared below once a snapshot's own
+    # side/qty/avg_entry_price genuinely match what the exchange reports
+    # right now (the same trusted-snapshot gate every other restored field
+    # already uses). A brand-new position (no snapshot needed at all -
+    # entry_price/qty came straight from `row`, no prior DCA activity
+    # possible) also clears this immediately below, since there is nothing
+    # to lose track of yet.
+    restored_dca_blocked = True
+    restored_dca_block_reason: Optional[str] = "no matching DCA-state snapshot restored for this position"
     snapshot_restored = False
     snapshot = await manager.load_dca_state_snapshot()
 
@@ -5618,6 +5982,14 @@ async def initialize_sync(
             except (TypeError, ValueError):
                 restored_position_fees_accum = 0.0
             restored_position_fees_reliable = bool(snapshot.get("position_fees_reliable", True))
+            # 2026-08 hard DCA safety invariant: a snapshot that passes the
+            # exact same side/qty/avg_entry_price/symbol trust gate every
+            # other field above already relies on is trusted for
+            # dca_blocked/dca_block_reason too - restores whatever this
+            # trade's own prior state was (normally False/None) instead of
+            # the conservative True default this rebuild started with.
+            restored_dca_blocked = bool(snapshot.get("dca_blocked", False))
+            restored_dca_block_reason = snapshot.get("dca_block_reason")
             # 2026-08 CLOSING-resync opened_at fix: restore the real entry
             # timestamp from the snapshot (present on any snapshot saved by
             # the fixed _dca_state_snapshot() - older snapshots predating
@@ -5716,6 +6088,10 @@ async def initialize_sync(
                     YELLOW,
                 ))
         else:
+            restored_dca_block_reason = (
+                "DCA-state snapshot found but does not match exchange position "
+                "(side/qty/avg_entry/symbol)"
+            )
             print(color(
                 f"{now_str()} [sync:{context}] [dca-state] snapshot found but does not match "
                 f"exchange position (side/qty/avg_entry/symbol) - ignoring.", YELLOW,
@@ -5744,6 +6120,9 @@ async def initialize_sync(
         # logs rather than happening quietly. Does not change what happens
         # next (still falls through to the same rebuild below, dca_step=0)
         # - this is a diagnostic addition only.
+        restored_dca_block_reason = (
+            "no local or GitHub DCA-state snapshot found for this open position"
+        )
         print(color(
             f"{now_str()} [sync:{context}] [dca-state] WARNING snapshot missing - dca_step reset risk "
             f"(exchange shows an open {side} qty={qty} position but no local or GitHub DCA-state "
@@ -5756,6 +6135,24 @@ async def initialize_sync(
             "[DCA RECOVERY WARNING]\n"
             "history unavailable, using conservative fallback",
             YELLOW,
+        ))
+
+    # 2026-08 hard DCA safety invariant: a REST resolution earlier in THIS
+    # SAME call that came back "unknown" (ambiguous/failed order-status
+    # lookup) always wins over whatever the snapshot match above decided -
+    # even a snapshot that matched side/qty/avg_entry can't vouch for a
+    # DCA step whose most recent add this process still can't confirm.
+    # Consumed (reset to None) here so it can never leak into an unrelated
+    # later call.
+    if manager._pending_dca_block_reason is not None:
+        restored_dca_blocked = True
+        restored_dca_block_reason = manager._pending_dca_block_reason
+        manager._pending_dca_block_reason = None
+    if restored_dca_blocked:
+        print(color(
+            f"{now_str()} [sync:{context}] [dca-safety-block] DCA will remain blocked for this "
+            f"position after resync: {restored_dca_block_reason}. TP / Hard Stop / Smart Exit / "
+            f"Profit Lock / Max Hold Time are unaffected.", RED,
         ))
 
     print(color(
@@ -5803,6 +6200,16 @@ async def initialize_sync(
         pending_order_id=restored_pending_order_id,
         pending_role=restored_pending_role,
         pending_order_ts=time.time() if restored_pending_order_id is not None else 0.0,
+        # 2026-08 hard DCA safety invariant: this is the actual enforcement
+        # point - all the restored_dca_blocked/restored_dca_block_reason
+        # computation above only matters if it lands on the rebuilt
+        # PositionState itself. Without this, the entire safety-block
+        # decision above would be computed and logged but silently
+        # discarded, leaving the rebuilt position free to DCA again on an
+        # unrecoverable/blocked dca_step - exactly the bug this patch
+        # fixes.
+        dca_blocked=restored_dca_blocked,
+        dca_block_reason=restored_dca_block_reason,
     )
     # Keep the peak-save throttle consistent with whatever peak was just
     # restored (or reset to 0.0 on a fresh/mismatched snapshot), so the
