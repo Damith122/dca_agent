@@ -1617,7 +1617,6 @@ class MartingaleManager:
         self._last_max_hold_review_log_ts: float = 0.0  # throttles the Max Hold Time V2 "kept alive" diagnostic line
         self._last_max_hold_fee_net_review_log_ts: float = 0.0  # throttles the [max-hold-review] fee-net meaningful_loss diagnostic line
         self._last_max_dca_exhausted_review_log_ts: float = 0.0  # throttles the [max-dca-exhausted-review] diagnostic line
-        self._last_dca_risk_debug_exhausted_log_ts: float = 0.0  # throttles the [dca-risk-debug] exit_candidate=max_dca_exhausted diagnostic line (2026-08 Railway rate-limit fix)
         self._last_dca_spacing_log_ts: float = 0.0  # throttles the [dca-spacing] diagnostic line
         self._last_max_hold_dca_defer_log_ts: float = 0.0  # throttles the Max Hold Time V2 "DCA opportunity available" diagnostic line
         self._max_hold_dca_defer_pending: bool = False  # set True when Max Hold Time V2 defers for a DCA opportunity this tick; consumed by _on_entry_filled() to log "[dca] executed after max-hold defer"
@@ -3078,23 +3077,6 @@ class MartingaleManager:
             return True
         return False
 
-    def _should_log_dca_risk_debug_exhausted(self, interval_sec: float = 30.0) -> bool:
-        """Throttle for the [dca-risk-debug] exit_candidate=max_dca_exhausted
-        diagnostic line (2026-08 Railway rate-limit fix - this line was
-        previously unconditional and fired on almost every aggTrade tick
-        while dca_step was exhausted, ~1,982 lines in ~14s observed on
-        Live, causing Railway to drop other log lines including fill/close/
-        Profit Lock output). Debugging only, does not affect the
-        recovery-risk decision itself. Only throttles repeated DEFER ticks;
-        the caller always logs the CLOSE decision immediately regardless
-        (see its own condition), same pattern as
-        _should_log_max_dca_exhausted_review above."""
-        now = time.time()
-        if now - self._last_dca_risk_debug_exhausted_log_ts >= interval_sec:
-            self._last_dca_risk_debug_exhausted_log_ts = now
-            return True
-        return False
-
     def _should_log_dca_spacing(self, interval_sec: float = 15.0) -> bool:
         """Throttle for the [dca-spacing] diagnostic line (2026-08 DCA
         re-fire spacing fix) - debugging only, does not affect the spacing
@@ -4427,22 +4409,24 @@ class MartingaleManager:
                         f"(treated as exhausted for entry purposes only).", RED,
                     ))
                 # ================================================================
-                # [dca-risk-debug] TEMPORARY diagnostic only (2026-08 deep-DCA
-                # decision evidence gathering). Printed immediately before this
-                # exact close_position() call, using only values already
-                # computed above in this function (pct_move, dynamic_tp_pct,
-                # dca_distance_pct) plus a direct read of self.last_confidence/
-                # self.last_regime and the existing estimate_net_pnl_usdt()
-                # helper - no new formula, no threshold, no control flow. Does
-                # not gate, delay, or otherwise affect the close_position()
-                # call immediately below it in any way.
+                # 2026-08 - the [dca-risk-debug] exit_candidate=max_dca_exhausted
+                # TEMPORARY diagnostic print that used to live here has been
+                # fully removed (2026-08 Railway rate-limit fix, take 2). A
+                # 30s throttle was tried first but Live still showed ~2,942
+                # of these lines in ~25s (every aggTrade tick re-entered this
+                # branch faster than the throttle window could suppress at
+                # that tick rate), which kept causing Railway to rate-limit
+                # and drop other log lines (fill/close/Profit Lock output).
+                # This print never affected the recovery-risk decision or
+                # any trading behavior - it was diagnostic-only - so it is
+                # simply deleted rather than throttled again. The
+                # [max-dca-exhausted-review] line just below (with its own
+                # existing 30s throttle, and its own immediate-on-CLOSE
+                # logging) is unchanged and remains the log line for this
+                # decision.
                 # ================================================================
                 _dbg_conf = self.last_confidence
                 _dbg_regime = self.last_regime
-                _dbg_notional = (p.total_qty * p.avg_entry_price) if p.avg_entry_price else 0.0
-                _dbg_adverse_to_tp = (abs(pct_move) / dynamic_tp_pct) if dynamic_tp_pct > 0 else float("nan")
-                _dbg_dca_to_tp = (dca_distance_pct / dynamic_tp_pct) if dynamic_tp_pct > 0 else float("nan")
-                _dbg_est_net_pnl = self.estimate_net_pnl_usdt(price)
                 # ================================================================
                 # 2026-08 Fix 2 - max_dca_exhausted recovery-risk review (this
                 # block only - DCA sizing/spacing/distance formula,
@@ -4467,14 +4451,6 @@ class MartingaleManager:
                 # voting on position state rather than independent market
                 # evidence - it remains implicit context (this whole code
                 # path only runs when it's true) rather than a signal.
-                #
-                # 2026-08 - moved ABOVE the [dca-risk-debug] print (this
-                # reordering only - the formulas/values themselves are
-                # byte-for-byte unchanged) so the decision (DEFER vs CLOSE)
-                # is known before deciding whether to print, letting
-                # [dca-risk-debug] use the exact same "throttle DEFER,
-                # always print CLOSE immediately" pattern already used by
-                # [max-dca-exhausted-review] just below it.
                 # ================================================================
                 velocity_for_exhausted_review = 0.0
                 if self.prev_price and self.current_price:
@@ -4497,36 +4473,6 @@ class MartingaleManager:
                 }
                 exhausted_agree_count = sum(1 for v in exhausted_recovery_signals.values() if v)
                 exhausted_low_probability_recovery = exhausted_agree_count >= MAX_HOLD_TIME_RECOVERY_MIN_AGREE
-
-                # 2026-08 Railway rate-limit fix (this condition only - the
-                # label, fields, field order, and values of the print below
-                # are byte-for-byte unchanged): this line was previously
-                # unconditional and fired on almost every aggTrade tick
-                # while dca_step was exhausted (~1,982 lines in ~14s
-                # observed on Live), which caused Railway to start dropping
-                # log lines ("Railway rate limit reached", "Messages
-                # dropped"), including unrelated fill/close/Profit Lock
-                # output. Now throttled to at most once per 30s while the
-                # decision is DEFER, same pattern as
-                # [max-dca-exhausted-review] just below - but still prints
-                # immediately, bypassing the throttle, the moment the
-                # decision is actually CLOSE.
-                if exhausted_low_probability_recovery or self._should_log_dca_risk_debug_exhausted():
-                    print(color(
-                        f"[dca-risk-debug] exit_candidate=max_dca_exhausted side={p.side} "
-                        f"dca_step={p.dca_step}/{MAX_DCA_STEPS} avg_entry={p.avg_entry_price:.2f} "
-                        f"price={price:.2f} total_qty={p.total_qty:.6f} notional={_dbg_notional:.2f} "
-                        f"pct_move={pct_move*100:.4f}% dynamic_tp={dynamic_tp_pct*100:.4f}% "
-                        f"dca_distance={dca_distance_pct*100:.4f}% "
-                        f"adverse_to_tp_ratio={_dbg_adverse_to_tp:.3f} dca_to_tp_ratio={_dbg_dca_to_tp:.3f} "
-                        f"regime={_dbg_regime.regime} atr_pct={_dbg_regime.atr_pct:.5f} "
-                        f"atr_ratio={_dbg_regime.atr_ratio:.2f} risk={_dbg_conf.risk_score:.2f} "
-                        f"trend_direction={_dbg_conf.trend_direction} "
-                        f"trend_confidence={_dbg_conf.trend_confidence:.2f} "
-                        f"confidence={_dbg_conf.confidence_score:.2f} "
-                        f"profit_lock_active={p.profit_lock_active} est_net_pnl={_dbg_est_net_pnl:.4f} "
-                        f"dca_exhausted=True", CYAN,
-                    ))
 
                 if exhausted_low_probability_recovery or self._should_log_max_dca_exhausted_review():
                     print(color(
