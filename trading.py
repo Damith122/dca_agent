@@ -370,6 +370,30 @@ def color(text: str, code: str) -> str:
 GREEN, RED, YELLOW, CYAN, GRAY, BOLD, MAGENTA, BLUE = "32", "31", "33", "36", "90", "1", "35", "34"
 
 
+def sanitize_recovered_dca_step(raw_step) -> Tuple[int, Optional[str]]:
+    """Return a recovered DCA step inside the configured hard limit.
+
+    A non-None reason means the input was invalid/out of range. Snapshot
+    callers use that reason as a conservative DCA safety block instead of
+    treating the clamped number as proof that more exposure is safe.
+    """
+    try:
+        numeric = float(raw_step or 0)
+        if not math.isfinite(numeric) or not numeric.is_integer():
+            raise ValueError
+        parsed = int(numeric)
+    except (TypeError, ValueError, OverflowError):
+        return 0, f"recovered dca_step={raw_step!r} is not a valid integer"
+
+    clamped = min(max(parsed, 0), MAX_DCA_STEPS)
+    if clamped != parsed:
+        return clamped, (
+            f"recovered dca_step={parsed} is outside the configured range "
+            f"0..{MAX_DCA_STEPS}; clamped to {clamped}"
+        )
+    return clamped, None
+
+
 # ============================================================================
 # PROFIT LOCK (new, position-level, DCA-aware - see module docstring) -------
 # PROFIT_LOCK_ACTIVATION_USDT / PROFIT_LOCK_RATIO now live in config.py
@@ -3376,6 +3400,27 @@ class MartingaleManager:
                 f"flight; re-evaluating against current state next tick instead.", YELLOW,
             ))
             return
+        # Final order-boundary enforcement for the hard DCA limit. Normal
+        # management already stops before calling this function at the
+        # limit; this also protects a delayed/stale direct call.
+        current_step, current_step_safety_reason = sanitize_recovered_dca_step(
+            self.position.dca_step
+        )
+        self.position.dca_step = current_step
+        if current_step_safety_reason is not None:
+            self.position.dca_blocked = True
+            self.position.dca_block_reason = current_step_safety_reason
+        if step > 0 and (
+            step > MAX_DCA_STEPS
+            or current_step >= MAX_DCA_STEPS
+            or self.position.dca_blocked
+        ):
+            print(color(
+                f"{now_str()} [dca-safety-block] refusing DCA step={step}: "
+                f"current_step={self.position.dca_step}/{MAX_DCA_STEPS} "
+                f"blocked={self.position.dca_blocked}; no order submitted.", RED,
+            ))
+            return
         notional = self.notional_for_step(step, size_mult)
         price = self.current_price
         if price is None or price <= 0:
@@ -5422,7 +5467,24 @@ class MartingaleManager:
         self.position.total_qty = total_qty
         self.position.original_qty = total_qty
         if role == "dca":
-            self.position.dca_step += 1
+            prior_step, prior_step_safety_reason = sanitize_recovered_dca_step(
+                self.position.dca_step
+            )
+            if prior_step >= MAX_DCA_STEPS:
+                # Apply the real fill economics once, but never let a late
+                # or unexpected fill turn 2/2 into 3/2 or reopen capacity.
+                self.position.dca_step = MAX_DCA_STEPS
+                self.position.dca_blocked = True
+                self.position.dca_block_reason = (
+                    prior_step_safety_reason
+                    or f"DCA fill order_id={order_id} arrived while already at "
+                    f"MAX_DCA_STEPS={MAX_DCA_STEPS}"
+                )
+            else:
+                self.position.dca_step = min(prior_step + 1, MAX_DCA_STEPS)
+                if prior_step_safety_reason is not None:
+                    self.position.dca_blocked = True
+                    self.position.dca_block_reason = prior_step_safety_reason
             self.position.last_dca_order_id = order_id
             # 2026-08 DCA re-fire spacing fix: anchor last_dca_price to the
             # ACTUAL fill price (already available here, from Binance's
@@ -5991,6 +6053,8 @@ async def initialize_sync(
         and p.side == side
         and p.avg_entry_price is not None
         and abs(p.total_qty - qty) < max(manager.filters.step_size, 1e-9)
+        and entry_price > 0
+        and abs(p.avg_entry_price - entry_price) / entry_price < 0.001
     )
     if already_synced:
         # 2026-08 position_sync_ready timing fix (this line only): local
@@ -6239,6 +6303,11 @@ async def initialize_sync(
     restored_dca_blocked = True
     restored_dca_block_reason: Optional[str] = "no matching DCA-state snapshot restored for this position"
     snapshot_restored = False
+    # A confirmed OPEN mismatch is now entering the authoritative rebuild
+    # path, which contains awaits. Earlier failure/grace/pending/ambiguous
+    # paths have already returned above; only this actual rebuild window
+    # temporarily withholds provisional-economics-dependent actions.
+    manager.position_sync_ready = False
     snapshot = await manager.load_dca_state_snapshot()
 
     # 2026-08 DCA state recovery hardening: strict FLAT-snapshot
@@ -6297,7 +6366,9 @@ async def initialize_sync(
             and abs(float(snap_avg_entry) - entry_price) / entry_price < 0.001
         )
         if snap_side == side and qty_ok and price_ok and symbol_ok:
-            restored_dca_step = int(snapshot.get("dca_step", 0) or 0)
+            restored_dca_step, recovered_step_safety_reason = sanitize_recovered_dca_step(
+                snapshot.get("dca_step", 0)
+            )
             restored_last_dca_price = snapshot.get("last_dca_price")
             preserved_profit_lock_active = bool(snapshot.get("profit_lock_active", False))
             preserved_peak_unrealized_pnl = float(snapshot.get("peak_unrealized_pnl", 0.0) or 0.0)
@@ -6321,6 +6392,9 @@ async def initialize_sync(
             # the conservative True default this rebuild started with.
             restored_dca_blocked = bool(snapshot.get("dca_blocked", False))
             restored_dca_block_reason = snapshot.get("dca_block_reason")
+            if recovered_step_safety_reason is not None:
+                restored_dca_blocked = True
+                restored_dca_block_reason = recovered_step_safety_reason
             # 2026-08 CLOSING-resync opened_at fix: restore the real entry
             # timestamp from the snapshot (present on any snapshot saved by
             # the fixed _dca_state_snapshot() - older snapshots predating

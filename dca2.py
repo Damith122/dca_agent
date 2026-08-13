@@ -408,6 +408,7 @@ from trading import (
     PerformanceStats,
     PositionState,
     MartingaleManager,
+    sanitize_recovered_dca_step,
     initialize_sync,
     BrainV2,
 )
@@ -512,6 +513,26 @@ async def load_dca_state(manager: MartingaleManager) -> None:
 
         candidate = PositionState(**kwargs)
 
+        candidate.dca_step, recovered_step_safety_reason = sanitize_recovered_dca_step(
+            candidate.dca_step
+        )
+        if recovered_step_safety_reason is not None:
+            candidate.dca_blocked = True
+            candidate.dca_block_reason = recovered_step_safety_reason
+
+        if candidate.status == "FLAT" and (
+            candidate.side is not None
+            or candidate.total_qty != 0
+            or candidate.avg_entry_price not in (None, 0)
+            or candidate.dca_step != 0
+            or candidate.entries
+        ):
+            print(color(
+                "[dca-state] REJECTED snapshot claiming FLAT with non-flat economics - "
+                "starting from a clean FLAT state.", RED,
+            ))
+            return
+
         # 2026-08 invalid-OPEN-snapshot validation (this block only): an
         # OPEN/DCA_PENDING/CLOSING snapshot is only trusted if its core
         # economics are actually self-consistent - valid side, positive
@@ -526,12 +547,20 @@ async def load_dca_state(manager: MartingaleManager) -> None:
         # whereas trusting a broken OPEN snapshot is not.
         if candidate.status in ("OPEN", "DCA_PENDING", "CLOSING"):
             entries_sum = sum(qty for _, qty in candidate.entries) if candidate.entries else 0.0
+            qty_tolerance = max(manager.filters.step_size, 1e-9) * 2
+            entries_consistent = (
+                not candidate.entries
+                or (
+                    all(float(price) > 0 and float(qty) > 0 for price, qty in candidate.entries)
+                    and abs(entries_sum - candidate.total_qty) <= qty_tolerance
+                )
+            )
             valid_open = (
                 candidate.side in ("LONG", "SHORT")
                 and candidate.avg_entry_price is not None
                 and candidate.avg_entry_price > 0
                 and candidate.total_qty > 0
-                and (not candidate.entries or entries_sum > 0)
+                and entries_consistent
             )
             if not valid_open:
                 print(color(
