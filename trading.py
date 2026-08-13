@@ -1620,6 +1620,7 @@ class MartingaleManager:
         self._last_dca_spacing_log_ts: float = 0.0  # throttles the [dca-spacing] diagnostic line
         self._last_max_hold_dca_defer_log_ts: float = 0.0  # throttles the Max Hold Time V2 "DCA opportunity available" diagnostic line
         self._max_hold_dca_defer_pending: bool = False  # set True when Max Hold Time V2 defers for a DCA opportunity this tick; consumed by _on_entry_filled() to log "[dca] executed after max-hold defer"
+        self._last_dca_time_blocked_log_ts: float = 0.0  # throttles the [dca-time-blocked] diagnostic line (2026-08 Option B DCA time gate)
         self._last_profit_lock_debug_log_ts: float = 0.0  # throttles the [profit-lock-debug] diagnostic line
         self._last_profit_lock_peak_update_log_ts: float = 0.0  # throttles the [profit-lock-peak] UPDATED diagnostic line
 
@@ -3097,6 +3098,16 @@ class MartingaleManager:
             return True
         return False
 
+    def _should_log_dca_time_blocked(self, interval_sec: float = 30.0) -> bool:
+        """Throttle for the [dca-time-blocked] diagnostic line (2026-08
+        Option B DCA time gate) - debugging only, does not affect whether a
+        new DCA add is actually withheld."""
+        now = time.time()
+        if now - self._last_dca_time_blocked_log_ts >= interval_sec:
+            self._last_dca_time_blocked_log_ts = now
+            return True
+        return False
+
     def _should_log_profit_lock_debug(self, interval_sec: float = 30.0) -> bool:
         """Throttle for the [profit-lock-debug] diagnostic line (2026-08
         Profit Lock diagnostics, Issue 2) - debugging only, does not affect
@@ -3996,6 +4007,18 @@ class MartingaleManager:
         effective_max_hold_sec = (
             MAX_HOLD_TIME_SEC * MAX_HOLD_TIME_DCA_MULTIPLIER if p.dca_step >= 1 else MAX_HOLD_TIME_SEC
         )
+        # 2026-08 Option B - DCA time-eligibility gate (this variable only -
+        # MAX_HOLD_TIME_SEC/MAX_HOLD_TIME_HARD_CAP_SEC/MAX_HOLD_TIME_DCA_MULTIPLIER/
+        # MAX_HOLD_TIME_RECOVERY_MIN_AGREE, the recovery-risk signal set, DCA
+        # sizing/spacing/distance, TP, Profit Lock, Smart Exit, and Hard Stop
+        # are all untouched). Single source of truth for "can a NEW DCA still
+        # be placed on this tick", shared by BOTH (a) the dca_opportunity_available
+        # signal in the emergency review just below and (b) the actual DCA
+        # placement gate further down in this same function - so the two can
+        # never disagree about DCA eligibility. Computed unconditionally,
+        # every tick, from the exact same held_sec_so_far/effective_max_hold_sec
+        # already computed above for the threshold check itself.
+        dca_time_eligible = not (MAX_HOLD_TIME_ENABLED and held_sec_so_far >= effective_max_hold_sec)
         if MAX_HOLD_TIME_ENABLED and held_sec_so_far >= effective_max_hold_sec:
             hard_cap_hit = held_sec_so_far >= MAX_HOLD_TIME_HARD_CAP_SEC
             trending_and_profitable = (
@@ -4050,8 +4073,19 @@ class MartingaleManager:
             # Hard cap always wins regardless (`not hard_cap_hit` gate).
             current_loss_distance = max(0.0, -pct_move)
             dca_distance_pct_now = self.get_dynamic_dca_distance_pct()
+            # 2026-08 Option B fix (this `dca_time_eligible and` clause only -
+            # every other term here, and the DCA block's own trigger/spacing/
+            # sizing/distance logic, are unchanged): dca_time_eligible is the
+            # SAME shared flag the actual DCA placement gate uses below, so
+            # this signal can never claim a DCA opportunity is available when
+            # the placement gate would actually refuse to place it. In
+            # practice this expression only runs after the soft threshold has
+            # already been crossed (see the enclosing `if` above), so
+            # dca_time_eligible is always False here - the "DCA opportunity
+            # available" defer reason can no longer fire once time-blocked.
             dca_opportunity_available = (
-                not hard_cap_hit
+                dca_time_eligible
+                and not hard_cap_hit
                 and p.dca_step < MAX_DCA_STEPS
                 and current_loss_distance >= dca_distance_pct_now
             )
@@ -4483,6 +4517,34 @@ class MartingaleManager:
                     f"{', '.join(k for k, v in exhausted_recovery_signals.items() if v)})",
                     emergency=True, exit_reason_tag="max_dca_exhausted",
                 )
+                return
+
+            # 2026-08 Option B - DCA time gate (this block only - the
+            # step-exhaustion branch above, which always returns without
+            # ever placing an order, is untouched and stays fully
+            # independent of hold time; the spacing gate, final-DCA gate,
+            # and order placement just below are all still reached exactly
+            # as before whenever dca_time_eligible is True). Uses the SAME
+            # dca_time_eligible flag computed once near the top of this
+            # function and already used by dca_opportunity_available above -
+            # not a second/parallel time check - so this can never disagree
+            # with what the emergency review believes is available. Once the
+            # soft max-hold threshold is reached, no NEW DCA add is placed
+            # regardless of price distance; Max Hold Time V2's own
+            # recovery-risk review (evaluated earlier this same tick,
+            # unconditionally) is the sole mechanism deciding hold-vs-close
+            # from here. Hard Stop, Profit Lock, TP/Trailing, and Smart Exit
+            # all ran earlier in this function and are completely
+            # unaffected - this only withholds a NEW order, the same way the
+            # spacing-gate and final-DCA-gate `return`s below already do.
+            if not dca_time_eligible:
+                if self._should_log_dca_time_blocked():
+                    print(color(
+                        f"{now_str()} [dca-time-blocked] dca_step={p.dca_step}/{MAX_DCA_STEPS} "
+                        f"held={held_sec_so_far/3600:.2f}h >= "
+                        f"soft_threshold={effective_max_hold_sec/3600:.2f}h - withholding new DCA add "
+                        f"(Max Hold Time V2 review governs from here)", YELLOW,
+                    ))
                 return
 
             # --- 2026-08 DCA re-fire spacing fix (this block only - sizing,
