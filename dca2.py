@@ -108,6 +108,7 @@ import json
 import math
 import os
 import pickle
+import random
 import sys
 import time
 import traceback
@@ -256,11 +257,57 @@ async def retry_with_backoff(coro_fn, *args, attempts: int = STARTUP_RETRY_ATTEM
     the REST calls that run ONCE before the self-reconnecting websocket loops
     take over - those calls have no other retry path of their own, so a single
     transient network blip during container startup would otherwise kill the
-    whole process before it ever gets going."""
+    whole process before it ever gets going.
+
+    2026-08 HTTP 418/429 cooldown-survival fix (this function only - the
+    exponential-backoff retry behavior for every OTHER kind of failure,
+    including the final SystemExit after `attempts` genuine failures, is
+    completely unchanged): an HTTP 418 (IP ban) or 429 (rate limit) is not
+    a normal transient failure - retrying it on the usual exponential
+    schedule only digs the ban deeper, and a long ban (Binance 418 bans
+    escalate well past the handful of minutes this retry loop's own
+    backoff would cover) previously exhausted all `attempts` and raised
+    SystemExit, which the outer run_forever() supervisor would then
+    restart from scratch - losing the in-memory cooldown and immediately
+    contacting Binance again on the new process, worsening the ban. Now:
+    a 418/429 (detected via BinanceApiError.status, the same exception
+    type/attribute every existing caller already uses) makes this loop
+    wait out the SAME shared RestClient cooldown _arm_cooldown() already
+    armed (see exchange.py) - however long that takes - and then retries
+    WITHOUT consuming one of the `attempts` budget, so the process stays
+    alive and simply waits instead of restart-looping."""
     last_exc = None
-    for attempt in range(1, attempts + 1):
+    attempt = 1
+    while attempt <= attempts:
         try:
             return await coro_fn(*args)
+        except BinanceApiError as e:
+            if e.status in (418, 429):
+                client = getattr(coro_fn, "__self__", None)
+                if not isinstance(client, RestClient):
+                    client = next((a for a in args if isinstance(a, RestClient)), None)
+                if client is not None:
+                    remaining = client.cooldown_remaining()
+                    if remaining > 0:
+                        expiry_utc = client.cooldown_expiry_utc_str()
+                        print(color(
+                            f"[startup] {label} hit HTTP {e.status} (rate limit/IP ban) - waiting for "
+                            f"the shared cooldown to clear ({expiry_utc}, {remaining:.0f}s) before "
+                            f"retrying. This wait does NOT count against the {attempts}-attempt budget "
+                            f"and will not exit the process.", RED,
+                        ))
+                        await asyncio.sleep(remaining + random.uniform(0.1, 3.0))
+                        print(color(f"[startup] {label} resuming after cooldown.", GREEN))
+                        continue  # retry now, same `attempt` count - not consumed
+            last_exc = e
+            delay = base_delay * (2 ** (attempt - 1))
+            print(color(
+                f"[startup] {label} failed (attempt {attempt}/{attempts}): {e}. "
+                f"Retrying in {delay:.1f}s ...", YELLOW
+            ))
+            if attempt < attempts:
+                await asyncio.sleep(delay)
+            attempt += 1
         except Exception as e:  # noqa: BLE001 - deliberately broad, this is a retry wrapper
             last_exc = e
             delay = base_delay * (2 ** (attempt - 1))
@@ -270,6 +317,7 @@ async def retry_with_backoff(coro_fn, *args, attempts: int = STARTUP_RETRY_ATTEM
             ))
             if attempt < attempts:
                 await asyncio.sleep(delay)
+            attempt += 1
     raise SystemExit(f"[startup] {label} failed after {attempts} attempts: {last_exc}")
 
 
@@ -432,13 +480,75 @@ async def load_dca_state(manager: MartingaleManager) -> None:
         # entry_features is an Optional[np.ndarray] on PositionState - not
         # something this JSON-based snapshot format carries; leave it at
         # its dataclass default (None) rather than guessing a reconstruction.
-        kwargs = {k: v for k, v in data.items() if k in valid_fields and k != "entry_features"}
+        #
+        # 2026-08 snapshot key-name fix (this remap only - every other
+        # field in the snapshot already matches its PositionState name
+        # exactly and is untouched): _dca_state_snapshot() (trading.py)
+        # writes "qty" for PositionState.total_qty and "dca_history" for
+        # PositionState.entries. Neither name matches a PositionState
+        # field, so the old `k in valid_fields` filter below silently
+        # dropped both - every restored OPEN snapshot got total_qty=0.0
+        # and entries=[] (the PositionState() defaults) while side/
+        # avg_entry_price/dca_step/opened_at all restored correctly,
+        # producing an OPEN position with real economics but zero
+        # quantity (see the Live incident this fix addresses: qty=0.000000
+        # net=+0.0000, Max Hold read that as "no meaningful loss"). Remap
+        # explicitly before filtering, and derive original_qty from the
+        # same qty value when the snapshot doesn't carry a separate
+        # original_qty (older/current snapshot format never has - only a
+        # possible FUTURE snapshot format might, so an existing
+        # original_qty key is still honored if present, for forward
+        # compatibility).
+        remapped = dict(data)
+        if "qty" in remapped:
+            remapped.setdefault("total_qty", remapped["qty"])
+            remapped.setdefault("original_qty", remapped["qty"])
+        if "dca_history" in remapped:
+            remapped.setdefault("entries", remapped["dca_history"])
+
+        kwargs = {k: v for k, v in remapped.items() if k in valid_fields and k != "entry_features"}
         if isinstance(kwargs.get("entries"), list):
             kwargs["entries"] = [tuple(e) for e in kwargs["entries"]]
-        manager.position = PositionState(**kwargs)
+
+        candidate = PositionState(**kwargs)
+
+        # 2026-08 invalid-OPEN-snapshot validation (this block only): an
+        # OPEN/DCA_PENDING/CLOSING snapshot is only trusted if its core
+        # economics are actually self-consistent - valid side, positive
+        # average entry, positive quantity, and (when entries/dca_history
+        # was present in the raw snapshot at all) a non-empty, qty-
+        # consistent fill history. A snapshot that fails this check is
+        # exactly the shape of the pre-fix qty=0 bug (or any other
+        # corruption) reappearing under a different cause - falling back
+        # to a fresh FLAT PositionState() is always safe (initialize_sync()
+        # runs immediately after this and is the sole authority that can
+        # rebuild a genuinely-open position from the exchange itself),
+        # whereas trusting a broken OPEN snapshot is not.
+        if candidate.status in ("OPEN", "DCA_PENDING", "CLOSING"):
+            entries_sum = sum(qty for _, qty in candidate.entries) if candidate.entries else 0.0
+            valid_open = (
+                candidate.side in ("LONG", "SHORT")
+                and candidate.avg_entry_price is not None
+                and candidate.avg_entry_price > 0
+                and candidate.total_qty > 0
+                and (not candidate.entries or entries_sum > 0)
+            )
+            if not valid_open:
+                print(color(
+                    f"[dca-state] REJECTED snapshot claiming status={candidate.status} with invalid "
+                    f"economics (side={candidate.side}, avg_entry={candidate.avg_entry_price}, "
+                    f"total_qty={candidate.total_qty}, entries={len(candidate.entries)}) - "
+                    f"starting flat instead of restoring an unmanageable position. "
+                    f"initialize_sync() will rebuild from the exchange if a position genuinely exists.",
+                    RED,
+                ))
+                return
+
+        manager.position = candidate
         print(color(
             f"[dca-state] restored DCA state snapshot (status={manager.position.status}, "
-            f"side={manager.position.side}, dca_step={manager.position.dca_step}).", MAGENTA,
+            f"side={manager.position.side}, dca_step={manager.position.dca_step}, "
+            f"total_qty={manager.position.total_qty}).", MAGENTA,
         ))
     except Exception as e:  # noqa: BLE001 - corrupted/incompatible snapshot must not crash startup
         print(color(f"[dca-state] failed to apply DCA state snapshot ({e}), starting flat.", YELLOW))
@@ -446,6 +556,18 @@ async def load_dca_state(manager: MartingaleManager) -> None:
 
 async def balance_refresher(client: RestClient, manager: MartingaleManager) -> None:
     while True:
+        # 2026-08 HTTP 418/429 cooldown-survival fix (this check only -
+        # the actual balance refresh below is unchanged): skip this
+        # iteration's REST call entirely and silently while the shared
+        # cooldown is active, instead of calling get_balance() (which
+        # would just raise locally anyway - see RestClient._request())
+        # and logging an error every BALANCE_REFRESH_SEC. wait_out_cooldown_silently()
+        # sleeps until the cooldown clears (plus jitter, to avoid every
+        # poller resuming on the same tick) and logs the one-time resume
+        # line itself - nothing else needs to log here.
+        if client.is_cooldown_active():
+            await client.wait_out_cooldown_silently()
+            continue
         try:
             balances = await client.get_balance()
             usdt = next((b for b in balances if b["asset"] == "USDT"), None)
@@ -462,6 +584,11 @@ async def funding_oi_poller(client: RestClient, manager: MartingaleManager) -> N
     feature inputs - any failure just leaves the last known value (or None)
     in place and never interrupts trading."""
     while True:
+        # 2026-08 HTTP 418/429 cooldown-survival fix - same pattern as
+        # balance_refresher() above.
+        if client.is_cooldown_active():
+            await client.wait_out_cooldown_silently()
+            continue
         try:
             premium = await client.get_premium_index(SYMBOL)
             manager.funding_rate = float(premium.get("lastFundingRate", 0) or 0)
@@ -482,6 +609,14 @@ async def position_risk_poller(client: RestClient, manager: MartingaleManager) -
     while True:
         if DRY_RUN:
             await asyncio.sleep(POSITION_RISK_POLL_SEC)
+            continue
+        # 2026-08 HTTP 418/429 cooldown-survival fix - same pattern as
+        # balance_refresher() above. Deliberately does NOT call
+        # initialize_sync() either while skipping - it would just hit the
+        # same cooldown-blocked get_position_risk() path if rows were None,
+        # and this poller always supplies its own freshly-fetched `rows`.
+        if client.is_cooldown_active():
+            await client.wait_out_cooldown_silently()
             continue
         try:
             rows = await client.get_position_risk(SYMBOL)

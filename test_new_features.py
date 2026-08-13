@@ -44,6 +44,7 @@ async def make_manager():
 
 
 def open_flat_position(manager, side="LONG", entry_price=60000.0, qty=0.002):
+    manager.position_sync_ready = True  # 2026-08 position_sync_ready gate: this helper builds an already-OPEN position directly, bypassing initialize_sync() - mark it ready so the new startup-readiness gate doesn't mask the Max Hold/DCA/entry-signal behavior under test in this file.
     manager.position.side = side
     manager.position.status = "OPEN"
     manager.position.avg_entry_price = entry_price

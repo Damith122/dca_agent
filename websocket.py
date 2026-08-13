@@ -198,6 +198,22 @@ async def market_data_consumer(manager: MartingaleManager) -> None:
 async def userdata_consumer(client: RestClient, manager: MartingaleManager) -> None:
     backoff = 1.0
     while True:
+        # 2026-08 HTTP 418/429 cooldown-survival fix (this check only -
+        # everything else in this reconnect loop is unchanged): skip this
+        # reconnect attempt entirely and silently while the shared REST
+        # cooldown (armed by RestClient._request() on a 418/429 - see
+        # exchange.py) is active, instead of calling create_listen_key()
+        # (which would just raise locally anyway) and logging a fresh
+        # "[user-ws] disconnected (...), retrying in Xs" error every
+        # reconnect attempt. wait_out_cooldown_silently() sleeps out the
+        # cooldown (plus jitter, so this loop doesn't resume on the exact
+        # same tick as every other poller) and logs the one-time resume
+        # line itself - nothing else needs to log here. `continue` re-enters
+        # the loop, which re-checks the cooldown before ever calling
+        # create_listen_key() again.
+        if client.is_cooldown_active():
+            await client.wait_out_cooldown_silently()
+            continue
         try:
             listen_key = await client.create_listen_key()
             # 2026-08 WS route-migration fix: the legacy raw path
@@ -266,6 +282,13 @@ async def userdata_consumer(client: RestClient, manager: MartingaleManager) -> N
 async def listen_key_keepalive(client: RestClient) -> None:
     while True:
         await asyncio.sleep(LISTEN_KEY_KEEPALIVE_SEC)
+        # 2026-08 HTTP 418/429 cooldown-survival fix - same pattern as the
+        # REST pollers in dca2.py: skip silently and wait out the shared
+        # cooldown instead of calling through (which would just raise
+        # locally anyway) and logging an error every LISTEN_KEY_KEEPALIVE_SEC.
+        if client.is_cooldown_active():
+            await client.wait_out_cooldown_silently()
+            continue
         try:
             await client.keepalive_listen_key()
             print(color(f"{now_str()} [user-ws] listenKey keepalive sent.", GRAY))

@@ -100,6 +100,7 @@ async def make_manager(side="LONG", dca_step=1, entries=None, avg_entry=77.20,
     DCA-aware 0.5x multiplier exactly as in the real incident."""
     filters = bot.SymbolFilters(tick_size=0.0001, step_size=0.01, min_qty=0.01, min_notional=5.0)
     m = bot.MartingaleManager(client=FakeClient(), symbol="SOLUSDT", filters=filters, leverage=20)
+    m.position_sync_ready = True  # 2026-08 position_sync_ready gate: this test file exercises DCA/Max Hold management directly against an already-OPEN position, bypassing initialize_sync() - mark it ready so the new startup-readiness gate (unrelated to this file's own DCA time-gate fix) doesn't mask what's under test.
     m.position.side = side
     m.position.status = "OPEN"
     m.position.entries = entries if entries is not None else [(77.20, 1.03), (77.05, 1.60)]

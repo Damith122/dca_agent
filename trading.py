@@ -1580,6 +1580,26 @@ class MartingaleManager:
         self.leverage = leverage
 
         self.position = PositionState()
+        # 2026-08 position_sync_ready startup gate: starts False on every
+        # fresh MartingaleManager - a local/GitHub DCA-state snapshot
+        # restore (load_dca_state() in dca2.py) NEVER sets this True, no
+        # matter how structurally valid the snapshot looks, because a
+        # snapshot only proves what THIS process last wrote to disk, not
+        # what Binance's position actually is right now (it could have
+        # changed via manual intervention, a missed fill, liquidation,
+        # etc. while this process was down). Only initialize_sync() sets
+        # this True, and only after it has actually obtained authoritative
+        # position-risk rows from Binance and reconciled local state
+        # against them - see that function. Consulted by on_price_tick()
+        # (blocks new entries), _manage_open_position() (blocks DCA and
+        # the Max Hold V2 / Smart Exit discretionary decision blocks), and
+        # nothing else - Hard Stop / Profit Lock / TP / Trailing / the
+        # invalid-open-state safety gate above all remain fully active
+        # regardless of this flag, since they are simple, deterministic,
+        # already qty-safe (close_position() re-fetches the exchange's own
+        # positionAmt right before submitting) risk-REDUCING exits, never
+        # exposure-adding or provisional-economics-dependent decisions.
+        self.position_sync_ready: bool = False
         self.current_price: Optional[float] = None
         self.prev_price: Optional[float] = None
         self.prev_prev_price: Optional[float] = None
@@ -1615,6 +1635,8 @@ class MartingaleManager:
         self.last_trade_open_ts: float = 0.0
         self._last_warmup_skip_log_ts: float = 0.0  # throttles the pre-warmup "no entry" log line
         self._last_max_hold_review_log_ts: float = 0.0  # throttles the Max Hold Time V2 "kept alive" diagnostic line
+        self._last_invalid_open_state_log_ts: float = 0.0  # throttles the [invalid-open-state] safety-gate diagnostic line
+        self._last_sync_not_ready_log_ts: float = 0.0  # throttles the [entry-skip]/[dca-skip]/[max-hold-skip]/[smart-exit-skip] position_sync_ready diagnostic lines
         self._last_max_hold_fee_net_review_log_ts: float = 0.0  # throttles the [max-hold-review] fee-net meaningful_loss diagnostic line
         self._last_max_dca_exhausted_review_log_ts: float = 0.0  # throttles the [max-dca-exhausted-review] diagnostic line
         self._last_dca_spacing_log_ts: float = 0.0  # throttles the [dca-spacing] diagnostic line
@@ -3077,6 +3099,27 @@ class MartingaleManager:
             return True
         return False
 
+    def _should_log_invalid_open_state(self, interval_sec: float = 30.0) -> bool:
+        """Throttle for the [invalid-open-state] safety-gate diagnostic
+        line (2026-08 invalid-OPEN-state safety gate) - debugging only,
+        does not affect the gate's own decision to block management (it
+        always blocks regardless of whether this tick happens to log)."""
+        now = time.time()
+        if now - self._last_invalid_open_state_log_ts >= interval_sec:
+            self._last_invalid_open_state_log_ts = now
+            return True
+        return False
+
+    def _should_log_sync_not_ready(self, interval_sec: float = 30.0) -> bool:
+        """Throttle shared by every position_sync_ready-gated diagnostic
+        line (entry-skip / dca-skip / max-hold-skip / smart-exit-skip) -
+        debugging only, does not affect any gate's own decision to block."""
+        now = time.time()
+        if now - self._last_sync_not_ready_log_ts >= interval_sec:
+            self._last_sync_not_ready_log_ts = now
+            return True
+        return False
+
     def _should_log_dca_spacing(self, interval_sec: float = 15.0) -> bool:
         """Throttle for the [dca-spacing] diagnostic line (2026-08 DCA
         re-fire spacing fix) - debugging only, does not affect the spacing
@@ -3181,6 +3224,32 @@ class MartingaleManager:
 
         if self.position.status == "FLAT":
             if time.time() - self.last_trade_action_ts < TRADE_COOLDOWN_SEC:
+                return
+
+            # 2026-08 position_sync_ready startup gate (isolated to entry
+            # gating only - DCA/exit management for an already-open
+            # position, Brain learning, and every other function are
+            # untouched, identical in structure to the Daily Loss/Warm-up
+            # gates right below): position_sync_ready starts False and is
+            # only ever set True by initialize_sync() once it has actually
+            # obtained authoritative position-risk rows from Binance and
+            # reconciled local state against them (see that function).
+            # Until then, self.position.status=="FLAT" locally does NOT
+            # prove Binance itself is flat - it could be an untouched
+            # fresh PositionState(), a rejected/invalid restored snapshot
+            # that fell back to FLAT, or a genuinely-stale local view - so
+            # no NEW entry may be opened on top of a real, unknown exchange
+            # position. Once initialize_sync() confirms readiness this
+            # gate never fires again for the rest of the process (it is
+            # never reset back to False by a later transient REST
+            # failure - see that function's own comment).
+            if not self.position_sync_ready:
+                if self._should_log_sync_not_ready():
+                    print(color(
+                        f"{now_str()} [entry-skip] position_sync_ready=False - local state has not yet "
+                        f"been reconciled against an authoritative Binance position-risk fetch. "
+                        f"No new entry will be opened until initialize_sync() confirms readiness.", YELLOW,
+                    ))
                 return
 
             # 2026-08 Daily Loss Protection (isolated to entry gating only -
@@ -3288,7 +3357,25 @@ class MartingaleManager:
             return (self.current_price - p.avg_entry_price) / p.avg_entry_price
         return (p.avg_entry_price - self.current_price) / p.avg_entry_price
 
-    async def _place_step_order(self, step: int, side_signal: str, size_mult: float = 1.0) -> None:
+    async def _place_step_order(
+        self, step: int, side_signal: str, size_mult: float = 1.0,
+        expected_position: Optional["PositionState"] = None,
+    ) -> None:
+        # 2026-08 stale-decision safety gate - identical guard/rationale to
+        # close_position()'s own (see its docstring comment): the DCA-add
+        # call site inside _manage_open_position() passes its own `p` as
+        # expected_position; if self.position has since been swapped by a
+        # concurrent sync, this DCA decision is stale and must not be
+        # placed against whatever replaced it. The initial-entry call site
+        # (try_enter_position, a FLAT->ENTERING transition with no `p` to
+        # protect) doesn't pass expected_position and is unaffected.
+        if expected_position is not None and expected_position is not self.position:
+            print(color(
+                f"{now_str()} [stale-decision-guard] _place_step_order(step={step}) skipped - "
+                f"self.position was replaced by a concurrent sync while this decision was in "
+                f"flight; re-evaluating against current state next tick instead.", YELLOW,
+            ))
+            return
         notional = self.notional_for_step(step, size_mult)
         price = self.current_price
         if price is None or price <= 0:
@@ -3306,6 +3393,27 @@ class MartingaleManager:
         order_side = "BUY" if side_signal == "LONG" else "SELL"
         role = "initial" if step == 0 else "dca"
         step_label = "INITIAL ENTRY" if step == 0 else f"DCA STEP {step}/{MAX_DCA_STEPS}"
+
+        # 2026-08 stale-decision safety gate, SECOND check (this check
+        # only - everything else, including the DRY_RUN branch right
+        # below, is unchanged): the guard at function entry above only
+        # protects against self.position being swapped BEFORE this call
+        # started. Although nothing currently awaits between that entry
+        # check and here, re-verifying identity immediately before
+        # mutating pending state / submitting the order (whichever comes
+        # first - DRY_RUN or the real order path below) means this stays
+        # correct even if a future change inserts an await in between -
+        # the actual order boundary is what must be protected, not just
+        # the function's first line. Aborts without touching
+        # status/side/pending_order_ts and without ever placing an order
+        # (real or simulated).
+        if expected_position is not None and expected_position is not self.position:
+            print(color(
+                f"{now_str()} [stale-decision-guard] _place_step_order(step={step}) skipped "
+                f"immediately before submission - self.position was replaced by a concurrent "
+                f"sync; no order submitted, no pending state mutated.", YELLOW,
+            ))
+            return
 
         if DRY_RUN:
             fake_id = -(int(time.time() * 1000) % 1_000_000) - step
@@ -3524,7 +3632,32 @@ class MartingaleManager:
             ))
             return None
 
-    async def close_position(self, reason: str, emergency: bool = False, exit_reason_tag: str = "manual") -> None:
+    async def close_position(
+        self, reason: str, emergency: bool = False, exit_reason_tag: str = "manual",
+        expected_position: Optional["PositionState"] = None,
+    ) -> None:
+        # 2026-08 stale-decision safety gate (this check only - everything
+        # below is unchanged): _manage_open_position() binds p = self.position
+        # once at the top and reasons about IT for the rest of that call,
+        # but a concurrent initialize_sync() (periodic poll / reconnect /
+        # startup) can reassign self.position to a brand-new PositionState
+        # object while _manage_open_position() is still awaiting something
+        # earlier in the same tick. Callers inside _manage_open_position()
+        # pass their own `p` as expected_position; if self.position has
+        # since been swapped out from under them, the decision was reasoned
+        # about a PositionState that this manager no longer considers
+        # current, so it must not be executed against whatever replaced it -
+        # skip this call entirely and let the NEXT tick (which will
+        # re-evaluate against the current self.position) decide fresh.
+        # Callers outside that race (e.g. position_risk_poller's own direct
+        # close) don't pass expected_position and are completely unaffected.
+        if expected_position is not None and expected_position is not self.position:
+            print(color(
+                f"{now_str()} [stale-decision-guard] close_position(reason={reason}) skipped - "
+                f"self.position was replaced by a concurrent sync while this decision was in "
+                f"flight; re-evaluating against current state next tick instead.", YELLOW,
+            ))
+            return
         if self.position.status not in ("OPEN", "DCA_PENDING") or self.position.total_qty <= 0:
             return
         close_side = "SELL" if self.position.side == "LONG" else "BUY"
@@ -3618,6 +3751,26 @@ class MartingaleManager:
                     f"{now_str()} [close-qty] could not fetch fresh positionAmt before closing - "
                     f"falling back to local total_qty for this close order.", YELLOW,
                 ))
+
+        # 2026-08 stale-decision safety gate, SECOND check (this check
+        # only - everything else is unchanged): the guard at function
+        # entry above only protects against self.position being swapped
+        # BEFORE this call started. self.position could still have been
+        # swapped by a concurrent initialize_sync() DURING the
+        # _fetch_exchange_position() await just above (the only await
+        # between entry and here) - re-verify identity immediately before
+        # mutating pending state / submitting the actual order, not just
+        # at entry, so that window can never let a stale decision through
+        # either. Aborts without touching status/pending_order_id/order
+        # index and without ever calling _place_reduce_only_close_order().
+        if expected_position is not None and expected_position is not self.position:
+            print(color(
+                f"{now_str()} [stale-decision-guard] close_position(reason={reason}) skipped "
+                f"immediately before submission - self.position was replaced by a concurrent "
+                f"sync during the fresh-position fetch; no order submitted, no pending state "
+                f"mutated.", YELLOW,
+            ))
+            return
 
         label = "EMERGENCY CLOSE" if emergency else "CLOSE (full)"
         print(color(
@@ -3724,6 +3877,47 @@ class MartingaleManager:
         if avg is None or price is None:
             return
 
+        # 2026-08 invalid-OPEN-state safety gate (this check only - every
+        # other line in this function is unchanged): status=="OPEN" is
+        # supposed to guarantee a real, manageable position (this is the
+        # only call site - see on_price_tick's `elif self.position.status
+        # == "OPEN":` gate above), but a corrupted/incomplete restore (the
+        # Live incident this addresses: a DCA-state snapshot that restored
+        # side/avg_entry_price/dca_step correctly but total_qty=0.0 due to
+        # the separate snapshot key-mapping bug - see load_dca_state() in
+        # dca2.py) could previously still reach here with economics that
+        # make every dollar/percent figure below meaningless: pct_move
+        # still computes against avg_entry_price, but
+        # estimate_net_pnl_usdt() returns exactly 0.0 for total_qty<=0 (see
+        # its own guard), which Max Hold Time V2 then read as "no
+        # meaningful loss" and deferred on - a real, and possibly large,
+        # unrealized loss silently invisible to every PnL-based decision
+        # in this function (TP, Profit Lock, Smart Exit, Max Hold, hard
+        # stop distance is unaffected since it's pct-based, but nothing
+        # here should be trusted to manage size-dependent risk against a
+        # quantity that isn't real). Rather than let TP / Profit Lock /
+        # Smart Exit / Hard Stop / Max Hold / DCA reason about a position
+        # with no real size, or place any order against it, refuse to
+        # manage it at all until an authoritative exchange sync
+        # (initialize_sync(), which runs independently of this function on
+        # every reconnect/periodic poll/startup) replaces self.position
+        # with real economics - normal management resumes automatically
+        # the very next tick after that happens, with no special-casing
+        # needed here.
+        if p.total_qty <= 0 or p.side not in ("LONG", "SHORT") or avg <= 0:
+            if self._should_log_invalid_open_state():
+                print(color(
+                    f"{now_str()} [invalid-open-state] *** MANUAL MANAGEMENT REQUIRED *** "
+                    f"status={p.status} side={p.side} avg_entry={avg} total_qty={p.total_qty} - "
+                    f"economics are not manageable (missing/zero side, avg_entry, or quantity). "
+                    f"No automatic TP/Profit-Lock/Smart-Exit/Hard-Stop/Max-Hold/DCA order will be "
+                    f"placed for this position until an authoritative exchange sync restores real "
+                    f"position data - if a real position exists on the exchange, it is currently "
+                    f"UNPROTECTED by any automated risk management and should be checked manually.",
+                    RED,
+                ))
+            return
+
         # track max favorable / adverse excursion for reward + trailing stop
         if p.side == "LONG":
             p.max_favorable_price = price if p.max_favorable_price is None else max(p.max_favorable_price, price)
@@ -3739,6 +3933,7 @@ class MartingaleManager:
             await self.close_position(
                 f"hard stop: {pct_move*100:.2f}% adverse move on average entry",
                 emergency=True, exit_reason_tag="hard_stop",
+                expected_position=p,
             )
             return
 
@@ -3755,6 +3950,7 @@ class MartingaleManager:
                 await self.close_position(
                     f"breakeven stop after partial TP: price {price:.2f} back through "
                     f"entry {p.breakeven_price:.2f}", emergency=True, exit_reason_tag="breakeven",
+                    expected_position=p,
                 )
                 return
 
@@ -3958,6 +4154,7 @@ class MartingaleManager:
                         f"locked level ${locked_profit:+.4f} (peak=${p.peak_unrealized_pnl:+.4f}, "
                         f"ratio={PROFIT_LOCK_RATIO*100:.0f}%, fee-safe floor=${MIN_NET_PROFIT_USDT:.4f})",
                         exit_reason_tag="profit_lock",
+                        expected_position=p,
                     )
                     return
 
@@ -4019,7 +4216,29 @@ class MartingaleManager:
         # every tick, from the exact same held_sec_so_far/effective_max_hold_sec
         # already computed above for the threshold check itself.
         dca_time_eligible = not (MAX_HOLD_TIME_ENABLED and held_sec_so_far >= effective_max_hold_sec)
-        if MAX_HOLD_TIME_ENABLED and held_sec_so_far >= effective_max_hold_sec:
+        # 2026-08 position_sync_ready gate (this outer branch only - every
+        # line of the existing Max Hold V2 review logic inside the
+        # unchanged `elif` below is untouched): the review's own
+        # "no meaningful loss" / recovery-vote decisions are provisional-
+        # economics-dependent (this is exactly the mechanism the Live
+        # incident exploited via a corrupted qty=0 restore), so they must
+        # not run at all until initialize_sync() has authoritatively
+        # reconciled local state against Binance. Hard Stop / Profit Lock
+        # / TP / Trailing / Breakeven above and below this block are
+        # unaffected - they remain simple, deterministic, already
+        # qty-safe reduceOnly exits regardless of this flag.
+        if not self.position_sync_ready:
+            if (
+                MAX_HOLD_TIME_ENABLED and held_sec_so_far >= effective_max_hold_sec
+                and self._should_log_sync_not_ready()
+            ):
+                print(color(
+                    f"{now_str()} [max-hold-skip] position_sync_ready=False - Max Hold Time V2's "
+                    f"review (including its own hard cap) is withheld until an authoritative "
+                    f"exchange sync confirms this position's real economics; simple reduceOnly "
+                    f"exits (Hard Stop/Profit Lock/TP/Trailing) remain active.", YELLOW,
+                ))
+        elif MAX_HOLD_TIME_ENABLED and held_sec_so_far >= effective_max_hold_sec:
             hard_cap_hit = held_sec_so_far >= MAX_HOLD_TIME_HARD_CAP_SEC
             trending_and_profitable = (
                 unrealized_pnl_usdt > 0
@@ -4223,6 +4442,7 @@ class MartingaleManager:
                     f"profit_lock_active={p.profit_lock_active}{review_suffix}) - closing dead/ranging "
                     f"hold instead of tying up capital indefinitely",
                     emergency=True, exit_reason_tag="max_hold_time",
+                    expected_position=p,
                 )
                 return
             elif dca_opportunity_available and self._should_log_max_hold_dca_defer():
@@ -4270,6 +4490,7 @@ class MartingaleManager:
                     f"(dynamic TP={dynamic_tp_pct*100:.3f}%, base={TAKE_PROFIT_PCT*100:.2f}%, "
                     f"est. net pnl=${net_pnl:+.4f} after fees)",
                     exit_reason_tag="take_profit",
+                    expected_position=p,
                 )
                 return
 
@@ -4302,6 +4523,7 @@ class MartingaleManager:
                             f"(ATR-based, {pct_move*100:.2f}% still favorable, "
                             f"est. net pnl=${net_pnl_trail:+.4f} after fees)",
                             exit_reason_tag="trailing_stop",
+                            expected_position=p,
                         )
                         return
             else:
@@ -4315,6 +4537,7 @@ class MartingaleManager:
                             f"(ATR-based, {pct_move*100:.2f}% still favorable, "
                             f"est. net pnl=${net_pnl_trail:+.4f} after fees)",
                             exit_reason_tag="trailing_stop",
+                            expected_position=p,
                         )
                         return
 
@@ -4353,8 +4576,16 @@ class MartingaleManager:
             dca_distance_pct > 0
             and (-pct_move) >= dca_distance_pct * SMART_EXIT_DCA_PROXIMITY_RATIO
         )
+        # 2026-08 position_sync_ready gate (the `self.position_sync_ready
+        # and` clause only - every other condition/signal/threshold below
+        # is unchanged): Smart Exit's multi-signal analysis is exactly the
+        # kind of discretionary, provisional-economics-dependent decision
+        # that must not run until initialize_sync() has authoritatively
+        # reconciled local state against Binance - see the identical gate
+        # on the Max Hold V2 review above.
         if (
-            SMART_EXIT_ENABLED and smart_exit_held_long_enough
+            self.position_sync_ready
+            and SMART_EXIT_ENABLED and smart_exit_held_long_enough
             and smart_exit_loss_gate
             and pct_move > -SMART_EXIT_MAX_LOSS_PCT
             and not smart_exit_near_dca
@@ -4379,6 +4610,7 @@ class MartingaleManager:
                     f"({', '.join(k for k, v in signals.items() if v)}) at {pct_move*100:.2f}% - "
                     f"exiting before further adverse move rather than a single-tick panic exit",
                     exit_reason_tag="smart_exit",
+                    expected_position=p,
                 )
                 return
 
@@ -4503,7 +4735,24 @@ class MartingaleManager:
                     f"recovery_review={exhausted_agree_count}/{len(exhausted_recovery_signals)} signals agree: "
                     f"{', '.join(k for k, v in exhausted_recovery_signals.items() if v)})",
                     emergency=True, exit_reason_tag="max_dca_exhausted",
+                    expected_position=p,
                 )
+                return
+
+            # 2026-08 position_sync_ready gate (this block only - the
+            # step-exhaustion branch above, which only ever CLOSES
+            # (reduceOnly, risk-reducing, never adds exposure) is
+            # untouched and remains available regardless of readiness;
+            # only a NEW DCA add - genuine additional exposure - is
+            # withheld here): mirrors the identical gate on Max Hold V2 /
+            # Smart Exit above, using the same shared throttle helper.
+            if not self.position_sync_ready:
+                if self._should_log_sync_not_ready():
+                    print(color(
+                        f"{now_str()} [dca-skip] position_sync_ready=False - withholding new DCA "
+                        f"add (additional exposure) until an authoritative exchange sync confirms "
+                        f"this position's real economics.", YELLOW,
+                    ))
                 return
 
             # 2026-08 Option B - DCA time gate (this block only - the
@@ -4682,11 +4931,14 @@ class MartingaleManager:
                         f"atr_ratio={regime.atr_ratio:.2f}) at {pct_move*100:.2f}% - "
                         f"exiting instead of adding the last DCA step",
                         emergency=True, exit_reason_tag="final_dca_skipped_low_probability",
+                        expected_position=p,
                     )
                     return
 
             size_mult = self.confidence_size_multiplier(self.last_confidence, self.last_regime)
-            await self._place_step_order(step=p.dca_step + 1, side_signal=p.side, size_mult=size_mult)
+            await self._place_step_order(
+                step=p.dca_step + 1, side_signal=p.side, size_mult=size_mult, expected_position=p,
+            )
             # 2026-08 DCA re-fire spacing fix: last_dca_price is now set
             # from the ACTUAL fill price in _on_entry_filled()'s "dca"
             # branch below (once the order actually fills), not here from
@@ -5612,6 +5864,25 @@ async def initialize_sync(
 
     row = next((r for r in rows if float(r.get("positionAmt", 0)) != 0), None)
     p = manager.position
+    # 2026-08 position_sync_ready timing fix (comment only - this is where
+    # `rows` becomes authoritative, but readiness is deliberately NOT set
+    # here anymore): setting it this early let on_price_tick()/
+    # _manage_open_position() treat local state as trustworthy the instant
+    # rows arrived, even though reconciliation - pending-order recovery,
+    # snapshot matching, and installing the final PositionState - hasn't
+    # happened yet. position_sync_ready is now set True at each of the
+    # THREE points below where this function has genuinely finished
+    # reconciling and a final, authoritative PositionState is already in
+    # place, with zero `await` between installing that state and setting
+    # the flag: (1) the already_synced short-circuit just below, (2) the
+    # exchange-confirmed-flat branch inside `if row is None:` above, and
+    # (3) the very end of this function, after the full rebuild. Every
+    # OTHER return in this function (grace-wait / pending / unknown REST
+    # resolution / ambiguous DCA-state) represents reconciliation that is
+    # NOT yet finished, and deliberately leaves position_sync_ready
+    # untouched - it stays False on a first sync, and stays whatever it
+    # already was (True) on a later poll, exactly per the "never reset an
+    # already-True flag over a transient/ambiguous condition" requirement.
 
     if row is None:
         if p.status in ("ENTERING", "DCA_PENDING", "CLOSING"):
@@ -5702,6 +5973,12 @@ async def initialize_sync(
                 YELLOW,
             ))
             manager.position = PositionState(last_close_time=time.time())
+        # 2026-08 position_sync_ready timing fix (this line only): the
+        # exchange has now been confirmed genuinely flat (either local
+        # state already agreed, or it was just reset to FLAT immediately
+        # above with no await since) - this IS a final, authoritative
+        # state. No await between the assignment above and this line.
+        manager.position_sync_ready = True
         return
 
     amt = float(row["positionAmt"])
@@ -5716,6 +5993,11 @@ async def initialize_sync(
         and abs(p.total_qty - qty) < max(manager.filters.step_size, 1e-9)
     )
     if already_synced:
+        # 2026-08 position_sync_ready timing fix (this line only): local
+        # state already exactly matches the exchange's authoritative
+        # report - a final, confirmed state with nothing to rebuild. No
+        # await between this check and setting the flag.
+        manager.position_sync_ready = True
         return
 
     # 2026-08 DCA_PENDING-resync fix: mirrors the SYNC_PENDING_GRACE_SEC
@@ -6306,3 +6588,13 @@ async def initialize_sync(
             f"{now_str()} [sync:{context}] [profit-lock] preserved across resync "
             f"(peak_unrealized_pnl=${preserved_peak_unrealized_pnl:+.4f})", MAGENTA,
         ))
+    # 2026-08 position_sync_ready timing fix (this line only): the full
+    # rebuild above (manager.position = PositionState(...), fee/peak
+    # bookkeeping, order-index registration) has now completely finished -
+    # this is the ONLY way execution reaches this exact point (every
+    # earlier branch in this function either returns before getting here
+    # or falls through to this same rebuild), and there is no `await`
+    # between the last state mutation above and this line. The final,
+    # authoritative PositionState is fully installed before readiness is
+    # ever set.
+    manager.position_sync_ready = True

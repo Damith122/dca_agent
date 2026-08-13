@@ -66,6 +66,7 @@ class FakeClient:
 async def make_manager(side="LONG"):
     filters = bot.SymbolFilters(tick_size=0.0001, step_size=0.01, min_qty=0.01, min_notional=5.0)
     m = bot.MartingaleManager(client=FakeClient(), symbol="SOLUSDT", filters=filters, leverage=20)
+    m.position_sync_ready = True  # 2026-08 position_sync_ready gate: this test file exercises DCA/Max Hold management directly against an already-OPEN position, bypassing initialize_sync() - mark it ready so the new startup-readiness gate (unrelated to this file's own DCA-spacing fix) doesn't mask what's under test.
     m.position.side = side
     m.position.status = "OPEN"
     m.position.entries = [(77.08, 1.03)]

@@ -187,7 +187,7 @@ async def test_profit_lock_requires_fee_safe_floor():
     manager.position.peak_unrealized_pnl = 0.11
     close_calls = []
 
-    async def fake_close_position(reason, emergency=False, exit_reason_tag="manual"):
+    async def fake_close_position(reason, emergency=False, exit_reason_tag="manual", expected_position=None):
         close_calls.append(exit_reason_tag)
 
     manager.close_position = fake_close_position
