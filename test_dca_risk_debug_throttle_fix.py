@@ -1,31 +1,31 @@
 """
-Regression tests for the 2026-08 [dca-risk-debug] Railway rate-limit fix.
+Regression tests for the 2026-08 [dca-risk-debug] Railway rate-limit fix
+(take 2 - full removal, not a throttle).
 
 Root cause: in MartingaleManager._manage_open_position(), the
 "[dca-risk-debug] exit_candidate=max_dca_exhausted ..." diagnostic line was
 printed unconditionally on every tick that entered the max_dca_exhausted
-branch (dca_step >= MAX_DCA_STEPS), with no throttle at all - unlike the
-"[max-dca-exhausted-review]" line right after it, which already had a 30s
-throttle (_should_log_max_dca_exhausted_review). On a Live SOLUSDT position
-stuck at dca_step=2/2, this produced ~1,982 identical [dca-risk-debug] lines
-in ~14 seconds of aggTrade ticks, which caused Railway to start dropping log
-lines ("Railway rate limit reached", "Messages dropped: 54",
-"Messages dropped: 184"), obscuring fill/close/Profit Lock output. The
-underlying trading state was correct the whole time (dca_step=2/2, qty and
-avg_entry matched the exchange, no resync loop, no over-DCA) - this was a
-pure logging/observability problem, not a decision-logic bug.
+branch (dca_step >= MAX_DCA_STEPS). A first attempt throttled it to once
+per 30s (mirroring the existing [max-dca-exhausted-review] throttle), but
+Live logs still showed ~2,942 of these lines in ~25 seconds - the aggTrade
+tick rate on a stuck deep-DCA position is high enough that even a 30s
+per-instance throttle produces enough volume, combined with everything
+else being logged, to trip Railway's rate limiter and drop other log lines
+(fill/close/Profit Lock output). The underlying trading state was correct
+throughout (dca_step=2/2, qty/avg_entry matched the exchange, no resync
+loop, no over-DCA) - this was purely a logging/observability problem.
 
-Fix (logging only - this file's target): the [dca-risk-debug]
-exit_candidate=max_dca_exhausted print now uses the exact same
-"throttle DEFER, always print CLOSE immediately" pattern the adjacent
-[max-dca-exhausted-review] line already used, via a new
-_should_log_dca_risk_debug_exhausted() 30s throttle. The recovery-risk
-signal computation (previously below the print) was moved above it, byte-
-for-byte unchanged, purely so the DEFER/CLOSE decision is known before
-deciding whether to print. Label, field names, field order, and values of
-the line itself are all unchanged. No trading decision, ENV variable,
-threshold, DCA trigger/spacing/sizing/step-limit, TP, Profit Lock, Smart
-Exit, Hard Stop, Max Hold Time, or recovery-review logic is touched.
+Fix (this file's target - logging only): the [dca-risk-debug]
+exit_candidate=max_dca_exhausted print block, and the throttle
+state/helper introduced exclusively for it
+(_last_dca_risk_debug_exhausted_log_ts,
+_should_log_dca_risk_debug_exhausted()), have been removed entirely. The
+line must never print again, throttled or not. The existing
+[max-dca-exhausted-review] line (own 30s throttle, own immediate-on-CLOSE
+logging) is completely unchanged and remains the log line for this
+decision. No trading decision, ENV variable, threshold, DCA
+trigger/spacing/sizing/step-limit, TP, Profit Lock, Smart Exit, Hard Stop,
+Max Hold Time, or recovery-review logic is touched.
 
 Run directly: `python3 test_dca_risk_debug_throttle_fix.py`
 """
@@ -104,10 +104,9 @@ async def make_manager(qty=3.55, avg_entry=95.0, side="LONG"):
 
 
 class Capture:
-    """Captures everything printed to stdout during a `with` block, while
-    still letting the caller see it afterwards (unlike pytest's capsys,
-    this file has no pytest dependency, matching the repo's existing
-    plain-`python3` test convention)."""
+    """Captures everything printed to stdout during a `with` block (no
+    pytest dependency, matching the repo's existing plain-`python3` test
+    convention)."""
     def __enter__(self):
         self._buf = io.StringIO()
         self._real_stdout = sys.stdout
@@ -122,14 +121,22 @@ class Capture:
         return self._buf.getvalue()
 
 
+def debug_lines_in(text):
+    return [l for l in text.splitlines() if "exit_candidate=max_dca_exhausted" in l]
+
+
+def review_lines_in(text):
+    return [l for l in text.splitlines() if "[max-dca-exhausted-review]" in l]
+
+
 # ============================================================================
 # TEST 1-4: >=1,000 rapid DEFER ticks while dca_step is exhausted - the
-# [dca-risk-debug] line must be throttled to at most one per 30s interval,
-# only the already-throttled [max-dca-exhausted-review] output otherwise
-# appears, the position stays open, and no order is placed.
+# removed [dca-risk-debug] line must NEVER print (zero, not throttled),
+# [max-dca-exhausted-review] must remain throttled exactly as before, the
+# position stays open, and no order is placed.
 # ============================================================================
-async def test_rapid_defer_ticks_throttle_dca_risk_debug():
-    print("\n=== test_rapid_defer_ticks_throttle_dca_risk_debug ===")
+async def test_rapid_defer_ticks_never_print_dca_risk_debug():
+    print("\n=== test_rapid_defer_ticks_never_print_dca_risk_debug ===")
     m = await make_manager()
     # ~0.5% adverse - well under HARD_STOP_PCT (2%) - and no signals will
     # agree (risk_score=0.1, trend_direction=None, near-zero velocity),
@@ -142,17 +149,16 @@ async def test_rapid_defer_ticks_throttle_dca_risk_debug():
             m.prev_price = price
             await m._manage_open_position()
 
-    debug_lines = [l for l in cap.text.splitlines() if "[dca-risk-debug] exit_candidate=max_dca_exhausted" in l]
-    review_lines = [l for l in cap.text.splitlines() if "[max-dca-exhausted-review]" in l]
+    debug_lines = debug_lines_in(cap.text)
+    review_lines = review_lines_in(cap.text)
 
-    print(f"TEST 1: 1200 rapid DEFER ticks -> [dca-risk-debug] lines={len(debug_lines)}, "
-          f"[max-dca-exhausted-review] lines={len(review_lines)}")
-    assert len(debug_lines) == 1, (
-        f"expected exactly one throttled [dca-risk-debug] line within the 30s interval, got {len(debug_lines)}"
+    print(f"TEST 1: 1200 rapid DEFER ticks -> exit_candidate=max_dca_exhausted lines={len(debug_lines)}")
+    assert len(debug_lines) == 0, (
+        f"the removed [dca-risk-debug] line must NEVER print, got {len(debug_lines)}"
     )
-    print("TEST 1: PASS - [dca-risk-debug] throttled to a single line across 1200 rapid DEFER ticks\n")
+    print("TEST 1: PASS - zero exit_candidate=max_dca_exhausted lines across 1200 rapid DEFER ticks\n")
 
-    print(f"TEST 2: [max-dca-exhausted-review] lines={len(review_lines)} (must also stay throttled, unchanged)")
+    print(f"TEST 2: [max-dca-exhausted-review] lines={len(review_lines)} (must stay throttled, unchanged)")
     assert len(review_lines) == 1, (
         f"[max-dca-exhausted-review]'s existing 30s throttle must be unaffected by this fix, got {len(review_lines)}"
     )
@@ -172,23 +178,27 @@ async def test_rapid_defer_ticks_throttle_dca_risk_debug():
 
 # ============================================================================
 # TEST 5-7: recovery signals reach the existing close threshold immediately
-# after the throttle window opened (i.e. well within 30s of the last
-# [dca-risk-debug] print) - [dca-risk-debug] and decision=CLOSE must still
-# log immediately, bypassing the throttle, and exactly one close order must
-# be placed.
+# after 1,200 rapid DEFER ticks (i.e. well within any old 30s throttle
+# window) - the removed [dca-risk-debug] line must STILL never print (not
+# even once, not even on the CLOSE tick), [max-dca-exhausted-review] must
+# still log decision=CLOSE immediately, and exactly one close order must be
+# placed.
 # ============================================================================
-async def test_close_decision_bypasses_throttle_immediately():
-    print("=== test_close_decision_bypasses_throttle_immediately ===")
+async def test_close_tick_also_never_prints_dca_risk_debug():
+    print("=== test_close_tick_also_never_prints_dca_risk_debug ===")
     m = await make_manager()
     price = m.position.avg_entry_price * 0.995
 
     with Capture() as cap:
-        # Prime the throttle exactly as TEST 1 does - one DEFER tick.
-        m.current_price = price
-        m.prev_price = price
-        await m._manage_open_position()
+        # 1,200 rapid DEFER ticks first, matching the incident's tick rate,
+        # so any lingering per-instance throttle state would be primed if
+        # it still existed.
+        for _ in range(1200):
+            m.current_price = price
+            m.prev_price = price
+            await m._manage_open_position()
 
-        # Immediately (same test, well under 30s wall-clock later) push
+        # Immediately (same test, well under any 30s window) push
         # recovery-risk signals to/above MAX_HOLD_TIME_RECOVERY_MIN_AGREE
         # (2 of trend_against/high_risk/momentum_against/extreme_volatility)
         # - reusing the exact same signal formulas the code already uses.
@@ -200,20 +210,19 @@ async def test_close_decision_bypasses_throttle_immediately():
         m.current_price = price * (0.999 if m.position.side == "LONG" else 1.001)  # strong adverse velocity
         await m._manage_open_position()
 
-    debug_lines = [l for l in cap.text.splitlines() if "[dca-risk-debug] exit_candidate=max_dca_exhausted" in l]
-    review_lines = [l for l in cap.text.splitlines() if "[max-dca-exhausted-review]" in l]
+    debug_lines = debug_lines_in(cap.text)
+    review_lines = review_lines_in(cap.text)
     close_review_lines = [l for l in review_lines if "decision=CLOSE" in l]
 
-    print(f"TEST 5: [dca-risk-debug] lines={len(debug_lines)}")
-    assert len(debug_lines) == 2, (
-        "expected exactly 2 [dca-risk-debug] lines: the priming DEFER tick, plus the CLOSE tick logging "
-        f"immediately despite being well within the 30s throttle window - got {len(debug_lines)}"
+    print(f"TEST 5: exit_candidate=max_dca_exhausted lines={len(debug_lines)} (across DEFER + CLOSE ticks)")
+    assert len(debug_lines) == 0, (
+        f"the removed [dca-risk-debug] line must never print, even on the CLOSE tick, got {len(debug_lines)}"
     )
-    print("TEST 5: PASS - [dca-risk-debug] logged immediately on CLOSE, bypassing the throttle\n")
+    print("TEST 5: PASS - zero exit_candidate=max_dca_exhausted lines, including on the CLOSE tick\n")
 
     print(f"TEST 6: [max-dca-exhausted-review] decision=CLOSE lines={len(close_review_lines)}")
-    assert len(close_review_lines) == 1, "the CLOSE decision itself must be logged immediately"
-    print("TEST 6: PASS - decision=CLOSE logged immediately\n")
+    assert len(close_review_lines) == 1, "the CLOSE decision itself must still be logged immediately"
+    print("TEST 6: PASS - decision=CLOSE still logged immediately, unchanged\n")
 
     print(f"TEST 7: status={m.position.status} orders_placed={len(m.client.placed_orders)}")
     assert len(m.client.placed_orders) == 1, "exactly one close order must be placed once the recovery review closes"
@@ -221,10 +230,39 @@ async def test_close_decision_bypasses_throttle_immediately():
     print("TEST 7: PASS - exactly one close order placed\n")
 
 
+# ============================================================================
+# TEST 8: Profit Lock logging format is completely unaffected by this
+# removal - [profit-lock-debug] / [PROFITLOCK VERIFY] and their gross PnL /
+# fee estimate / net PnL / peak / floor / action fields still appear
+# exactly as before.
+# ============================================================================
+async def test_profit_lock_logging_unchanged():
+    print("=== test_profit_lock_logging_unchanged ===")
+    m = await make_manager()
+    price = m.position.avg_entry_price * 0.995
+
+    with Capture() as cap:
+        m.current_price = price
+        m.prev_price = price
+        await m._manage_open_position()
+
+    text = cap.text
+    print(f"TEST 8: [profit-lock-debug] present={'[profit-lock-debug]' in text} "
+          f"[PROFITLOCK VERIFY] present={'[PROFITLOCK VERIFY]' in text}")
+    assert "[profit-lock-debug]" in text, "[profit-lock-debug] line must still be emitted"
+    assert "[PROFITLOCK VERIFY]" in text, "[PROFITLOCK VERIFY] block must still be emitted"
+    for field in ("gross=", "fees=", "net=", "peak=", "floor=", "action="):
+        assert field in text, f"expected Profit Lock field '{field}' missing from output"
+    for field in ("gross_local=", "fee_est=", "net_local="):
+        assert field in text, f"expected [PROFITLOCK VERIFY] field '{field}' missing from output"
+    print("TEST 8: PASS - Profit Lock logging (gross/fee/net/peak/floor/action, VERIFY fields) all unchanged\n")
+
+
 async def main():
-    await test_rapid_defer_ticks_throttle_dca_risk_debug()
-    await test_close_decision_bypasses_throttle_immediately()
-    print("ALL DCA-RISK-DEBUG THROTTLE FIX TESTS PASSED")
+    await test_rapid_defer_ticks_never_print_dca_risk_debug()
+    await test_close_tick_also_never_prints_dca_risk_debug()
+    await test_profit_lock_logging_unchanged()
+    print("ALL DCA-RISK-DEBUG REMOVAL TESTS PASSED")
 
 
 if __name__ == "__main__":
