@@ -272,15 +272,16 @@ SIGNAL_DEADBAND_PCT = 0.0005
 # --- Over-trading guardrails --------------------------------------------------
 TRADE_COOLDOWN_SEC = int(os.environ.get("TRADE_COOLDOWN_SEC", "60"))
 MIN_HOLD_SEC_BEFORE_EXIT = int(os.environ.get("MIN_HOLD_SEC_BEFORE_EXIT", "60"))
-MAX_DAILY_LOSS_USDT = float(os.environ.get("MAX_DAILY_LOSS_USDT", "2.5"))
-# 2026-08 Daily Loss Protection: once today's (UTC calendar day) cumulative
-# realized PnL drops to/below -MAX_DAILY_LOSS_USDT, no NEW entries are opened
-# for the rest of that UTC day - see MartingaleManager's daily-loss tracker
-# in trading.py's on_price_tick(). An already-OPEN position keeps being
-# managed exactly as before (TP/Hard-Stop/Profit-Lock/DCA/Max-Hold-Time all
-# unaffected) - this only ever gates the FLAT-state entry decision, never
-# exit/risk management for an existing trade. Resets automatically at the
-# next UTC day boundary.
+MAX_DAILY_LOSS_USDT = float(os.environ.get("MAX_DAILY_LOSS_USDT", "0.50"))
+DAILY_PROFIT_TARGET_USDT = float(os.environ.get("DAILY_PROFIT_TARGET_USDT", "0.50"))
+# 2026-08 fee-net daily session locks: once today's (UTC calendar day)
+# cumulative REALIZED NET PnL reaches either boundary, no NEW entries are
+# opened for the rest of that UTC day. The tracker uses Binance's actual
+# commissions when available, so +$0.50 means profit AFTER fees rather than
+# a raw-price/gross-PnL target. An already-OPEN position keeps being managed
+# normally (TP/Hard-Stop/Profit-Lock/DCA/Max-Hold-Time all remain active) -
+# these values only gate the FLAT-state entry decision. Both locks reset at
+# the next UTC day boundary. Set either value <=0 to disable that side.
 
 # --- Fee-aware profit threshold ----------------------------------------------
 TAKER_FEE_RATE = float(os.environ.get("TAKER_FEE_RATE", "0.0005"))
@@ -323,6 +324,17 @@ TP_HIT_LOOKAHEAD_CANDLES = 8      # how far ahead we check "did price reach TP-i
 # --- Entry Engine V2 ---------------------------------------------------------
 ENTRY_SCORE_THRESHOLD = float(os.environ.get("ENTRY_SCORE_THRESHOLD", "0.75"))  # raised from 0.60 (2026-07 profitability fix)
 SIDEWAYS_ENTRY_SCORE_THRESHOLD = float(os.environ.get("SIDEWAYS_ENTRY_SCORE_THRESHOLD", "0.60"))  # SIDEWAYS is structurally capped lower (volatility_fit/regime_fit/momentum), all other regimes unchanged at 0.75
+# Clean Live entry evidence exposed a directional scoring hole: the entry
+# engine rewarded abs(momentum), so a strong upward move boosted a proposed
+# SHORT exactly like a LONG. In SIDEWAYS, block a meaningful counter move
+# (at least half the existing momentum-saturation scale); tiny sign jitter
+# remains governed by the normal composite score instead of a hard gate.
+SIDEWAYS_ENTRY_MOMENTUM_ALIGNMENT_ENABLED = (
+    os.environ.get("SIDEWAYS_ENTRY_MOMENTUM_ALIGNMENT_ENABLED", "true").lower() != "false"
+)
+SIDEWAYS_ENTRY_COUNTER_MOMENTUM_BLOCK_RATIO = float(
+    os.environ.get("SIDEWAYS_ENTRY_COUNTER_MOMENTUM_BLOCK_RATIO", "0.50")
+)
 ENTRY_WEIGHTS = {
     "brain_confidence": 0.30,
     "trend_confidence": 0.20,
@@ -655,6 +667,7 @@ __all__ = [
     "TRADE_COOLDOWN_SEC",
     "MIN_HOLD_SEC_BEFORE_EXIT",
     "MAX_DAILY_LOSS_USDT",
+    "DAILY_PROFIT_TARGET_USDT",
     "TAKER_FEE_RATE",
     "MIN_NET_PROFIT_USDT",
     "LIQUIDATION_SANITY_MIN_RATIO",
@@ -681,6 +694,8 @@ __all__ = [
     "TP_HIT_LOOKAHEAD_CANDLES",
     "ENTRY_SCORE_THRESHOLD",
     "SIDEWAYS_ENTRY_SCORE_THRESHOLD",
+    "SIDEWAYS_ENTRY_MOMENTUM_ALIGNMENT_ENABLED",
+    "SIDEWAYS_ENTRY_COUNTER_MOMENTUM_BLOCK_RATIO",
     "ENTRY_WEIGHTS",
     "SMART_EXIT_ENABLED",
     "SMART_EXIT_MAX_LOSS_PCT",

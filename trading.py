@@ -279,6 +279,7 @@ from config import (
     TRADE_COOLDOWN_SEC,
     MIN_HOLD_SEC_BEFORE_EXIT,
     MAX_DAILY_LOSS_USDT,
+    DAILY_PROFIT_TARGET_USDT,
     TAKER_FEE_RATE,
     MIN_NET_PROFIT_USDT,
     LIQUIDATION_WARNING_BUFFER_PCT,
@@ -301,6 +302,8 @@ from config import (
     RECENT_TRADE_WINDOW,
     ENTRY_SCORE_THRESHOLD,
     SIDEWAYS_ENTRY_SCORE_THRESHOLD,
+    SIDEWAYS_ENTRY_MOMENTUM_ALIGNMENT_ENABLED,
+    SIDEWAYS_ENTRY_COUNTER_MOMENTUM_BLOCK_RATIO,
     ENTRY_WEIGHTS,
     SMART_EXIT_ENABLED,
     SMART_EXIT_MAX_LOSS_PCT,
@@ -1062,7 +1065,26 @@ class EntryEngineV2:
         # the 0.13 weight assigned to it in ENTRY_WEIGHTS was silently dead.
         # ENTRY_MOMENTUM_SATURATION_PCT (config.py) is sized for the
         # multi-candle rolling return actually being passed in now.
-        momentum_component = clamp((abs(momentum) / ENTRY_MOMENTUM_SATURATION_PCT), 0.0, 1.0)
+        momentum_magnitude = clamp((abs(momentum) / ENTRY_MOMENTUM_SATURATION_PCT), 0.0, 1.0)
+        momentum_aligned = (
+            (conf.trend_direction == "LONG" and momentum > 0)
+            or (conf.trend_direction == "SHORT" and momentum < 0)
+        )
+        # 2026-08 clean-Live entry-quality fix: abs(momentum) used to
+        # reward a strong move even when it ran AGAINST Brain's proposed
+        # side. In SIDEWAYS, regime_fit is deliberately neutral (0.5), so
+        # nothing else checked this direction. Preserve magnitude scoring
+        # for aligned entries and give counter-momentum no positive score.
+        # A meaningful counter move is also a hard SIDEWAYS entry block;
+        # tiny sign jitter below the configured ratio remains score-only.
+        sideways_counter_momentum_blocked = (
+            SIDEWAYS_ENTRY_MOMENTUM_ALIGNMENT_ENABLED
+            and regime.regime == REGIME_SIDEWAYS
+            and momentum_magnitude >= SIDEWAYS_ENTRY_COUNTER_MOMENTUM_BLOCK_RATIO
+            and not momentum_aligned
+        )
+        regime_blocked = regime_blocked or sideways_counter_momentum_blocked
+        momentum_component = momentum_magnitude if momentum_aligned else 0.0
 
         # Regime fit: does the regime's own directional bias (slope sign)
         # agree with the brain's proposed side?
@@ -1081,6 +1103,10 @@ class EntryEngineV2:
             "volume_confirmation": volume_confirmation,
             "volatility_fit": volatility_fit,
             "momentum": momentum_component,
+            "momentum_raw": momentum,
+            "momentum_magnitude": momentum_magnitude,
+            "momentum_aligned": momentum_aligned,
+            "sideways_counter_momentum_blocked": sideways_counter_momentum_blocked,
             "regime_fit": regime_fit,
             "risk_score": conf.risk_score,
         }
@@ -1103,12 +1129,14 @@ class EntryEngineV2:
             print(color(
                 f"{now_str()} [entry-debug] regime={regime.regime} "
                 f"regime_blocked={regime_blocked} dead_market_blocked={dead_market_blocked} "
+                f"counter_momentum_blocked={sideways_counter_momentum_blocked} "
                 f"atr_pct={regime.atr_pct:.6f} "
                 f"brain_confidence={components['brain_confidence']:.4f} "
                 f"trend_confidence={components['trend_confidence']:.4f} "
                 f"volume_confirmation={components['volume_confirmation']:.4f} "
                 f"volatility_fit={components['volatility_fit']:.4f} "
-                f"momentum={components['momentum']:.4f} "
+                f"momentum={components['momentum']:.4f} raw_momentum={momentum:+.6f} "
+                f"momentum_aligned={momentum_aligned} "
                 f"regime_fit={components['regime_fit']:.4f} "
                 f"risk_score={components['risk_score']:.4f} "
                 f"final_score={score:.4f} threshold={active_threshold:.4f}",
@@ -1116,6 +1144,27 @@ class EntryEngineV2:
             ))
 
         should_enter = (not regime_blocked) and score >= active_threshold
+        # Never throttle the exact accepted tick. Previously the periodic
+        # [entry-debug] line could show a sub-threshold tick, then a real
+        # order appeared before the next 15-second log, leaving no evidence
+        # of which inputs actually authorized it. One line per real entry is
+        # low volume and freezes the decision before async fill timing can
+        # change self.last_confidence.
+        if should_enter:
+            print(color(
+                f"{now_str()} [entry-accepted] side={conf.trend_direction} "
+                f"score={score:.4f} threshold={active_threshold:.4f} "
+                f"regime={regime.regime} atr_pct={regime.atr_pct:.6f} "
+                f"brain_confidence={conf.confidence_score:.4f} "
+                f"trend_confidence={conf.trend_confidence:.4f} "
+                f"success_p={conf.success_probability:.6f} "
+                f"tp_hit_p={conf.tp_hit_probability:.6f} risk={conf.risk_score:.4f} "
+                f"volume_confirmation={volume_confirmation:.4f} "
+                f"raw_momentum={momentum:+.6f} "
+                f"momentum_magnitude={momentum_magnitude:.4f} "
+                f"momentum_aligned={momentum_aligned}",
+                GREEN,
+            ))
         return EntryDecision(should_enter, conf.trend_direction, score, components)
 
 
@@ -1644,6 +1693,7 @@ class MartingaleManager:
         self.daily_realized_pnl: float = 0.0
         self._daily_loss_tracker_date: Optional[str] = None  # UTC "YYYY-MM-DD" the current daily_realized_pnl covers
         self._last_daily_loss_block_log_ts: float = 0.0  # throttles the "entries halted" diagnostic line
+        self._last_daily_profit_block_log_ts: float = 0.0  # throttles the fee-net daily-profit lock diagnostic line
         # 2026-08 close-verification fix: a single logical "close this
         # position" action can now take more than one reduceOnly order (a
         # genuine partial fill, or a fill landing on the position in the
@@ -2444,6 +2494,13 @@ class MartingaleManager:
                 f"(-${MAX_DAILY_LOSS_USDT:.2f}) - new entries stay blocked until the next "
                 f"UTC day (existing on_price_tick() gate - unchanged).", YELLOW,
             ))
+        if DAILY_PROFIT_TARGET_USDT > 0 and daily_total >= DAILY_PROFIT_TARGET_USDT:
+            print(color(
+                f"{now_str()} [startup-accounting] today's restored realized NET PnL "
+                f"(${daily_total:+.4f}) already reached DAILY_PROFIT_TARGET_USDT "
+                f"(+${DAILY_PROFIT_TARGET_USDT:.2f}) - profit is locked and new entries "
+                f"stay blocked until the next UTC day.", GREEN,
+            ))
 
     @staticmethod
     def _file_sha256(path: str) -> Optional[str]:
@@ -3089,6 +3146,15 @@ class MartingaleManager:
             return True
         return False
 
+    def _should_log_daily_profit_block(self, interval_sec: float = 60.0) -> bool:
+        """Throttle for the fee-net daily-profit entry lock diagnostic.
+        Logging only; the boundary check itself runs on every FLAT tick."""
+        now = time.time()
+        if now - self._last_daily_profit_block_log_ts >= interval_sec:
+            self._last_daily_profit_block_log_ts = now
+            return True
+        return False
+
     def _should_log_max_hold_review(self, interval_sec: float = 30.0) -> bool:
         """Throttle for the Max Hold Time V2 'kept alive after emergency
         review' diagnostic line - debugging only, does not affect whether
@@ -3113,10 +3179,9 @@ class MartingaleManager:
 
     def _should_log_max_dca_exhausted_review(self, interval_sec: float = 30.0) -> bool:
         """Throttle for the [max-dca-exhausted-review] diagnostic line
-        (2026-08 max_dca_exhausted recovery-risk review fix) - debugging
-        only, does not affect the recovery-risk decision itself. Only
-        throttles repeated DEFER ticks; the caller always logs the CLOSE
-        decision regardless (see its own condition)."""
+        (2026-08 max_dca_exhausted exposure-cap review fix) - debugging
+        only, does not affect the exposure-cap decision itself. It keeps
+        repeated HOLD ticks readable while normal exit logic remains active."""
         now = time.time()
         if now - self._last_max_dca_exhausted_review_log_ts >= interval_sec:
             self._last_max_dca_exhausted_review_log_ts = now
@@ -3294,6 +3359,25 @@ class MartingaleManager:
                         f"${self.daily_realized_pnl:+.4f} <= -${MAX_DAILY_LOSS_USDT:.2f} limit - "
                         f"no new trades until the next UTC day (existing open positions, if any, "
                         f"are unaffected)", RED,
+                    ))
+                return
+
+            # Fee-net Daily Profit Lock: once the configured UTC-day target
+            # has been realized AFTER commissions, preserve it by refusing
+            # new exposure for the remainder of the day. This is symmetric
+            # with Daily Loss Protection above and is deliberately an
+            # entry-only gate: an already-open position is never abandoned
+            # or deprived of TP/Profit-Lock/Smart-Exit/Hard-Stop management.
+            if (
+                DAILY_PROFIT_TARGET_USDT > 0
+                and self.daily_realized_pnl >= DAILY_PROFIT_TARGET_USDT
+            ):
+                if self._should_log_daily_profit_block():
+                    print(color(
+                        f"{now_str()} [daily-profit] entries halted: today's realized NET PnL "
+                        f"${self.daily_realized_pnl:+.4f} >= +${DAILY_PROFIT_TARGET_USDT:.2f} "
+                        f"target - profit locked, no new trades until the next UTC day "
+                        f"(existing open positions, if any, are unaffected)", GREEN,
                     ))
                 return
 
@@ -4710,8 +4794,8 @@ class MartingaleManager:
             # order-status lookup during resync came back ambiguous/failed,
             # or no matching DCA-state snapshot could be found for an
             # already-open position - is blocked from any further DCA add.
-            # A confirmed dca_step >= MAX_DCA_STEPS takes the hard-boundary
-            # close below; an uncertain dca_blocked position only blocks
+            # A confirmed dca_step >= MAX_DCA_STEPS takes the exposure cap
+            # below; an uncertain dca_blocked position only blocks
             # exposure because uncertainty is not proof that 2/2 fills
             # completed. TP / Hard Stop / Smart Exit / Profit Lock / Max
             # Hold Time continue to manage either position. This is
@@ -4719,29 +4803,37 @@ class MartingaleManager:
             # count" into "never add on top of an uncertain count", instead
             # of silently defaulting to 0 and allowing more adds.
             if p.dca_step >= MAX_DCA_STEPS:
-                # 2026-08 DCA loss-deferral rollback: MAX_DCA_STEPS is now
-                # a real exposure boundary. Once the existing adverse DCA
-                # trigger is reached at 2/2, close reduceOnly immediately.
-                # The previous 2-of-4 recovery vote repeatedly deferred a
-                # slowly drifting live loser because its per-tick signals
-                # stayed quiet. This changes only the decision at the
-                # already-existing boundary; distance, sizing, and max-step
-                # configuration remain untouched.
-                print(color(
-                    f"{now_str()} [max-dca-exhausted] "
-                    f"dca_step={p.dca_step}/{MAX_DCA_STEPS} "
-                    f"pct_move={pct_move*100:.4f}% "
-                    f"dca_distance={dca_distance_pct*100:.4f}% "
-                    f"decision=CLOSE reason=hard_safety_boundary",
-                    CYAN,
-                ))
-                await self.close_position(
-                    f"max DCA steps ({MAX_DCA_STEPS}) exhausted and price still adverse "
-                    f"({pct_move*100:.2f}%, dca_distance={dca_distance_pct*100:.3f}%) - "
-                    f"closing at the hard DCA safety boundary without recovery-vote deferral",
-                    emergency=True, exit_reason_tag="max_dca_exhausted",
-                    expected_position=p,
-                )
+                # 2026-08 fee-aware exhausted-DCA correction: MAX_DCA_STEPS
+                # is a HARD ADDITIONAL-EXPOSURE boundary, not an automatic
+                # stop at the same tiny percentage used to trigger DCA.
+                #
+                # Live evidence showed why the old immediate close was
+                # economically self-defeating: after DCA #2 moved the
+                # weighted average toward the latest fill, the position was
+                # already almost 0.20% adverse to that NEW average. A few
+                # ticks later this branch closed a three-fill MARKET book,
+                # realizing $0.2085 fees and a $0.5886 net loss only 53s
+                # after DCA #2. That converts the final DCA from a recovery
+                # tool into a near-immediate fee crystallizer.
+                #
+                # At 2/2 we now only cap exposure and return. No DCA #3 can
+                # be submitted. Normal fee-net TP/Profit Lock, Smart Exit,
+                # Hard Stop, liquidation protection, and the deterministic
+                # DCA-aware 2h Max Hold boundary all ran/remain active. The
+                # existing final-DCA risk gate also already rejected DCA #2
+                # before placement whenever >=2 independent risk signals
+                # indicated low-probability recovery.
+                if self._should_log_max_dca_exhausted_review():
+                    est_net_pnl = self.estimate_net_pnl_usdt(price)
+                    print(color(
+                        f"{now_str()} [max-dca-exhausted] "
+                        f"dca_step={p.dca_step}/{MAX_DCA_STEPS} "
+                        f"pct_move={pct_move*100:.4f}% "
+                        f"dca_distance={dca_distance_pct*100:.4f}% "
+                        f"fee_net_pnl_usdt={est_net_pnl:+.4f} "
+                        f"decision=HOLD reason=exposure_capped_normal_exits_active",
+                        CYAN,
+                    ))
                 return
 
             if p.dca_blocked:
@@ -4759,9 +4851,7 @@ class MartingaleManager:
                 return
 
             # 2026-08 position_sync_ready gate (this block only - the
-            # step-exhaustion branch above, which only ever CLOSES
-            # (reduceOnly, risk-reducing, never adds exposure) is
-            # untouched and remains available regardless of readiness;
+            # step-exhaustion branch above only caps exposure and returns;
             # only a NEW DCA add - genuine additional exposure - is
             # withheld here): mirrors the identical gate on Max Hold V2 /
             # Smart Exit above, using the same shared throttle helper.
@@ -5507,11 +5597,16 @@ class MartingaleManager:
 
         step_label = "INITIAL" if role == "initial" else f"DCA #{self.position.dca_step}"
         side_color = GREEN if self.position.side == "LONG" else RED
+        fill_confidence = (
+            self.position.entry_confidence
+            if role == "initial"
+            else self.last_confidence.confidence_score
+        )
         print(color(
             f"{now_str()} ENTRY FILLED [{step_label}] {self.position.side} "
             f"qty={fill_qty} @ {fill_price:.2f}  ->  avg_entry={self.position.avg_entry_price:.2f}  "
             f"total_qty={self.position.total_qty}  leverage={self.leverage}x  margin={MARGIN_TYPE}  "
-            f"regime={self.last_regime.regime}  confidence={self.last_confidence.confidence_score:.2f}",
+            f"regime={self.last_regime.regime}  entry_confidence={fill_confidence:.2f}",
             side_color,
         ))
 

@@ -401,11 +401,14 @@ async def test_max_dca_steps_hard_limit_never_exceeded():
     )
     await manager._manage_open_position()
     assert manager.position.dca_step == 2, "dca_step itself must never exceed MAX_DCA_STEPS"
-    assert len(client.placed_orders) == 1
-    assert client.placed_orders[0].get("reduceOnly") == "true", "only a risk-reducing close is allowed"
-    assert manager.position.pending_role == "close"
+    assert len(client.placed_orders) == 0, (
+        "the exhausted DCA boundary must cap exposure: no DCA #3 and no "
+        "immediate fee-heavy close"
+    )
+    assert manager.position.status == "OPEN"
+    assert manager.position.pending_role is None
     print(f"PASS: dca_step capped at {manager.position.dca_step}/{trading.MAX_DCA_STEPS}; "
-          "hard boundary placed one reduceOnly close and no further DCA")
+          "exposure capped with normal risk-reducing exits still active and no further DCA")
 
 
 async def main():

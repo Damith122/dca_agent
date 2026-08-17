@@ -1,5 +1,5 @@
 """
-Regression tests for exhausted-DCA logging after the loss-deferral rollback.
+Regression tests for exhausted-DCA logging after the fee-aware correction.
 
 Root cause: in MartingaleManager._manage_open_position(), the
 "[dca-risk-debug] exit_candidate=max_dca_exhausted ..." diagnostic line was
@@ -15,10 +15,9 @@ throughout (dca_step=2/2, qty/avg_entry matched the exchange, no resync
 loop, no over-DCA) - this was purely a logging/observability problem.
 
 The obsolete per-tick debug line remains removed. At the existing adverse
-boundary, a confirmed 2/2 position now emits one
-`[max-dca-exhausted] ... decision=CLOSE` line and submits one reduceOnly
-close. Repeated ticks cannot spam logs or duplicate orders because the
-position immediately becomes CLOSING.
+boundary, a confirmed 2/2 position emits a throttled
+`[max-dca-exhausted] ... decision=HOLD` line, submits no DCA #3 and leaves
+normal exits active. Rapid ticks must not spam logs or place any order.
 
 Run directly: `python3 test_dca_risk_debug_throttle_fix.py`
 """
@@ -123,14 +122,14 @@ def review_lines_in(text):
 
 
 # ============================================================================
-# TEST 1-4: >=1,000 rapid ticks at the hard boundary produce exactly one
-# close decision and one reduceOnly order, with no obsolete debug spam.
+# TEST 1-4: >=1,000 rapid ticks at the exposure boundary produce one
+# throttled HOLD diagnostic, no order, and no obsolete debug spam.
 # ============================================================================
 async def test_rapid_ticks_close_once_without_dca_risk_debug():
     print("\n=== test_rapid_ticks_close_once_without_dca_risk_debug ===")
     m = await make_manager()
     # ~0.5% adverse - well under HARD_STOP_PCT (2%) - and no signals agree.
-    # The exhausted boundary must still close immediately.
+    # Exposure must stay capped while normal exits remain active.
     price = m.position.avg_entry_price * 0.995
 
     with Capture() as cap:
@@ -152,8 +151,9 @@ async def test_rapid_ticks_close_once_without_dca_risk_debug():
     assert len(review_lines) == 1, (
         f"the hard boundary must log exactly once, got {len(review_lines)}"
     )
-    assert "decision=CLOSE" in review_lines[0]
-    print("TEST 2: PASS - one immediate hard-boundary close decision logged\n")
+    assert "decision=HOLD" in review_lines[0]
+    assert "exposure_capped_normal_exits_active" in review_lines[0]
+    print("TEST 2: PASS - one throttled exposure-cap HOLD decision logged\n")
 
     print(f"TEST 3: total captured lines={len(cap.text.splitlines())} (must not be ~1200+ repeated debug lines)")
     assert len(cap.text.splitlines()) < 50, (
@@ -162,15 +162,15 @@ async def test_rapid_ticks_close_once_without_dca_risk_debug():
     print("TEST 3: PASS - total log volume stays small, not one line per tick\n")
 
     print(f"TEST 4: status={m.position.status} orders_placed={len(m.client.placed_orders)}")
-    assert m.position.status == "CLOSING"
-    assert len(m.client.placed_orders) == 1
-    assert m.client.placed_orders[0].get("reduceOnly") == "true"
-    print("TEST 4: PASS - exactly one reduceOnly close, no duplicate order\n")
+    assert m.position.status == "OPEN"
+    assert len(m.client.placed_orders) == 0
+    assert m.position.dca_step == trading.MAX_DCA_STEPS
+    print("TEST 4: PASS - exposure capped, no DCA #3 and no immediate close\n")
 
 
 # ============================================================================
-# TEST 5-7: the same immediate close happens even with 0 recovery signals;
-# signal values no longer control the exhausted boundary.
+# TEST 5-7: one HOLD diagnostic appears even with 0 recovery signals;
+# the exhausted boundary still never adds exposure.
 # ============================================================================
 async def test_close_tick_also_never_prints_dca_risk_debug():
     print("=== test_close_tick_also_never_prints_dca_risk_debug ===")
@@ -184,7 +184,7 @@ async def test_close_tick_also_never_prints_dca_risk_debug():
 
     debug_lines = debug_lines_in(cap.text)
     review_lines = review_lines_in(cap.text)
-    close_review_lines = [l for l in review_lines if "decision=CLOSE" in l]
+    hold_review_lines = [l for l in review_lines if "decision=HOLD" in l]
 
     print(f"TEST 5: exit_candidate=max_dca_exhausted lines={len(debug_lines)}")
     assert len(debug_lines) == 0, (
@@ -192,15 +192,15 @@ async def test_close_tick_also_never_prints_dca_risk_debug():
     )
     print("TEST 5: PASS - zero obsolete debug lines on the close tick\n")
 
-    print(f"TEST 6: [max-dca-exhausted] decision=CLOSE lines={len(close_review_lines)}")
-    assert len(close_review_lines) == 1, "the CLOSE decision itself must still be logged immediately"
-    print("TEST 6: PASS - decision=CLOSE logged immediately with 0 recovery signals\n")
+    print(f"TEST 6: [max-dca-exhausted] decision=HOLD lines={len(hold_review_lines)}")
+    assert len(hold_review_lines) == 1, "the exposure-cap HOLD decision must be logged"
+    print("TEST 6: PASS - decision=HOLD logged with 0 recovery signals\n")
 
     print(f"TEST 7: status={m.position.status} orders_placed={len(m.client.placed_orders)}")
-    assert len(m.client.placed_orders) == 1
-    assert m.client.placed_orders[0].get("reduceOnly") == "true"
-    assert m.position.status in ("CLOSING", "FLAT"), f"position must be closing, got status={m.position.status}"
-    print("TEST 7: PASS - exactly one close order placed\n")
+    assert len(m.client.placed_orders) == 0
+    assert m.position.status == "OPEN", f"normal exits must remain active, got status={m.position.status}"
+    assert m.position.dca_step == trading.MAX_DCA_STEPS
+    print("TEST 7: PASS - no order placed and exposure remains capped\n")
 
 
 # ============================================================================

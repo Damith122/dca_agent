@@ -45,6 +45,7 @@ os.environ.setdefault("BRAIN_LOCAL_PATH", "/tmp/test_restart_acct_brain.pkl")
 os.environ.setdefault("DCA_STATE_PATH", "/tmp/test_restart_acct_dca_state.json")
 os.environ.setdefault("BRAIN2_WARMUP_UPDATES", "5")
 os.environ.setdefault("MAX_DAILY_LOSS_USDT", "2.5")
+os.environ.setdefault("DAILY_PROFIT_TARGET_USDT", "0.5")
 # Explicit, matching the real Railway deployment this fix targets - Partial
 # TP is OFF and this fix must not depend on or interact with it either way.
 os.environ.setdefault("PARTIAL_TP_ENABLED", "false")
@@ -245,6 +246,44 @@ async def test_max_daily_loss_still_blocks_after_restart():
     )
     print(f"PASS: daily_pnl={manager.daily_realized_pnl:+.4f} correctly blocks new entries "
           f"post-restart, and survives the first _maybe_reset_daily_loss_tracker() call")
+
+
+# ============================================================================
+# 7) After restart, the fee-net daily profit target is restored from the
+#    permanent trade log and therefore cannot be bypassed by a redeploy.
+# ============================================================================
+
+async def test_daily_profit_target_still_blocks_after_restart():
+    print("\n=== test_daily_profit_target_still_blocks_after_restart ===")
+    _reset_files()
+    today = today_utc_str()
+    write_trade(0.20, f"{today} 08:00:00 UTC", order_id=11)
+    write_trade(0.31, f"{today} 09:00:00 UTC", order_id=12)
+
+    manager = await make_manager()
+    await manager.restore_runtime_accounting_from_history()
+
+    assert manager.daily_realized_pnl >= trading.DAILY_PROFIT_TARGET_USDT, (
+        f"expected daily_realized_pnl >= +{trading.DAILY_PROFIT_TARGET_USDT}, "
+        f"got {manager.daily_realized_pnl:.4f}"
+    )
+    gate_blocks_entries = (
+        trading.DAILY_PROFIT_TARGET_USDT > 0
+        and manager.daily_realized_pnl >= trading.DAILY_PROFIT_TARGET_USDT
+    )
+    assert gate_blocks_entries, (
+        "Daily Profit Target must block new entries immediately after restart"
+    )
+    pnl_before = manager.daily_realized_pnl
+    manager._maybe_reset_daily_loss_tracker()
+    assert manager.daily_realized_pnl == pnl_before, (
+        "the first daily tracker reset check after restart must preserve today's "
+        "restored fee-net profit"
+    )
+    print(
+        f"PASS: daily fee-net PnL={manager.daily_realized_pnl:+.4f} keeps new "
+        "entries locked after restart"
+    )
 
 
 # ============================================================================
@@ -542,6 +581,7 @@ async def main():
     await test_restore_trade_count_and_realized_pnl_total()
     await test_previous_day_trades_excluded_from_daily_bucket()
     await test_max_daily_loss_still_blocks_after_restart()
+    await test_daily_profit_target_still_blocks_after_restart()
     await test_corrupt_rows_fail_soft()
     await test_missing_trade_log_file_is_a_no_op()
     await test_non_dict_json_lines_fail_soft()

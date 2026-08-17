@@ -22,10 +22,10 @@ check, now gates BOTH:
 The two can never disagree, by construction, because they read the same
 variable.
 
-The loss-deferral rollback adds two hard risk boundaries while reusing the
-same configured thresholds: a DCA position closes at its DCA-aware soft Max
-Hold time, and a 2/2 position closes when the existing adverse DCA boundary
-is crossed. Recovery-vote DEFER is no longer allowed at either boundary.
+The loss-deferral rollback keeps the deterministic DCA-aware soft Max Hold
+boundary. A later fee-aware correction changed the 2/2 adverse branch from
+an immediate close into an exposure cap: no DCA #3 is possible, while normal
+TP/Profit-Lock/Smart-Exit/Hard-Stop and the 2h DCA Max Hold remain active.
 
 Explicitly NOT changed (and asserted here where practical):
   - MAX_HOLD_TIME_SEC, MAX_HOLD_TIME_HARD_CAP_SEC, MAX_HOLD_TIME_DCA_MULTIPLIER,
@@ -287,19 +287,20 @@ async def test7_hard_cap_always_wins():
 
 
 # ============================================================================
-# TEST 8: step exhaustion is a hard close independent of hold time
+# TEST 8: step exhaustion caps exposure without crystallizing an immediate
+# fee-heavy loss before the DCA-aware time boundary
 # ============================================================================
-async def test8_step_exhaustion_independent_of_time():
+async def test8_step_exhaustion_caps_exposure_before_time_boundary():
     effective = trading.MAX_HOLD_TIME_SEC * trading.MAX_HOLD_TIME_DCA_MULTIPLIER
     m = await make_manager(dca_step=trading.MAX_DCA_STEPS, held_sec=effective - 3600)  # well BEFORE soft threshold
     price = dca_trigger_price(m)
     await tick(m, price)
     print(f"TEST 8: dca_step={m.position.dca_step} (exhausted), orders={len(m.client.placed_orders)}, "
           f"status={m.position.status}")
-    assert len(m.client.placed_orders) == 1
-    assert m.client.placed_orders[0].get("reduceOnly") == "true"
-    assert m.position.pending_role == "close"
-    print("TEST 8: PASS - max_dca_exhausted hard boundary closes before the time limit\n")
+    assert len(m.client.placed_orders) == 0, "2/2 must never submit DCA #3 or an immediate fee-heavy close"
+    assert m.position.status == "OPEN"
+    assert m.position.dca_step == trading.MAX_DCA_STEPS
+    print("TEST 8: PASS - max_dca_exhausted caps exposure and leaves normal exits active\n")
 
 
 # ============================================================================
@@ -436,7 +437,7 @@ async def run_all():
     await test5_time_blocked_insufficient_signals_still_closes()
     await test6_time_blocked_sufficient_signals_closes()
     await test7_hard_cap_always_wins()
-    await test8_step_exhaustion_independent_of_time()
+    await test8_step_exhaustion_caps_exposure_before_time_boundary()
     await test9_hard_stop_unaffected()
     await test10_pending_dca_not_duplicated_across_boundary()
     await test11_restart_preserves_opened_at()

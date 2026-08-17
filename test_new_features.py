@@ -228,9 +228,9 @@ async def test_adaptive_scale_disabled_matches_legacy_behavior():
 # ----------------------------------------------------------------------------
 
 async def test_momentum_component_saturates_at_configured_threshold():
-    """momentum_component must saturate to 1.0 once |momentum| reaches
-    ENTRY_MOMENTUM_SATURATION_PCT (the multi-candle rolling-return scale),
-    not the old single-tick 0.002 threshold."""
+    """An aligned momentum_component must saturate to 1.0 once momentum
+    reaches ENTRY_MOMENTUM_SATURATION_PCT (the multi-candle rolling-return
+    scale), not the old single-tick 0.002 threshold."""
     print("\n=== test_momentum_component_saturates_at_configured_threshold ===")
     engine = trading.EntryEngineV2()
     conf = trading.ConfidenceReading(

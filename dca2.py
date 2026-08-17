@@ -154,6 +154,8 @@ from config import (
     SIGNAL_DEADBAND_PCT,
     TRADE_COOLDOWN_SEC,
     MIN_HOLD_SEC_BEFORE_EXIT,
+    MAX_DAILY_LOSS_USDT,
+    DAILY_PROFIT_TARGET_USDT,
     TAKER_FEE_RATE,
     MIN_NET_PROFIT_USDT,
     LIQUIDATION_SANITY_MIN_RATIO,
@@ -783,6 +785,10 @@ async def main() -> None:
         f"Size mult range=[{SIZE_MIN_MULT}, {SIZE_MAX_MULT}]  Partial TP={PARTIAL_TP_ENABLED} "
         f"({PARTIAL_TP_FRACTION*100:.0f}% @ {PARTIAL_TP_TRIGGER_RATIO*100:.0f}% of TP)  "
         f"Trailing stop={TRAILING_STOP_ENABLED}", GRAY,
+    ))
+    print(color(
+        f" Daily fee-net locks (UTC): profit=+${DAILY_PROFIT_TARGET_USDT:.2f}  "
+        f"loss=-${MAX_DAILY_LOSS_USDT:.2f}  (new entries only)", GRAY,
     ))
     if DRY_RUN:
         print(color(" *** DRY RUN MODE - no real orders will be sent ***", YELLOW))
