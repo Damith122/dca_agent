@@ -95,6 +95,8 @@ class FakeClient:
         self.order_resp_extra = order_resp_extra or {}
         self.get_order_calls = []
         self.get_user_trades_calls = []
+        self.placed_orders = []
+        self._next_order_id = 9900
 
     async def get_position_risk(self, symbol):
         return self.position_rows
@@ -115,6 +117,12 @@ class FakeClient:
         # first, unconditionally) - always a no-op empty result here, since
         # no test in this file depends on trade-log reconciliation.
         return []
+
+    async def place_order(self, **kwargs):
+        self.placed_orders.append(kwargs)
+        order_id = self._next_order_id
+        self._next_order_id += 1
+        return {"orderId": order_id}
 
 
 def rows_for(side: str, qty: float, avg_entry: float, symbol="SOLUSDT") -> list:
@@ -379,6 +387,8 @@ async def test_max_dca_steps_hard_limit_never_exceeded():
     print("\n=== test_max_dca_steps_hard_limit_never_exceeded ===")
     manager = await make_manager()
     open_position(manager, "LONG", qty=3.0, avg_entry=95.0, dca_step=2)  # already at MAX_DCA_STEPS
+    client = FakeClient(position_rows=rows_for("LONG", 3.0, 95.0))
+    manager.client = client
     manager.position.opened_at = time.time()
     manager.current_price = 94.5  # ~0.5% adverse - well under HARD_STOP_PCT (2%)
     manager.prev_price = 94.7
@@ -389,11 +399,13 @@ async def test_max_dca_steps_hard_limit_never_exceeded():
     manager.last_regime = trading.RegimeReading(
         regime=trading.REGIME_SIDEWAYS, atr_pct=0.001, atr_ratio=1.0,
     )
-    order_index_before = dict(manager._order_index)
     await manager._manage_open_position()
-    assert manager._order_index == order_index_before, "no order may be placed once dca_step >= MAX_DCA_STEPS"
     assert manager.position.dca_step == 2, "dca_step itself must never exceed MAX_DCA_STEPS"
-    print(f"PASS: dca_step capped at {manager.position.dca_step}/{trading.MAX_DCA_STEPS}, no further order placed")
+    assert len(client.placed_orders) == 1
+    assert client.placed_orders[0].get("reduceOnly") == "true", "only a risk-reducing close is allowed"
+    assert manager.position.pending_role == "close"
+    print(f"PASS: dca_step capped at {manager.position.dca_step}/{trading.MAX_DCA_STEPS}; "
+          "hard boundary placed one reduceOnly close and no further DCA")
 
 
 async def main():

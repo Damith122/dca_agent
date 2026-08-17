@@ -264,6 +264,20 @@ async def userdata_consumer(client: RestClient, manager: MartingaleManager) -> N
                             event = json.loads(raw)
                             etype = event.get("e")
                             if etype == "ORDER_TRADE_UPDATE":
+                                # A successful websocket handshake is not proof
+                                # that the private stream is delivering fills.
+                                # Emit one credential-free receipt marker for
+                                # completed orders so a controlled Live check can
+                                # distinguish the real user-stream path from a
+                                # later REST reconciliation.  Never include the
+                                # listenKey or the API key in this diagnostic.
+                                order = event.get("o", {})
+                                if str(order.get("X", "")).upper() == "FILLED":
+                                    print(color(
+                                        f"{now_str()} [user-ws] ORDER_TRADE_UPDATE received "
+                                        f"order_id={order.get('i')} status=FILLED",
+                                        CYAN,
+                                    ))
                                 await manager.handle_order_update(event)
                             elif etype == "ACCOUNT_UPDATE":
                                 for b in event.get("a", {}).get("B", []):

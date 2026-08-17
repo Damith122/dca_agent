@@ -1,6 +1,5 @@
 """
-Regression tests for the Max Hold Time V2 <-> DCA "time gate" fix (2026-08,
-Option B).
+Regression tests for the DCA time gate plus the DCA loss-deferral rollback.
 
 Root cause (observed on a clean Live SOLUSDT LONG trade): Max Hold Time V2's
 emergency review already reaches a genuine soft max-hold threshold
@@ -12,7 +11,7 @@ submitted after the position was already flagged for emergency review. That
 new DCA increases notional/exposure at exactly the point the bot's own
 review logic had already flagged the trade as questionable.
 
-Fix (Option B - this file's target, not a strategy change): a single shared
+The original Option-B fix introduced a single shared
 `dca_time_eligible` boolean, computed once per tick from the exact same
 held_sec_so_far / effective_max_hold_sec already used for the threshold
 check, now gates BOTH:
@@ -23,23 +22,19 @@ check, now gates BOTH:
 The two can never disagree, by construction, because they read the same
 variable.
 
-Explicitly NOT changed by this fix (and asserted here where practical):
+The loss-deferral rollback adds two hard risk boundaries while reusing the
+same configured thresholds: a DCA position closes at its DCA-aware soft Max
+Hold time, and a 2/2 position closes when the existing adverse DCA boundary
+is crossed. Recovery-vote DEFER is no longer allowed at either boundary.
+
+Explicitly NOT changed (and asserted here where practical):
   - MAX_HOLD_TIME_SEC, MAX_HOLD_TIME_HARD_CAP_SEC, MAX_HOLD_TIME_DCA_MULTIPLIER,
     MAX_HOLD_TIME_RECOVERY_MIN_AGREE, MAX_HOLD_TIME_SMALL_LOSS_PCT - no ENV
     defaults touched.
-  - The recovery-risk signal set is exactly 4 signals (trend_against,
-    high_risk, momentum_against, extreme_volatility) - NOT 5. dca_exhausted
-    is deliberately excluded from the vote (see the 2026-08 Max Hold
-    recovery-vote fix comment in trading.py) and is logged as context only.
-    Live logs reporting "2/4 signals" are correct; this file counts against
-    4, matching the actual implementation.
   - DCA sizing, spacing, distance formula, TP, Profit Lock, Smart Exit, Hard
-    Stop, and the max_dca_exhausted step-count review are all untouched.
+    Stop, and Brain are untouched.
   - This fix does not add a per-trade dollar-loss cap and does not
-    guarantee any particular loss ceiling - it only prevents a NEW DCA add
-    once the soft max-hold threshold is reached. The 8h hard cap and the
-    existing recovery-risk vote are the only mechanisms that can still force
-    a close, exactly as before.
+    guarantee any particular loss ceiling.
 
 Run directly: `python3 test_dca_time_gate_fix.py`
 """
@@ -78,9 +73,10 @@ def order_event(order_id, status, rp=0.0, n=0.0, N="USDT", ap=0.0, z=0.0):
 
 
 class FakeClient:
-    def __init__(self):
+    def __init__(self, rows=None):
         self.placed_orders = []
         self._next_id = 9000
+        self.rows = rows or []
 
     async def place_order(self, **kwargs):
         self.placed_orders.append(kwargs)
@@ -89,7 +85,7 @@ class FakeClient:
         return {"orderId": oid}
 
     async def get_position_risk(self, symbol):
-        return [{"symbol": symbol, "positionAmt": "0", "entryPrice": "0"}]
+        return self.rows
 
 
 async def make_manager(side="LONG", dca_step=1, entries=None, avg_entry=77.20,
@@ -109,6 +105,11 @@ async def make_manager(side="LONG", dca_step=1, entries=None, avg_entry=77.20,
     m.position.original_qty = total_qty
     m.position.dca_step = dca_step
     m.position.last_dca_price = 77.05 if dca_step >= 1 else None
+    m.client.rows = [{
+        "symbol": "SOLUSDT",
+        "positionAmt": str(total_qty if side == "LONG" else -total_qty),
+        "entryPrice": str(avg_entry),
+    }]
     m.last_regime = regime or trading.RegimeReading(regime=trading.REGIME_SIDEWAYS, atr_pct=0.0005, atr_ratio=1.0)
     ck = confidence_kwargs or {}
     m.last_confidence = trading.ConfidenceReading(
@@ -176,13 +177,15 @@ async def test2_at_soft_threshold_dca_blocked():
     await tick(m, price)
     print(f"TEST 2: held={(time.time()-m.position.opened_at)/3600:.4f}h >= "
           f"soft={effective/3600:.4f}h -> orders placed={len(m.client.placed_orders)}")
-    assert len(m.client.placed_orders) == 0, "no NEW DCA may be placed once held_sec_so_far >= effective_max_hold_sec"
-    print("TEST 2: PASS - DCA blocked exactly at the soft threshold\n")
+    assert len(m.client.placed_orders) == 1, "the DCA-aware timeout must place exactly one close"
+    assert m.client.placed_orders[0].get("reduceOnly") == "true"
+    assert m.position.pending_role == "close"
+    print("TEST 2: PASS - DCA blocked and position closes exactly at the soft threshold\n")
 
 
 # ============================================================================
-# TEST 3: well AFTER the soft threshold (but under hard cap) - still blocked,
-# and the max-hold review must never report "DCA opportunity available"
+# TEST 3: well AFTER the soft threshold (but under hard cap) - close without
+# any recovery-vote or "DCA opportunity available" deferral
 # ============================================================================
 async def test3_after_soft_threshold_never_defers_for_dca(capsys):
     effective = trading.MAX_HOLD_TIME_SEC * trading.MAX_HOLD_TIME_DCA_MULTIPLIER
@@ -191,12 +194,14 @@ async def test3_after_soft_threshold_never_defers_for_dca(capsys):
     await tick(m, price)
     out = capsys.readouterr().out
     print(f"TEST 3: orders placed={len(m.client.placed_orders)}")
-    assert len(m.client.placed_orders) == 0
+    assert len(m.client.placed_orders) == 1
+    assert m.client.placed_orders[0].get("reduceOnly") == "true"
     assert "DCA opportunity available" not in out, (
         "max-hold review must never defer with reason='DCA opportunity available' once DCA is time-blocked"
     )
-    assert "[dca-time-blocked]" in out, "the new time-block diagnostic line must be emitted"
-    print("TEST 3: PASS - no defer-for-DCA once time-blocked, new diagnostic present\n")
+    assert "reason=DCA soft timeout reached" in out
+    assert "action=DEFER" not in out
+    print("TEST 3: PASS - no recovery-vote defer once a DCA position reaches soft timeout\n")
 
 
 # ============================================================================
@@ -213,20 +218,19 @@ async def test4_shared_flag_never_diverges():
         held_sec_so_far = time.time() - m.position.opened_at
         dca_time_eligible_expected = held_sec_so_far < effective
         await m._manage_open_position()
-        placed = len(m.client.placed_orders) == 1
+        assert len(m.client.placed_orders) == 1
+        role = "close" if m.client.placed_orders[0].get("reduceOnly") == "true" else "dca"
+        expected_role = "dca" if dca_time_eligible_expected else "close"
         print(f"TEST 4: held={held_sec_so_far/3600:.4f}h eligible_expected={dca_time_eligible_expected} "
-              f"placed={placed}")
-        assert placed == dca_time_eligible_expected, (
-            "actual DCA placement must exactly track the same time-eligibility the review uses"
-        )
-    print("TEST 4: PASS - placement gate and review signal share one consistent boundary\n")
+              f"role={role}")
+        assert role == expected_role
+    print("TEST 4: PASS - before boundary DCA is eligible; at/after boundary only close is allowed\n")
 
 
 # ============================================================================
-# TEST 5: time-blocked with recovery signals BELOW MAX_HOLD_TIME_RECOVERY_MIN_AGREE
-# (2 of 4) - position must stay open, no DCA, no close
+# TEST 5: insufficient recovery signals may not keep a DCA position open
 # ============================================================================
-async def test5_time_blocked_insufficient_signals_stays_open():
+async def test5_time_blocked_insufficient_signals_still_closes():
     effective = trading.MAX_HOLD_TIME_SEC * trading.MAX_HOLD_TIME_DCA_MULTIPLIER
     m = await make_manager(
         dca_step=1, held_sec=effective + 300,
@@ -236,15 +240,14 @@ async def test5_time_blocked_insufficient_signals_stays_open():
     m.prev_price = m.position.avg_entry_price  # velocity ~0 -> momentum_against False
     await tick(m, price)
     print(f"TEST 5: status={m.position.status} orders={len(m.client.placed_orders)}")
-    assert m.position.status == "OPEN", "position must remain open when fewer than MAX_HOLD_TIME_RECOVERY_MIN_AGREE signals agree"
-    assert len(m.client.placed_orders) == 0, "no DCA once time-blocked, regardless of recovery-vote outcome"
-    print("TEST 5: PASS - recovery-risk vote (still only 4 signals) keeps deciding the outcome, unaffected by the DCA fix\n")
+    assert m.position.status == "CLOSING"
+    assert len(m.client.placed_orders) == 1
+    assert m.client.placed_orders[0].get("reduceOnly") == "true"
+    print("TEST 5: PASS - 0/2 recovery signals cannot defer the DCA soft-timeout close\n")
 
 
 # ============================================================================
-# TEST 6: time-blocked with recovery signals AT/ABOVE MAX_HOLD_TIME_RECOVERY_MIN_AGREE
-# (2 of 4: trend_against + momentum_against, mirroring the evidenced Live
-# trade) - position must close via max_hold_time, not via a DCA add
+# TEST 6: sufficient signals also close via the same deterministic boundary
 # ============================================================================
 async def test6_time_blocked_sufficient_signals_closes():
     effective = trading.MAX_HOLD_TIME_SEC * trading.MAX_HOLD_TIME_DCA_MULTIPLIER
@@ -264,8 +267,9 @@ async def test6_time_blocked_sufficient_signals_closes():
         "2/4 recovery-risk signals must force-close via max_hold_time "
         "(status may already resolve to FLAT if the FakeClient reports no residual exchange position)"
     )
-    assert len(m.client.placed_orders) == 0, "close must happen without ever placing a new DCA order first"
-    print("TEST 6: PASS - closes on recovery-risk vote (2/4 signals), no DCA placed en route\n")
+    assert len(m.client.placed_orders) == 1
+    assert m.client.placed_orders[0].get("reduceOnly") == "true"
+    print("TEST 6: PASS - signal values do not alter the deterministic DCA timeout close\n")
 
 
 # ============================================================================
@@ -283,9 +287,7 @@ async def test7_hard_cap_always_wins():
 
 
 # ============================================================================
-# TEST 8: step-exhaustion (max_dca_exhausted) path is untouched and stays
-# independent of hold time - it must still run even BEFORE the soft
-# threshold, and the new time-gate return must not shadow it
+# TEST 8: step exhaustion is a hard close independent of hold time
 # ============================================================================
 async def test8_step_exhaustion_independent_of_time():
     effective = trading.MAX_HOLD_TIME_SEC * trading.MAX_HOLD_TIME_DCA_MULTIPLIER
@@ -294,8 +296,10 @@ async def test8_step_exhaustion_independent_of_time():
     await tick(m, price)
     print(f"TEST 8: dca_step={m.position.dca_step} (exhausted), orders={len(m.client.placed_orders)}, "
           f"status={m.position.status}")
-    assert len(m.client.placed_orders) == 0, "already-exhausted DCA must never place a new order, time gate irrelevant here"
-    print("TEST 8: PASS - max_dca_exhausted review still runs on its own, independent of the time gate\n")
+    assert len(m.client.placed_orders) == 1
+    assert m.client.placed_orders[0].get("reduceOnly") == "true"
+    assert m.position.pending_role == "close"
+    print("TEST 8: PASS - max_dca_exhausted hard boundary closes before the time limit\n")
 
 
 # ============================================================================
@@ -429,7 +433,7 @@ async def run_all():
         cap.stop()
 
     await test4_shared_flag_never_diverges()
-    await test5_time_blocked_insufficient_signals_stays_open()
+    await test5_time_blocked_insufficient_signals_still_closes()
     await test6_time_blocked_sufficient_signals_closes()
     await test7_hard_cap_always_wins()
     await test8_step_exhaustion_independent_of_time()
