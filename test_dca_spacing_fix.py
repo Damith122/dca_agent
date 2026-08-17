@@ -220,9 +220,9 @@ async def test5_restart_restored_spacing():
 
 
 # ============================================================================
-# TEST 6: existing max_dca_exhausted behavior unchanged once truly exhausted
+# TEST 6: once truly exhausted, the hard boundary closes instead of adding
 # ============================================================================
-async def test6_max_dca_exhausted_unchanged():
+async def test6_max_dca_exhausted_closes_without_new_dca():
     m = await make_manager("LONG")
     m.position.dca_step = trading.MAX_DCA_STEPS  # already fully exhausted
     m.position.last_dca_price = 76.50
@@ -233,7 +233,8 @@ async def test6_max_dca_exhausted_unchanged():
     print(f"TEST 6: dca_step={m.position.dca_step} (exhausted), status={m.position.status}, "
           f"orders placed={len(m.client.placed_orders)}")
     assert len(m.client.placed_orders) == 0, "no new DCA must ever be placed once exhausted"
-    print("TEST 6: PASS - max_dca_exhausted path unaffected by the spacing fix\n")
+    assert m.position.status == "FLAT", "fake exchange is flat, so the hard close reconciles locally"
+    print("TEST 6: PASS - max_dca_exhausted hard boundary never adds exposure\n")
 
 
 async def main():
@@ -241,7 +242,7 @@ async def main():
     await test2_3_dca2_requires_full_spacing_long()
     await test4_short_symmetric()
     await test5_restart_restored_spacing()
-    await test6_max_dca_exhausted_unchanged()
+    await test6_max_dca_exhausted_closes_without_new_dca()
     print("ALL DCA SPACING FIX TESTS PASSED")
 
 

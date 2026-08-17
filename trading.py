@@ -3917,6 +3917,13 @@ class MartingaleManager:
 
     async def _manage_open_position(self) -> None:
         p = self.position
+        # Defense in depth: on_price_tick() only calls this method for an
+        # OPEN position, but keep the invariant local too. In particular,
+        # never evaluate a timeout close while an entry/DCA/close order is
+        # still pending; that order must first be resolved by its exact
+        # orderId through WebSocket/REST recovery.
+        if p.status != "OPEN":
+            return
         avg = p.avg_entry_price
         price = self.current_price
         if avg is None or price is None:
@@ -4289,6 +4296,41 @@ class MartingaleManager:
                 unrealized_pnl_usdt > 0
                 and self.last_regime.regime in (REGIME_STRONG_TREND, REGIME_WEAK_TREND)
             )
+            # 2026-08 DCA loss-deferral rollback: once a position has used
+            # any DCA step, the existing DCA-aware soft timeout is a hard
+            # exposure boundary. The previous recovery vote could keep a
+            # fully-sized DCA position open until the 8h hard cap when a
+            # slow adverse drift did not trip two fast market-risk signals.
+            # That exact failure was observed live (2/2 DCA, meaningful
+            # fee-net loss, 0/2 signals, repeated DEFER). Close at the
+            # already-configured effective timeout instead. No timeout,
+            # DCA distance/size, TP, Profit Lock, Smart Exit, Hard Stop, or
+            # Brain threshold is changed here.
+            if p.dca_step >= 1:
+                close_decision_reason = (
+                    "hard cap reached" if hard_cap_hit else "DCA soft timeout reached"
+                )
+                print(color(
+                    f"{now_str()} [max-hold-v2] close decision: "
+                    f"reason={close_decision_reason} "
+                    f"dca_step={p.dca_step}/{MAX_DCA_STEPS} "
+                    f"held={held_sec_so_far/3600:.2f}h "
+                    f"effective_limit={effective_max_hold_sec/3600:.2f}h "
+                    f"fee_net_pnl_usdt={unrealized_pnl_usdt:+.4f}",
+                    YELLOW,
+                ))
+                await self.close_position(
+                    f"max hold time reached for DCA position: "
+                    f"{held_sec_so_far/3600:.2f}h >= {effective_max_hold_sec/3600:.2f}h "
+                    f"(dca_step={p.dca_step}, hard_cap={hard_cap_hit}, "
+                    f"regime={self.last_regime.regime}, "
+                    f"unrealized_pnl=${unrealized_pnl_usdt:+.4f}) - "
+                    f"closing at the DCA-aware timeout instead of deferring on recovery votes",
+                    emergency=True,
+                    exit_reason_tag="max_hold_time",
+                    expected_position=p,
+                )
+                return
             # 2026-08 Max Hold Time V2 fee-net meaningful_loss fix (this
             # line only - MAX_HOLD_TIME_SMALL_LOSS_PCT itself, the
             # recovery-risk signals below, DCA sizing/spacing, TP, Profit
@@ -4667,121 +4709,53 @@ class MartingaleManager:
             # p.dca_blocked=True (see PositionState) - e.g. a REST
             # order-status lookup during resync came back ambiguous/failed,
             # or no matching DCA-state snapshot could be found for an
-            # already-open position - is treated exactly like
-            # dca_step >= MAX_DCA_STEPS for entry purposes: no further DCA
-            # add is ever placed, but every branch below (the existing
-            # max-dca-exhausted recovery-risk review / close, and - once
-            # this if-block is skipped entirely for an unblocked position -
-            # TP / Hard Stop / Smart Exit / Profit Lock / Max Hold Time)
-            # continues to manage the position exactly as before. This is
+            # already-open position - is blocked from any further DCA add.
+            # A confirmed dca_step >= MAX_DCA_STEPS takes the hard-boundary
+            # close below; an uncertain dca_blocked position only blocks
+            # exposure because uncertainty is not proof that 2/2 fills
+            # completed. TP / Hard Stop / Smart Exit / Profit Lock / Max
+            # Hold Time continue to manage either position. This is
             # the single point that turns "we don't know the true DCA step
             # count" into "never add on top of an uncertain count", instead
             # of silently defaulting to 0 and allowing more adds.
-            if p.dca_step >= MAX_DCA_STEPS or p.dca_blocked:
-                if p.dca_blocked and p.dca_step < MAX_DCA_STEPS:
-                    print(color(
-                        f"{now_str()} [dca-safety-block] side={p.side} "
-                        f"dca_step={p.dca_step}/{MAX_DCA_STEPS} reason="
-                        f"{p.dca_block_reason or 'unresolved recovery state'} - further DCA blocked "
-                        f"(treated as exhausted for entry purposes only).", RED,
-                    ))
-                # ================================================================
-                # 2026-08 - the [dca-risk-debug] exit_candidate=max_dca_exhausted
-                # TEMPORARY diagnostic print that used to live here has been
-                # fully removed (2026-08 Railway rate-limit fix, take 2). A
-                # 30s throttle was tried first but Live still showed ~2,942
-                # of these lines in ~25s (every aggTrade tick re-entered this
-                # branch faster than the throttle window could suppress at
-                # that tick rate), which kept causing Railway to rate-limit
-                # and drop other log lines (fill/close/Profit Lock output).
-                # This print never affected the recovery-risk decision or
-                # any trading behavior - it was diagnostic-only - so it is
-                # simply deleted rather than throttled again. The
-                # [max-dca-exhausted-review] line just below (with its own
-                # existing 30s throttle, and its own immediate-on-CLOSE
-                # logging) is unchanged and remains the log line for this
-                # decision.
-                # ================================================================
-                _dbg_conf = self.last_confidence
-                _dbg_regime = self.last_regime
-                # ================================================================
-                # 2026-08 Fix 2 - max_dca_exhausted recovery-risk review (this
-                # block only - DCA sizing/spacing/distance formula,
-                # MAX_DCA_STEPS, TP, Profit Lock, Smart Exit, Hard Stop, and
-                # Brain are all untouched; no further DCA order is ever
-                # placed here either way - DCA is already exhausted by
-                # definition at this point): previously this closed
-                # unconditionally the instant price crossed the exhaustion
-                # distance - the only one of the bot's three "give up on a
-                # deep-DCA position" mechanisms (the other two being
-                # Max Hold Time V2 and the final-DCA low-probability-
-                # recovery gate) with zero signal review at all. Now reuses
-                # the SAME genuine market-risk signals, identical
-                # formulas/thresholds, as Max Hold Time V2's own recovery-
-                # risk block above (trend_against, high_risk,
-                # momentum_against, extreme_volatility) and the SAME
-                # existing MAX_HOLD_TIME_RECOVERY_MIN_AGREE agreement
-                # threshold - no new formula, no new config value.
-                # dca_exhausted is deliberately NOT included as a vote here:
-                # it is guaranteed True by construction (that is the entire
-                # reason this branch is running), so counting it would be
-                # voting on position state rather than independent market
-                # evidence - it remains implicit context (this whole code
-                # path only runs when it's true) rather than a signal.
-                # ================================================================
-                velocity_for_exhausted_review = 0.0
-                if self.prev_price and self.current_price:
-                    velocity_for_exhausted_review = (self.current_price - self.prev_price) / self.prev_price
-                exhausted_recovery_signals = {
-                    "trend_against": (
-                        _dbg_conf.trend_direction is not None
-                        and _dbg_conf.trend_direction != p.side
-                        and _dbg_conf.trend_confidence >= 0.55
-                    ),
-                    "high_risk": _dbg_conf.risk_score >= 0.75,
-                    "momentum_against": (
-                        (p.side == "LONG" and velocity_for_exhausted_review < -0.0008)
-                        or (p.side == "SHORT" and velocity_for_exhausted_review > 0.0008)
-                    ),
-                    "extreme_volatility": (
-                        _dbg_regime.regime == REGIME_HIGH_VOL
-                        and _dbg_regime.atr_ratio >= REGIME_ATR_HIGH_MULT * 1.25
-                    ),
-                }
-                exhausted_agree_count = sum(1 for v in exhausted_recovery_signals.values() if v)
-                exhausted_low_probability_recovery = exhausted_agree_count >= MAX_HOLD_TIME_RECOVERY_MIN_AGREE
-
-                if exhausted_low_probability_recovery or self._should_log_max_dca_exhausted_review():
-                    print(color(
-                        f"{now_str()} [max-dca-exhausted-review] dca_step={p.dca_step}/{MAX_DCA_STEPS} "
-                        f"pct_move={pct_move*100:.4f}% dca_distance={dca_distance_pct*100:.4f}% "
-                        f"regime={_dbg_regime.regime} "
-                        f"trend_against={exhausted_recovery_signals['trend_against']} "
-                        f"momentum_against={exhausted_recovery_signals['momentum_against']} "
-                        f"high_risk={exhausted_recovery_signals['high_risk']} "
-                        f"extreme_volatility={exhausted_recovery_signals['extreme_volatility']} "
-                        f"agree_count={exhausted_agree_count}/{MAX_HOLD_TIME_RECOVERY_MIN_AGREE} "
-                        f"decision={'CLOSE' if exhausted_low_probability_recovery else 'DEFER'}", CYAN,
-                    ))
-
-                if not exhausted_low_probability_recovery:
-                    # Fewer than the required signals agree - defer safely
-                    # for this tick. No new DCA is placed (already
-                    # exhausted either way). Hard Stop, Smart Exit, TP,
-                    # Profit Lock, and Max Hold Time V2 (including its own
-                    # unconditional hard cap) all remain fully active on
-                    # subsequent ticks - this only withholds THIS specific
-                    # close.
-                    return
-
+            if p.dca_step >= MAX_DCA_STEPS:
+                # 2026-08 DCA loss-deferral rollback: MAX_DCA_STEPS is now
+                # a real exposure boundary. Once the existing adverse DCA
+                # trigger is reached at 2/2, close reduceOnly immediately.
+                # The previous 2-of-4 recovery vote repeatedly deferred a
+                # slowly drifting live loser because its per-tick signals
+                # stayed quiet. This changes only the decision at the
+                # already-existing boundary; distance, sizing, and max-step
+                # configuration remain untouched.
+                print(color(
+                    f"{now_str()} [max-dca-exhausted] "
+                    f"dca_step={p.dca_step}/{MAX_DCA_STEPS} "
+                    f"pct_move={pct_move*100:.4f}% "
+                    f"dca_distance={dca_distance_pct*100:.4f}% "
+                    f"decision=CLOSE reason=hard_safety_boundary",
+                    CYAN,
+                ))
                 await self.close_position(
                     f"max DCA steps ({MAX_DCA_STEPS}) exhausted and price still adverse "
-                    f"({pct_move*100:.2f}%, dca_distance={dca_distance_pct*100:.3f}%, "
-                    f"recovery_review={exhausted_agree_count}/{len(exhausted_recovery_signals)} signals agree: "
-                    f"{', '.join(k for k, v in exhausted_recovery_signals.items() if v)})",
+                    f"({pct_move*100:.2f}%, dca_distance={dca_distance_pct*100:.3f}%) - "
+                    f"closing at the hard DCA safety boundary without recovery-vote deferral",
                     emergency=True, exit_reason_tag="max_dca_exhausted",
                     expected_position=p,
                 )
+                return
+
+            if p.dca_blocked:
+                # Unknown recovery state is exposure-blocking, not proof of
+                # how many fills actually completed. Never submit another
+                # DCA, but do not pretend it is a confirmed 2/2 position.
+                # TP / Profit Lock / Smart Exit / Hard Stop / Max Hold ran
+                # earlier and remain available exactly as before.
+                print(color(
+                    f"{now_str()} [dca-safety-block] side={p.side} "
+                    f"dca_step={p.dca_step}/{MAX_DCA_STEPS} reason="
+                    f"{p.dca_block_reason or 'unresolved recovery state'} - further DCA blocked.",
+                    RED,
+                ))
                 return
 
             # 2026-08 position_sync_ready gate (this block only - the
