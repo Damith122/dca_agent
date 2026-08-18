@@ -292,6 +292,58 @@ LIQUIDATION_SANITY_MIN_RATIO = 0.2
 LIQUIDATION_SANITY_MAX_RATIO = 5.0
 LIQUIDATION_WARNING_BUFFER_PCT = float(os.environ.get("LIQUIDATION_WARNING_BUFFER_PCT", "0.15"))
 
+# --- Per-trade fee-net loss budget (2026-08 payoff-distribution fix) --------
+# Independent of MAX_DAILY_LOSS_USDT (a secondary, whole-day circuit
+# breaker). This is a PER-POSITION cap: once a position's estimated
+# fee-net PnL (actual accumulated entry/DCA commission + mark-to-executable
+# unrealized gross PnL - estimated closing commission) drops to
+# -(MAX_TRADE_NET_LOSS_USDT - MAX_TRADE_EXIT_BUFFER_USDT), the position is
+# closed immediately (exit_reason="max_trade_net_loss"), independent of
+# Brain/regime/DCA-availability. See trading.py's _manage_open_position()
+# for the exact calculation. Set MAX_TRADE_NET_LOSS_USDT<=0 to disable this
+# gate entirely (falls back to Hard Stop / Max Hold Time / Smart Exit only,
+# the previous behavior). Not a profitability guarantee - slippage, gaps,
+# delayed fills, and exchange outages/bans can still produce a worse result
+# than this budget targets.
+MAX_TRADE_NET_LOSS_USDT = float(os.environ.get("MAX_TRADE_NET_LOSS_USDT", "0.20"))
+MAX_TRADE_EXIT_BUFFER_USDT = float(os.environ.get("MAX_TRADE_EXIT_BUFFER_USDT", "0.05"))
+
+# --- Exchange-native protective stop (2026-08 HTTP 418 IP-ban resilience) --
+# A client-side loss check (MAX_TRADE_NET_LOSS_USDT above) cannot protect an
+# open position while the local REST client is banned/cooling down (see the
+# 2026-08 HTTP 418 incident: the bot could not submit ANY order, including a
+# risk-reducing close, for ~25 minutes). This places a server-side
+# STOP_MARKET closePosition=true order on Binance itself immediately after
+# each confirmed entry/DCA fill, computed from the same loss-budget inputs,
+# so the exchange can close the position even if this process is completely
+# unreachable. closePosition=true is used deliberately (rather than a fixed
+# reduceOnly quantity) because it is inherently reduce-only/cannot reverse
+# the position and needs no quantity bookkeeping across DCA adds - see
+# trading.py's _place_or_replace_protective_stop() for the full rationale
+# and the accepted cancel-then-replace race window.
+PROTECTIVE_STOP_ENABLED = os.environ.get("PROTECTIVE_STOP_ENABLED", "true").lower() != "false"
+PROTECTIVE_STOP_WORKING_TYPE = os.environ.get("PROTECTIVE_STOP_WORKING_TYPE", "MARK_PRICE")
+# 2026-08 protective-stop ownership fix (review finding 4): every protective
+# stop this bot places carries a newClientOrderId beginning with this prefix,
+# and startup/periodic reconciliation will ONLY adopt, replace, or cancel an
+# order whose clientOrderId carries it. A STOP_MARKET placed manually by the
+# user, or by any other system on the same account/symbol, is therefore never
+# touched. Binance's clientOrderId charset is ^[\.A-Za-z0-9_:/-]{1,36}$ - keep
+# this prefix short (<=12 chars) so the generated suffix always fits.
+PROTECTIVE_STOP_CLIENT_ID_PREFIX = os.environ.get("PROTECTIVE_STOP_CLIENT_ID_PREFIX", "bv2ps")
+# 2026-08 PROTECTION_PENDING fail-safe (review finding 3): when a protective
+# stop cannot be armed, the position is unprotected against exactly the REST
+# outage this feature exists for. Placement is retried on this interval
+# (throttled, and always skipped while a REST cooldown is active so a retry
+# can never contribute to a ban), and if protection still cannot be armed
+# after PROTECTION_PENDING_MAX_SEC of continuously trying, the position is
+# closed as a bounded, risk-reducing fail-safe rather than left indefinitely
+# unprotected. Set PROTECTION_PENDING_MAX_SEC<=0 to disable the fail-safe
+# close (retries continue; the position is then allowed to stay open
+# unprotected - not recommended).
+PROTECTIVE_STOP_RETRY_SEC = float(os.environ.get("PROTECTIVE_STOP_RETRY_SEC", "30"))
+PROTECTION_PENDING_MAX_SEC = float(os.environ.get("PROTECTION_PENDING_MAX_SEC", "300"))
+
 # --- State reconciliation grace period ----------------------------------------
 SYNC_PENDING_GRACE_SEC = int(os.environ.get("SYNC_PENDING_GRACE_SEC", "8"))
 
@@ -320,6 +372,43 @@ LABEL_HORIZON_TICKS = 10
 FEATURE_SHORT_LOOKBACK = 5
 RECENT_TRADE_WINDOW = 20
 TP_HIT_LOOKAHEAD_CANDLES = 8      # how far ahead we check "did price reach TP-ish move"
+# 2026-08 entry-quality audit note (item 10 of the Brain V2 audit - see
+# brain.py's readiness/sample-count fix for what WAS changed): confirmed
+# TP_HIT_LOOKAHEAD_CANDLES is defined here but is NOT imported/used
+# anywhere in trading.py or brain.py. The online-learning "tp_hit" head
+# (BrainV2.learn_tp_hit, called from trading.py's _learn_from_tick) is
+# labeled purely from LABEL_HORIZON_TICKS raw bookTicker ticks, not closed
+# candles, despite this constant's "CANDLES" name suggesting otherwise.
+# Deliberately left unwired rather than rearchitected in this pass: the
+# tp_hit head is an intentionally direction-agnostic "was a tradeable move
+# available" proxy (see _learn_from_tick's own comment) that is refined by
+# the side-aware success/quality heads learned at actual trade close
+# (learn_success/learn_quality, from real fee-net PnL) - moving its
+# tick-buffer to a closed-candle horizon would be a real online-learning
+# pipeline change with no concrete evidence of harm (unlike the confirmed
+# saturated-probability and entry-score-logging defects that WERE fixed),
+# so it was left alone per the "minimal targeted changes only" mandate.
+# Flagged here for a future, evidence-driven pass if warranted.
+BRAIN_HEAD_MIN_SAMPLES = int(os.environ.get("BRAIN_HEAD_MIN_SAMPLES", "20"))
+# 2026-08 entry-quality audit fix (confirmed defect - see brain.py):
+# success_model/tp_hit_model/noise_model are SGDClassifier heads that flip
+# their internal "fitted" flag True after their very FIRST partial_fit()
+# call (at trade-close time for success/quality; every LABEL_HORIZON_TICKS
+# ticks for noise/tp_hit) and, per scikit-learn's own documented behavior,
+# can report predict_proba() confidently near 0.0/1.0 from a single-class
+# or very small sample (live evidence: entry_success_prob=1.0 in the
+# attached trade log, from at most 1-2 completed trades). BrainV2 now
+# tracks a separate per-head sample counter (distinct from update_count,
+# which only reflects the trend head's tick-driven learning) and requires
+# BOTH classes to have been observed AND at least this many labeled
+# samples before a classifier head's predict_all() output is treated as
+# reliable; below that, predict_all() reports the neutral prior (0.5)
+# regardless of the underlying (possibly saturated) model output - exactly
+# like the existing "not yet fitted" default already did before any
+# training at all. Purely a reliability gate on the REPORTED probability -
+# does not change what is learned, does not reset/discard any existing
+# snapshot, and update_count/BRAIN2_WARMUP_UPDATES (the existing overall
+# is_ready() gate) are completely unchanged.
 
 # --- Entry Engine V2 ---------------------------------------------------------
 ENTRY_SCORE_THRESHOLD = float(os.environ.get("ENTRY_SCORE_THRESHOLD", "0.75"))  # raised from 0.60 (2026-07 profitability fix)
@@ -673,6 +762,13 @@ __all__ = [
     "LIQUIDATION_SANITY_MIN_RATIO",
     "LIQUIDATION_SANITY_MAX_RATIO",
     "LIQUIDATION_WARNING_BUFFER_PCT",
+    "MAX_TRADE_NET_LOSS_USDT",
+    "MAX_TRADE_EXIT_BUFFER_USDT",
+    "PROTECTIVE_STOP_ENABLED",
+    "PROTECTIVE_STOP_WORKING_TYPE",
+    "PROTECTIVE_STOP_CLIENT_ID_PREFIX",
+    "PROTECTIVE_STOP_RETRY_SEC",
+    "PROTECTION_PENDING_MAX_SEC",
     "SYNC_PENDING_GRACE_SEC",
     "CANDLE_INTERVAL_SEC",
     "CANDLE_HISTORY",
@@ -692,6 +788,7 @@ __all__ = [
     "FEATURE_SHORT_LOOKBACK",
     "RECENT_TRADE_WINDOW",
     "TP_HIT_LOOKAHEAD_CANDLES",
+    "BRAIN_HEAD_MIN_SAMPLES",
     "ENTRY_SCORE_THRESHOLD",
     "SIDEWAYS_ENTRY_SCORE_THRESHOLD",
     "SIDEWAYS_ENTRY_MOMENTUM_ALIGNMENT_ENABLED",

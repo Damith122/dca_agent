@@ -21,6 +21,13 @@ os.environ.setdefault("SMART_EXIT_ENABLED", "false")
 os.environ.setdefault("MAX_HOLD_TIME_ENABLED", "false")
 os.environ.setdefault("DAILY_PROFIT_TARGET_USDT", "0.50")
 os.environ.setdefault("MAX_DAILY_LOSS_USDT", "0.50")
+# This file exercises the pre-existing 2/2-DCA-exhaustion exposure cap and
+# the daily profit/loss target gates in isolation, at test position sizes
+# never tuned against the 2026-08 per-trade fee-net loss budget (item 5,
+# trading.py _manage_open_position) - disabled here (0 = off) so that
+# unrelated gate cannot force-close the position before the exhaustion/
+# daily-target behavior under test is exercised.
+os.environ.setdefault("MAX_TRADE_NET_LOSS_USDT", "0")
 os.environ.setdefault("TRADE_LOG_JSON_PATH", "/tmp/test_profitability_guard_trades.jsonl")
 os.environ.setdefault("TRADE_LOG_CSV_PATH", "/tmp/test_profitability_guard_trades.csv")
 os.environ.setdefault("STATS_JSON_PATH", "/tmp/test_profitability_guard_stats.json")

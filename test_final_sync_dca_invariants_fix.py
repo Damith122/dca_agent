@@ -12,6 +12,13 @@ os.environ.setdefault("DRY_RUN", "false")
 os.environ.setdefault("MAX_DCA_STEPS", "2")
 os.environ.setdefault("SMART_EXIT_ENABLED", "true")
 os.environ.setdefault("MAX_HOLD_TIME_ENABLED", "true")
+# This file exercises sync/DCA-invariant hardening (dca_step never resets,
+# no duplicate/late-fill over-DCA) in isolation, at test position sizes
+# never tuned against the 2026-08 per-trade fee-net loss budget (item 5,
+# trading.py _manage_open_position) - disabled here (0 = off) so that
+# unrelated gate cannot place its own close order and confuse the
+# zero-new-orders assertions under test.
+os.environ.setdefault("MAX_TRADE_NET_LOSS_USDT", "0")
 os.environ.setdefault("TRADE_LOG_JSON_PATH", "/tmp/test_final_invariants_trades.jsonl")
 os.environ.setdefault("TRADE_LOG_CSV_PATH", "/tmp/test_final_invariants_trades.csv")
 os.environ.setdefault("STATS_JSON_PATH", "/tmp/test_final_invariants_stats.json")

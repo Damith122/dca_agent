@@ -31,6 +31,12 @@ os.environ.setdefault("BRAIN_LOCAL_PATH", "/tmp/test_dca_spacing_brain.pkl")
 os.environ.setdefault("DCA_STATE_PATH", "/tmp/test_dca_spacing_dca_state.json")
 os.environ.setdefault("SMART_EXIT_ENABLED", "false")
 os.environ.setdefault("MAX_HOLD_TIME_SEC", "999999")
+# This file exercises DCA re-fire spacing in isolation, at a small
+# fixed test position size never tuned against the 2026-08 per-trade
+# fee-net loss budget (item 5, trading.py _manage_open_position) - disabled
+# here (0 = off) so that unrelated gate cannot preempt the spacing checks
+# under test, exactly like SMART_EXIT_ENABLED=false above.
+os.environ.setdefault("MAX_TRADE_NET_LOSS_USDT", "0")
 
 import asyncio
 import time

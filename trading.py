@@ -283,6 +283,13 @@ from config import (
     TAKER_FEE_RATE,
     MIN_NET_PROFIT_USDT,
     LIQUIDATION_WARNING_BUFFER_PCT,
+    MAX_TRADE_NET_LOSS_USDT,
+    MAX_TRADE_EXIT_BUFFER_USDT,
+    PROTECTIVE_STOP_ENABLED,
+    PROTECTIVE_STOP_WORKING_TYPE,
+    PROTECTIVE_STOP_CLIENT_ID_PREFIX,
+    PROTECTIVE_STOP_RETRY_SEC,
+    PROTECTION_PENDING_MAX_SEC,
     SYNC_PENDING_GRACE_SEC,
     CANDLE_INTERVAL_SEC,
     CANDLE_HISTORY,
@@ -1004,9 +1011,19 @@ class EntryEngineV2:
         volume_z: float,
         momentum: float,
         features: np.ndarray,
+        brain_readiness: Optional[dict] = None,
     ) -> EntryDecision:
+        # 2026-08 entry-quality audit fix (item 10): brain_readiness is
+        # purely a logging input (READY/WARMING_UP/UNRELIABLE per model
+        # head + meaningful sample counts - see BrainV2.head_readiness()) -
+        # it does not affect should_enter/score/components below in any
+        # way. The actual reliability gating already happened upstream, in
+        # BrainV2.predict_all() (confidence/success/tp_hit inputs to
+        # `conf` are already neutral-if-unreliable by the time they reach
+        # here) - this is only surfaced so the acceptance/rejection log
+        # line is auditable without cross-referencing brain internals.
         if conf.trend_direction is None or conf.trend_confidence <= 0:
-            return EntryDecision(False, None, 0.0, {})
+            return EntryDecision(False, None, 0.0, {"rejection_reason": "no directional trend signal"})
 
         # --- Regime gate (2026-07 profitability fix) ---------------------------
         # SIDEWAYS/HIGH_VOL/LOW_VOL entries had no measurable directional edge
@@ -1109,6 +1126,15 @@ class EntryEngineV2:
             "sideways_counter_momentum_blocked": sideways_counter_momentum_blocked,
             "regime_fit": regime_fit,
             "risk_score": conf.risk_score,
+            # 2026-08 entry-quality audit fix (item 10 - issue #7): quality_pred
+            # is recorded here for visibility/auditability only - it is
+            # deliberately NOT added to ENTRY_WEIGHTS/the score sum below.
+            # Confirmed: BrainV2 computes it (the quality/reward-prediction
+            # head) but it was never wired into the composite Entry Score.
+            # Left unwired in this pass rather than assigning it an
+            # untested weight from only two live trades - see the final
+            # report's entry-quality-audit section for the full rationale.
+            "quality_pred": conf.quality_pred,
         }
 
         score = 0.0
@@ -1124,6 +1150,22 @@ class EntryEngineV2:
             if regime.regime == REGIME_SIDEWAYS
             else ENTRY_SCORE_THRESHOLD
         )
+        components["threshold"] = active_threshold
+
+        should_enter = (not regime_blocked) and score >= active_threshold
+        if regime_blocked:
+            rejection_reason = (
+                "dead_market_blocked" if dead_market_blocked
+                else "sideways_counter_momentum_blocked" if sideways_counter_momentum_blocked
+                else "regime_not_allowed"
+            )
+        elif not should_enter:
+            rejection_reason = f"score {score:.4f} below threshold {active_threshold:.4f}"
+        else:
+            rejection_reason = "accepted"
+        components["rejection_reason"] = rejection_reason
+
+        readiness = brain_readiness or {}
 
         if self._should_log():
             print(color(
@@ -1139,11 +1181,18 @@ class EntryEngineV2:
                 f"momentum_aligned={momentum_aligned} "
                 f"regime_fit={components['regime_fit']:.4f} "
                 f"risk_score={components['risk_score']:.4f} "
-                f"final_score={score:.4f} threshold={active_threshold:.4f}",
+                f"quality_pred={conf.quality_pred:+.4f} "
+                f"success_p={conf.success_probability:.4f} tp_hit_p={conf.tp_hit_probability:.4f} "
+                f"final_score={score:.4f} threshold={active_threshold:.4f} "
+                f"decision={rejection_reason} "
+                f"brain_ready=[trend={readiness.get('trend','?')} "
+                f"success={readiness.get('success','?')}({readiness.get('success_samples','?')}) "
+                f"tp_hit={readiness.get('tp_hit','?')}({readiness.get('tp_hit_samples','?')}) "
+                f"noise={readiness.get('noise','?')}({readiness.get('noise_samples','?')}) "
+                f"updates={readiness.get('update_count','?')}]",
                 GRAY,
             ))
 
-        should_enter = (not regime_blocked) and score >= active_threshold
         # Never throttle the exact accepted tick. Previously the periodic
         # [entry-debug] line could show a sub-threshold tick, then a real
         # order appeared before the next 15-second log, leaving no evidence
@@ -1159,10 +1208,16 @@ class EntryEngineV2:
                 f"trend_confidence={conf.trend_confidence:.4f} "
                 f"success_p={conf.success_probability:.6f} "
                 f"tp_hit_p={conf.tp_hit_probability:.6f} risk={conf.risk_score:.4f} "
+                f"quality_pred={conf.quality_pred:+.4f} "
                 f"volume_confirmation={volume_confirmation:.4f} "
                 f"raw_momentum={momentum:+.6f} "
                 f"momentum_magnitude={momentum_magnitude:.4f} "
-                f"momentum_aligned={momentum_aligned}",
+                f"momentum_aligned={momentum_aligned} "
+                f"brain_ready=[trend={readiness.get('trend','?')} "
+                f"success={readiness.get('success','?')}({readiness.get('success_samples','?')}) "
+                f"tp_hit={readiness.get('tp_hit','?')}({readiness.get('tp_hit_samples','?')}) "
+                f"noise={readiness.get('noise','?')}({readiness.get('noise_samples','?')}) "
+                f"updates={readiness.get('update_count','?')}]",
                 GREEN,
             ))
         return EntryDecision(should_enter, conf.trend_direction, score, components)
@@ -1261,6 +1316,20 @@ TRADE_LOG_FIELDS = [
     "exit_order_id",
     "smart_exit_agree_count", "smart_exit_required_agree",
     "smart_exit_signals_fired", "smart_exit_dca_distance_pct",
+    # 2026-08 entry-quality audit fix (item 10): the composite Entry Score
+    # actually compared against the acceptance threshold, and the threshold
+    # itself - NOT the same value as entry_confidence above (which is only
+    # the brain_confidence SUB-component of that composite score; see
+    # EntryEngineV2.evaluate). Recorded so a trade's real accept/reject
+    # basis is auditable from the trade log alone.
+    "entry_composite_score", "entry_score_threshold",
+    # 2026-08 per-trade net-loss budget fix (item 5): the estimated
+    # fee-net PnL (executable bid/ask side, actual fees + estimated closing
+    # fee) at the moment the MAX_TRADE_NET_LOSS_USDT gate triggered a close
+    # - blank/0 for any trade that did not exit via that gate. Compare
+    # against this row's own net_pnl_usdt (the FINAL realized fee-net PnL)
+    # to see how much slippage/delay occurred between trigger and fill.
+    "loss_budget_trigger_est_net_pnl",
 ]
 
 
@@ -1643,6 +1712,57 @@ class PositionState:
     entry_tp_hit_prob: float = 0.5
     entry_dynamic_tp_pct: float = TAKE_PROFIT_PCT
     realized_fees_usdt: float = 0.0
+    # 2026-08 entry-quality audit fix (item 10): the actual composite Entry
+    # Score and threshold this trade was accepted under - see
+    # TRADE_LOG_FIELDS's own comment for why this differs from
+    # entry_confidence above.
+    entry_composite_score: float = 0.0
+    entry_score_threshold: float = 0.0
+    # 2026-08 per-trade net-loss budget fix (item 5): estimated fee-net PnL
+    # at the instant the MAX_TRADE_NET_LOSS_USDT gate triggered this
+    # position's close - None if this position never triggered that gate.
+    trade_loss_budget_trigger_pnl: Optional[float] = None
+
+    # -- exchange-native protective stop (item 6) ------------------------------
+    # A resting STOP_MARKET closePosition=true order on Binance itself,
+    # placed immediately after each confirmed entry/DCA fill so the
+    # position is protected even if this process cannot reach the REST API
+    # (see the HTTP 418 IP-ban incident this addresses). None whenever no
+    # such order is currently believed to be resting on the exchange.
+    protective_stop_order_id: Optional[int] = None
+    protective_stop_price: Optional[float] = None
+    # 2026-08 protective-stop ownership fix (review finding 4): the
+    # newClientOrderId this bot assigned to the currently-tracked protective
+    # stop (always prefixed PROTECTIVE_STOP_CLIENT_ID_PREFIX). Reconciliation
+    # uses the PREFIX to decide ownership (never adopting/cancelling a manual
+    # or third-party stop) and this exact value to recognise THIS position's
+    # own order. Persisted so ownership survives a restart.
+    protective_stop_client_order_id: Optional[str] = None
+    # 2026-08 cancel-confirmation fix (review finding 5): set when a cancel
+    # attempt for protective_stop_order_id failed for an indeterminate reason
+    # (network/timeout/REST cooldown/unexpected API error). The order MAY
+    # still be resting on Binance, so its id is deliberately NOT cleared -
+    # the periodic sweep in _manage_open_position() retries the cancel until
+    # it either succeeds or Binance proves the order is gone (-2011).
+    protective_stop_cancel_pending: bool = False
+    # True whenever this process cannot confirm a protective stop is
+    # correctly resting on the exchange for the current position (initial
+    # placement failed, a DCA-triggered replace failed, or startup
+    # reconciliation found none). While True: no new DCA is submitted (see
+    # _manage_open_position), and placement/replacement is retried on a
+    # throttled schedule. Never blocks TP/Hard-Stop/Profit-Lock/Smart-Exit/
+    # Max-Hold/the per-trade net-loss budget - those remain fully active
+    # and are, if anything, MORE relied upon while this is True.
+    protection_pending: bool = False
+    protection_pending_reason: Optional[str] = None
+    # 2026-08 PROTECTION_PENDING fail-safe (review finding 3): wall-clock
+    # time.time() when this position FIRST became unprotected, and the last
+    # retry attempt's timestamp. Together these drive the throttled retry
+    # (PROTECTIVE_STOP_RETRY_SEC) and the bounded fail-safe close
+    # (PROTECTION_PENDING_MAX_SEC) in _manage_open_position(). Persisted so
+    # a restart cannot silently reset the unprotected clock to zero.
+    protection_pending_since: Optional[float] = None
+    protection_last_retry_ts: float = 0.0
 
 
 class MartingaleManager:
@@ -1719,6 +1839,10 @@ class MartingaleManager:
         self._last_dca_time_blocked_log_ts: float = 0.0  # throttles the [dca-time-blocked] diagnostic line (2026-08 Option B DCA time gate)
         self._last_profit_lock_debug_log_ts: float = 0.0  # throttles the [profit-lock-debug] diagnostic line
         self._last_profit_lock_peak_update_log_ts: float = 0.0  # throttles the [profit-lock-peak] UPDATED diagnostic line
+        self._last_dca_post_step_timeout_log_ts: float = 0.0  # throttles the [dca-blocked-post-step-timeout] diagnostic line (item 8)
+        self._last_dca_loss_budget_log_ts: float = 0.0  # throttles the [dca-budget] blocked diagnostic line (item 7)
+        self._last_order_cooldown_block_log_ts: float = 0.0  # throttles the [order-cooldown-block] diagnostic line (item 4 - REST cooldown retry-storm fix)
+        self._last_protection_pending_log_ts: float = 0.0  # throttles the [protective-stop] high-severity PROTECTION_PENDING diagnostic line (item 6)
 
         # --- Brain V2 stack -----------------------------------------------------
         self.candles = CandleAggregator()
@@ -1766,6 +1890,18 @@ class MartingaleManager:
         self._last_synced_csv_hash: Dict[str, Optional[str]] = {}
 
         self._order_index: Dict[int, str] = {}
+        # 2026-08 protective-stop ownership fix (review finding 4):
+        # monotonic per-process counter feeding _new_protective_stop_client_order_id().
+        self._protective_stop_seq: int = 0
+        # 2026-08 cancel-confirmation fix (review finding 5): protective-stop
+        # order ids whose cancellation could NOT be confirmed at the moment
+        # the position went FLAT. PositionState is discarded on close, so
+        # these would otherwise be orphaned on the exchange with no local
+        # record. Swept (retried) from on_price_tick() - which runs every
+        # tick regardless of whether a position is open - until Binance
+        # either accepts the cancel or proves the order is gone.
+        self._orphan_protective_stop_ids: set = set()
+        self._last_orphan_sweep_ts: float = 0.0
         # 2026-08 hard DCA safety invariant: transient scratch field set by
         # initialize_sync() (via _resolve_pending_order_via_rest()) when a
         # pending order's REST resolution comes back ambiguous/failed
@@ -2159,6 +2295,22 @@ class MartingaleManager:
             # restart instead of silently clearing back to "DCA allowed".
             "dca_blocked": p.dca_blocked,
             "dca_block_reason": p.dca_block_reason,
+            # item 6 - exchange-native protective stop: persisted so a
+            # restart can recognize an already-placed protective stop
+            # (avoiding a spurious PROTECTION_PENDING/replace on a healthy
+            # position) and so a genuinely PROTECTION_PENDING position
+            # survives a restart still correctly blocking new DCA until
+            # reconcile_protective_stop_on_startup() (dca2.py) or the next
+            # entry/DCA fill resolves it. Restored under the same
+            # side/qty/avg_entry_price/symbol match gate as every other
+            # field here - a mismatched snapshot never carries this over.
+            "protective_stop_order_id": p.protective_stop_order_id,
+            "protective_stop_price": p.protective_stop_price,
+            "protective_stop_client_order_id": p.protective_stop_client_order_id,
+            "protective_stop_cancel_pending": p.protective_stop_cancel_pending,
+            "protection_pending": p.protection_pending,
+            "protection_pending_reason": p.protection_pending_reason,
+            "protection_pending_since": p.protection_pending_since,
         }
 
     def _flat_dca_state_snapshot(self) -> dict:
@@ -2195,6 +2347,13 @@ class MartingaleManager:
             "position_fees_reliable": True,
             "dca_blocked": False,
             "dca_block_reason": None,
+            "protective_stop_order_id": None,
+            "protective_stop_price": None,
+            "protective_stop_client_order_id": None,
+            "protective_stop_cancel_pending": False,
+            "protection_pending": False,
+            "protection_pending_reason": None,
+            "protection_pending_since": None,
         }
 
     async def save_dca_state(self, reason: str, payload_override: Optional[dict] = None) -> None:
@@ -2952,6 +3111,72 @@ class MartingaleManager:
         fees = self.estimate_round_trip_fee_usdt(use_qty, p.avg_entry_price, exit_price)
         return gross - fees
 
+    def estimate_net_pnl_usdt_executable(
+        self, extra_qty: float = 0.0, extra_entry_price: Optional[float] = None,
+    ) -> float:
+        """Conservative fee-net PnL estimate used ONLY by the per-trade
+        net-loss budget (item 5), the DCA loss-budget gate (item 7), and
+        the protective-stop price calculation (item 6) - deliberately
+        separate from estimate_net_pnl_usdt() above (used by Profit Lock /
+        max-hold diagnostics / the max-dca-exhausted review) so this
+        change cannot alter any of THEIR existing behavior.
+
+        Differs from estimate_net_pnl_usdt() in two ways the loss-budget
+        gate specifically requires: (1) uses the EXECUTABLE closing-side
+        price - best_bid for closing a LONG, best_ask for closing a SHORT -
+        instead of the mid/mark price, since that is the price a real
+        reduceOnly MARKET close would actually fill near; (2) uses the
+        ACTUAL accumulated commission (_position_fees_accum) when reliable,
+        falling back to a rate-based estimate only when it isn't, instead
+        of always estimating both legs from TAKER_FEE_RATE.
+
+        `extra_qty`/`extra_entry_price` let the DCA budget gate project the
+        PnL of the position AS IT WOULD BE immediately after a prospective
+        DCA add fills, without first submitting or mutating anything -
+        pass the candidate DCA's qty/price to preview that state; leave at
+        the defaults (0.0/None) to evaluate the position exactly as it is
+        now.
+        """
+        p = self.position
+        if not p.avg_entry_price or p.total_qty <= 0:
+            return 0.0
+
+        total_qty = p.total_qty + max(extra_qty, 0.0)
+        if extra_qty > 0 and extra_entry_price:
+            total_notional = p.avg_entry_price * p.total_qty + extra_entry_price * extra_qty
+            avg_entry = total_notional / total_qty
+        else:
+            avg_entry = p.avg_entry_price
+
+        close_price = self.best_bid_price if p.side == "LONG" else self.best_ask_price
+        if not close_price:
+            close_price = self.current_price or avg_entry
+
+        if p.side == "LONG":
+            gross = (close_price - avg_entry) * total_qty
+        else:
+            gross = (avg_entry - close_price) * total_qty
+
+        if extra_qty <= 0 and self._position_fees_reliable and self._position_fees_accum > 0:
+            entry_fees = self._position_fees_accum
+        else:
+            # Either projecting a not-yet-placed DCA add (no actual
+            # commission for it exists yet) or actual fees aren't reliable
+            # for this position - estimate the WHOLE entry-side leg
+            # (existing fills + the prospective add, if any) from the
+            # configured taker rate, consistent with
+            # estimate_round_trip_fee_usdt()'s own formula.
+            base_fees = (
+                self._position_fees_accum
+                if (extra_qty <= 0 and self._position_fees_reliable and self._position_fees_accum > 0)
+                else TAKER_FEE_RATE * (p.total_qty * p.avg_entry_price)
+            )
+            extra_fee = TAKER_FEE_RATE * (extra_qty * extra_entry_price) if (extra_qty > 0 and extra_entry_price) else 0.0
+            entry_fees = base_fees + extra_fee
+
+        est_close_fee = TAKER_FEE_RATE * (total_qty * close_price)
+        return gross - entry_fees - est_close_fee
+
     # -- tick plumbing -----------------------------------------------------------
 
     def update_price_history(self, price: float) -> None:
@@ -3240,6 +3465,59 @@ class MartingaleManager:
             return True
         return False
 
+    def _should_log_dca_post_step_timeout(self, interval_sec: float = 30.0) -> bool:
+        """Throttle for the [dca-blocked-post-step-timeout] diagnostic line
+        (item 8 - prospective post-DCA max-hold gate) - debugging only,
+        does not affect whether the DCA add is actually withheld."""
+        now = time.time()
+        if now - self._last_dca_post_step_timeout_log_ts >= interval_sec:
+            self._last_dca_post_step_timeout_log_ts = now
+            return True
+        return False
+
+    def _should_log_dca_loss_budget_blocked(self, interval_sec: float = 30.0) -> bool:
+        """Throttle for the [dca-budget] blocked diagnostic line (item 7 -
+        DCA loss-budget gate) - debugging only, does not affect whether the
+        DCA add is actually withheld."""
+        now = time.time()
+        if now - self._last_dca_loss_budget_log_ts >= interval_sec:
+            self._last_dca_loss_budget_log_ts = now
+            return True
+        return False
+
+    def _should_log_order_cooldown_block(self, interval_sec: float = 20.0) -> bool:
+        """Throttle for the [order-cooldown-block] diagnostic line (item 4 -
+        REST cooldown retry-storm fix). Root cause of the live incident this
+        addresses: _place_step_order() had no cooldown awareness at all, so
+        while the shared RestClient cooldown (see exchange.py's
+        _arm_cooldown/is_cooldown_active) was active, EVERY price tick that
+        satisfied the DCA trigger distance re-entered this function, which
+        called client.place_order() -> _request(), which raised its
+        synthetic local BinanceApiError(429) immediately (no network call,
+        so no additional real rate-limit damage) - but logged a full
+        "[dca] DCA STEP order FAILED" line every single time (434 lines in
+        ~22s in the attached log). Gating here stops the redundant order
+        attempts (and their per-attempt logging) at the source, for both
+        the DCA path and the initial-entry path, without needing to await/
+        sleep inside the tick handler (which stays responsive to price
+        moves and to the cooldown clearing)."""
+        now = time.time()
+        if now - self._last_order_cooldown_block_log_ts >= interval_sec:
+            self._last_order_cooldown_block_log_ts = now
+            return True
+        return False
+
+    def _should_log_protection_pending(self, interval_sec: float = 30.0) -> bool:
+        """Throttle for the high-severity [protective-stop] PROTECTION_PENDING
+        diagnostic line (item 6) - debugging only, does not affect the
+        conservative PROTECTION_PENDING state itself or the DCA block it
+        drives."""
+        now = time.time()
+        if now - self._last_protection_pending_log_ts >= interval_sec:
+            self._last_protection_pending_log_ts = now
+            return True
+        return False
+
     def _should_log_profit_lock_debug(self, interval_sec: float = 30.0) -> bool:
         """Throttle for the [profit-lock-debug] diagnostic line (2026-08
         Profit Lock diagnostics, Issue 2) - debugging only, does not affect
@@ -3290,7 +3568,54 @@ class MartingaleManager:
 
     # -- main tick handler -----------------------------------------------------------
 
+    async def _sweep_orphan_protective_stops(self) -> None:
+        """2026-08 cancel-confirmation fix (review finding 5): retries
+        cancellation of protective-stop orders whose cancel could not be
+        confirmed at close time (see _on_close_filled). Runs regardless of
+        whether a position is currently open - an orphaned conditional order
+        resting on the exchange is a real hazard precisely when the bot
+        believes it is flat, since it could later trigger against a NEW
+        position. Throttled to PROTECTIVE_STOP_RETRY_SEC and skipped entirely
+        while a REST cooldown is armed, so it can never become a retry storm.
+        An id is dropped only when the cancel succeeds or Binance answers
+        -2011 (proving it no longer exists)."""
+        if not self._orphan_protective_stop_ids or DRY_RUN:
+            return
+        now = time.time()
+        if now - self._last_orphan_sweep_ts < PROTECTIVE_STOP_RETRY_SEC:
+            return
+        self._last_orphan_sweep_ts = now
+        is_cooldown_active = getattr(self.client, "is_cooldown_active", None)
+        if is_cooldown_active is not None and is_cooldown_active():
+            return
+        for order_id in list(self._orphan_protective_stop_ids):
+            try:
+                await self.client.cancel_order(self.symbol, order_id)
+                self._orphan_protective_stop_ids.discard(order_id)
+                print(color(
+                    f"{now_str()} [protective-stop] orphan sweep cancelled stale orderId={order_id}.",
+                    GREEN,
+                ))
+            except BinanceApiError as e:
+                if e.code == -2011:  # proven gone
+                    self._orphan_protective_stop_ids.discard(order_id)
+                    print(color(
+                        f"{now_str()} [protective-stop] orphan sweep: orderId={order_id} confirmed "
+                        f"already gone.", GRAY,
+                    ))
+                else:
+                    print(color(
+                        f"{now_str()} [protective-stop] orphan sweep: cancel orderId={order_id} "
+                        f"failed ({e}) - will retry.", YELLOW,
+                    ))
+            except Exception as e:  # noqa: BLE001 - a sweep must never crash the trading loop
+                print(color(
+                    f"{now_str()} [protective-stop] orphan sweep: cancel orderId={order_id} error "
+                    f"({e}) - will retry.", YELLOW,
+                ))
+
     async def on_price_tick(self) -> None:
+        await self._sweep_orphan_protective_stops()
         features = self.build_features()
         candles = self.candles.all_candles_incl_live()
         self.last_regime = self.regime_engine.evaluate(candles)
@@ -3435,7 +3760,10 @@ class MartingaleManager:
             # pairing left this scoring component effectively inert.
             momentum = float(features[4]) if len(features) > 4 else 0.0  # rolling_return_5
 
-            decision = self.entry_engine.evaluate(self.last_confidence, self.last_regime, volume_z, momentum, features)
+            decision = self.entry_engine.evaluate(
+                self.last_confidence, self.last_regime, volume_z, momentum, features,
+                brain_readiness=self.brain.head_readiness(),
+            )
             self.last_entry_decision = decision
             if decision.should_enter and decision.side is not None:
                 # Initial entry ALWAYS uses the configured INITIAL_ENTRY_USDT
@@ -3451,6 +3779,15 @@ class MartingaleManager:
                 self.position.entry_success_prob = self.last_confidence.success_probability
                 self.position.entry_tp_hit_prob = self.last_confidence.tp_hit_probability
                 self.position.entry_dynamic_tp_pct = self.get_dynamic_take_profit_pct()
+                # 2026-08 entry-quality audit fix (item 10 - issue #10):
+                # entry_confidence above is ONLY the brain_confidence
+                # sub-component (conf.confidence_score) - NOT the same
+                # value as the composite Entry Score actually compared
+                # against the acceptance threshold. Recorded separately so
+                # the trade log's real accept/reject basis is auditable
+                # (see TRADE_LOG_FIELDS).
+                self.position.entry_composite_score = decision.score
+                self.position.entry_score_threshold = decision.components.get("threshold", 0.0)
                 await self._place_step_order(step=0, side_signal=decision.side, size_mult=1.0)
         elif self.position.status == "OPEN":
             await self._manage_open_position()
@@ -3469,6 +3806,46 @@ class MartingaleManager:
         self, step: int, side_signal: str, size_mult: float = 1.0,
         expected_position: Optional["PositionState"] = None,
     ) -> None:
+        # item 4 - REST cooldown retry-storm fix (this check only - every
+        # other line of this function, including the DRY_RUN branch, the
+        # BinanceApiError handler, and every safety gate below, is
+        # unchanged). Root cause of the attached live incident: this
+        # function had no cooldown awareness at all, so while the shared
+        # RestClient cooldown (exchange.py's is_cooldown_active(), armed by
+        # a real Binance 418/429) was active, EVERY price tick that
+        # satisfied the DCA trigger re-entered here, reached
+        # client.place_order(), and got a synthetic local
+        # BinanceApiError(429) raised by _request() BEFORE any network call
+        # was made - safe (no real request sent, no state left dangling;
+        # the existing BinanceApiError handler below already reverts the
+        # pending-state transition correctly), but logged a full "order
+        # FAILED" line on every single tick (434 lines in ~22s in the
+        # attached log) and did needless work on every one. Checking here,
+        # before ANY state mutation or notional/qty calculation, protects
+        # both this DCA-add call site and the initial-entry call site
+        # (on_price_tick) uniformly. No sleep/await is used (would make the
+        # tick handler unresponsive) - the very next met-trigger tick after
+        # the cooldown clears re-evaluates and proceeds normally; the
+        # position's local state (status/dca_step) is left completely
+        # untouched while blocked, so this is never treated as an ambiguous
+        # fill.
+        # getattr(..., None) defensively - some test doubles for `client`
+        # (e.g. a minimal FakeClient used by unrelated regression tests)
+        # don't implement is_cooldown_active(); treated as "not in
+        # cooldown" rather than raising, matching how those tests already
+        # exercise every OTHER cooldown-unaware code path in this file.
+        # The real RestClient (exchange.py) always has this method.
+        is_cooldown_active = getattr(self.client, "is_cooldown_active", None)
+        if is_cooldown_active is not None and is_cooldown_active():
+            if step == 0 or self._should_log_order_cooldown_block():
+                remaining = self.client.cooldown_remaining()
+                step_desc = "initial entry" if step == 0 else f"DCA step {step}/{MAX_DCA_STEPS}"
+                print(color(
+                    f"{now_str()} [order-cooldown-block] {step_desc} order withheld - local REST "
+                    f"cooldown active for another {remaining:.0f}s (no network request attempted, "
+                    f"no state changed).", YELLOW,
+                ))
+            return
         # 2026-08 stale-decision safety gate - identical guard/rationale to
         # close_position()'s own (see its docstring comment): the DCA-add
         # call site inside _manage_open_position() passes its own `p` as
@@ -3789,6 +4166,36 @@ class MartingaleManager:
             return
         if self.position.status not in ("OPEN", "DCA_PENDING") or self.position.total_qty <= 0:
             return
+
+        # 2026-08 cooldown-scope fix (review finding 6). BEHAVIOR-PRESERVING:
+        # while a 418/429 cooldown is armed, exchange.py's _request() already
+        # refuses to send ANY request (it raises a synthetic 429 locally and
+        # never touches the network), so neither the pre-close positionAmt
+        # fetch nor the reduceOnly order below can possibly reach Binance -
+        # this gate does not suppress a close that would otherwise succeed,
+        # and it cannot delay risk reduction that was ever achievable.
+        #
+        # What it DOES prevent is the per-tick churn the old code produced
+        # during the 25-minute ban: every tick ran _fetch_exchange_position()
+        # (one synthetic-429 error log), flipped status OPEN -> CLOSING,
+        # failed to place the order (a second, alarming "POSITION MAY STILL
+        # BE OPEN, check manually!" log), then flipped status back to OPEN -
+        # hundreds of times. The exchange-native protective stop (item 6) is
+        # the mechanism that actually protects the position in this window;
+        # this gate just stops the local thrash and logs once per interval.
+        is_cooldown_active = getattr(self.client, "is_cooldown_active", None)
+        if not DRY_RUN and is_cooldown_active is not None and is_cooldown_active():
+            if self._should_log_order_cooldown_block():
+                remaining = getattr(self.client, "cooldown_remaining", lambda: 0.0)()
+                print(color(
+                    f"{now_str()} [order-cooldown-block] close_position(reason={reason}) cannot be "
+                    f"submitted - REST cooldown active for another {remaining:.0f}s (every request "
+                    f"is refused locally; no order can reach Binance). Position state left "
+                    f"unchanged; the close will be re-evaluated each tick and submitted as soon as "
+                    f"cooldown clears. The exchange-native protective stop remains in force.", YELLOW,
+                ))
+            return
+
         close_side = "SELL" if self.position.side == "LONG" else "BUY"
 
         # 2026-08 close-verification fix: reset the close-sequence
@@ -3864,6 +4271,18 @@ class MartingaleManager:
                         f"(no order needed) - reconciling local state to FLAT instead of submitting "
                         f"a reduceOnly order for a position that no longer exists.", YELLOW,
                     ))
+                    # item 6: never leave a stale protective stop resting
+                    # once the exchange itself already reports flat.
+                    if self.position.protective_stop_order_id is not None:
+                        confirmed_gone = await self._cancel_protective_stop(
+                            reason="exchange already flat at close time"
+                        )
+                        # review finding 5: same orphan handoff as
+                        # _on_close_filled() - the PositionState is replaced
+                        # immediately below, so an unconfirmed cancel must be
+                        # remembered at manager level or it is lost.
+                        if not confirmed_gone and self.position.protective_stop_order_id is not None:
+                            self._orphan_protective_stop_ids.add(self.position.protective_stop_order_id)
                     self.position = PositionState(last_close_time=time.time())
                     self.last_trade_action_ts = time.time()
                     asyncio.create_task(self.save_flat_dca_state(reason="exchange already flat at close time"))
@@ -3920,6 +4339,433 @@ class MartingaleManager:
             # evaluating this position on the next tick instead of it being
             # stuck in CLOSING with nothing actually pending.
             self.position.status = "OPEN"
+
+    # -- exchange-native protective stop (item 6) ------------------------------
+
+    def _compute_protective_stop_price(
+        self, extra_qty: float = 0.0, extra_entry_price: Optional[float] = None,
+    ) -> Optional[float]:
+        """Inverts estimate_net_pnl_usdt_executable()'s fee model to find
+        the STOP_MARKET trigger price at which estimated fee-net PnL first
+        reaches the per-trade loss-budget trigger
+        (-(MAX_TRADE_NET_LOSS_USDT - MAX_TRADE_EXIT_BUFFER_USDT)) - i.e.
+        the exchange-side mirror of the client-side gate in
+        _manage_open_position(). Returns None if the budget is disabled or
+        the position has no real economics yet to protect. `extra_qty`/
+        `extra_entry_price` preview the price a prospective DCA add would
+        require, exactly like estimate_net_pnl_usdt_executable()."""
+        p = self.position
+        if MAX_TRADE_NET_LOSS_USDT <= 0 or not p.avg_entry_price or p.total_qty <= 0:
+            return None
+        total_qty = p.total_qty + max(extra_qty, 0.0)
+        if total_qty <= 0:
+            return None
+        if extra_qty > 0 and extra_entry_price:
+            total_notional = p.avg_entry_price * p.total_qty + extra_entry_price * extra_qty
+            avg_entry = total_notional / total_qty
+        else:
+            avg_entry = p.avg_entry_price
+
+        trigger_net_loss = -(MAX_TRADE_NET_LOSS_USDT - MAX_TRADE_EXIT_BUFFER_USDT)
+        if extra_qty <= 0 and self._position_fees_reliable and self._position_fees_accum > 0:
+            entry_fees = self._position_fees_accum
+        else:
+            entry_fees = TAKER_FEE_RATE * (p.total_qty * p.avg_entry_price) + (
+                TAKER_FEE_RATE * (extra_qty * extra_entry_price)
+                if (extra_qty > 0 and extra_entry_price) else 0.0
+            )
+
+        # Solve gross - entry_fees - TAKER_FEE_RATE*total_qty*close == trigger
+        # for `close`, where gross is the signed move on `avg_entry`.
+        if p.side == "LONG":
+            denom = total_qty * (1 - TAKER_FEE_RATE)
+            if denom <= 0:
+                return None
+            stop_price = (trigger_net_loss + entry_fees + avg_entry * total_qty) / denom
+        else:
+            denom = total_qty * (1 + TAKER_FEE_RATE)
+            if denom <= 0:
+                return None
+            stop_price = (avg_entry * total_qty - trigger_net_loss - entry_fees) / denom
+
+        if stop_price <= 0:
+            return None
+        # 2026-08 note: round_step() only rounds DOWN (toward zero), which
+        # is the tighter/earlier-triggering direction for a SHORT stop
+        # (above entry) but the looser/later-triggering direction for a
+        # LONG stop (below entry) by at most one tick_size. MAX_TRADE_EXIT_BUFFER_USDT
+        # already reserves headroom for slippage/exit-buffer purposes that
+        # comfortably absorbs a single tick - not special-cased further.
+        return round_step(stop_price, self.filters.tick_size) if self.filters.tick_size else stop_price
+
+    def _new_protective_stop_client_order_id(self) -> str:
+        """2026-08 protective-stop ownership fix (review finding 4):
+        generates a unique, bot-owned clientOrderId for a protective stop.
+        Always begins with PROTECTIVE_STOP_CLIENT_ID_PREFIX, which is the
+        ONLY thing reconciliation uses to decide whether an order resting on
+        Binance belongs to this bot - a manual or third-party STOP_MARKET
+        never carries it and is therefore never adopted or cancelled.
+        Stays inside Binance's ^[\\.A-Za-z0-9_:/-]{1,36}$ charset/length."""
+        self._protective_stop_seq += 1
+        # Millisecond clock (mod 10 digits ~ 115 days of uniqueness) plus a
+        # per-process sequence: unique across replaces within a process and
+        # across restarts, without needing any persisted counter.
+        return f"{PROTECTIVE_STOP_CLIENT_ID_PREFIX}-{int(time.time() * 1000) % 10_000_000_000}-{self._protective_stop_seq}"[:36]
+
+    def _is_own_protective_stop(self, order: dict) -> bool:
+        """True only if `order` (a raw Binance openOrders entry) is a
+        protective stop THIS bot placed, proven by its clientOrderId prefix.
+        Everything else - including a user's own manually-placed STOP_MARKET
+        on the same symbol/side - returns False and must never be adopted,
+        replaced, or cancelled by this bot."""
+        client_id = order.get("clientOrderId") or ""
+        return isinstance(client_id, str) and client_id.startswith(PROTECTIVE_STOP_CLIENT_ID_PREFIX)
+
+    async def _cancel_protective_stop(self, reason: str) -> bool:
+        """Cancels the currently-tracked protective stop order and reports
+        whether the order is now PROVABLY gone from Binance.
+
+        2026-08 cancel-confirmation fix (review finding 5): local tracking
+        (protective_stop_order_id/price/client_order_id) is now cleared ONLY
+        when cancellation is confirmed - either the cancel call succeeded, or
+        Binance answered -2011 "Unknown order sent" which proves the order no
+        longer exists (already triggered/expired/manually cancelled). On any
+        indeterminate failure (network error, timeout, REST cooldown,
+        unexpected API error) the order may STILL be resting on the exchange,
+        so its id is deliberately retained and protective_stop_cancel_pending
+        is set; the throttled sweep in _manage_open_position() retries until
+        it is resolved. Previously this cleared the id up-front, which could
+        leave a real resting order orphaned with the bot unable to name it.
+
+        Returns True if the order is confirmed gone, False if it may still be
+        resting (caller must not assume the exchange side is clean).
+        """
+        p = self.position
+        order_id = p.protective_stop_order_id
+        if order_id is None:
+            return True
+        if DRY_RUN:
+            p.protective_stop_order_id = None
+            p.protective_stop_price = None
+            p.protective_stop_client_order_id = None
+            p.protective_stop_cancel_pending = False
+            print(color(
+                f"{now_str()} [DRY RUN] would cancel protective stop orderId={order_id} ({reason})", GRAY,
+            ))
+            return True
+
+        # A cancel is a REST request like any other: while a 418/429 cooldown
+        # is armed, exchange.py's _request() would refuse to send it anyway
+        # (raising a synthetic 429). Detect that up-front so the order id is
+        # retained and retried rather than burning a confusing error log.
+        is_cooldown_active = getattr(self.client, "is_cooldown_active", None)
+        if is_cooldown_active is not None and is_cooldown_active():
+            p.protective_stop_cancel_pending = True
+            if self._should_log_protection_pending():
+                print(color(
+                    f"{now_str()} [protective-stop] cancel orderId={order_id} deferred - REST "
+                    f"cooldown active ({reason}); keeping the tracked id so it can be cancelled "
+                    f"once cooldown clears (no orphan).", YELLOW,
+                ))
+            return False
+
+        def _confirmed_gone() -> None:
+            p.protective_stop_order_id = None
+            p.protective_stop_price = None
+            p.protective_stop_client_order_id = None
+            p.protective_stop_cancel_pending = False
+
+        try:
+            await self.client.cancel_order(self.symbol, order_id)
+            _confirmed_gone()
+            print(color(f"{now_str()} [protective-stop] cancelled orderId={order_id} ({reason})", GRAY))
+            return True
+        except BinanceApiError as e:
+            if e.code == -2011:  # "Unknown order sent" - Binance PROVES it is gone
+                _confirmed_gone()
+                print(color(
+                    f"{now_str()} [protective-stop] cancel orderId={order_id} - already gone "
+                    f"(likely triggered or expired) ({reason})", GRAY,
+                ))
+                return True
+            p.protective_stop_cancel_pending = True
+            print(color(
+                f"{now_str()} [protective-stop] cancel orderId={order_id} FAILED: {e} ({reason}) - "
+                f"order may STILL be resting; keeping the tracked id and retrying on the "
+                f"protective-stop sweep.", YELLOW,
+            ))
+            return False
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            p.protective_stop_cancel_pending = True
+            print(color(
+                f"{now_str()} [protective-stop] cancel orderId={order_id} network error: {e} ({reason}) - "
+                f"order may STILL be resting; keeping the tracked id and retrying on the "
+                f"protective-stop sweep.", YELLOW,
+            ))
+            return False
+        except Exception as e:  # noqa: BLE001 - a cancel attempt must never crash the trading loop
+            p.protective_stop_cancel_pending = True
+            print(color(
+                f"{now_str()} [protective-stop] cancel orderId={order_id} unexpected error: {e} "
+                f"({reason}) - order may STILL be resting; keeping the tracked id and retrying "
+                f"on the protective-stop sweep.", YELLOW,
+            ))
+            return False
+
+    async def _place_or_replace_protective_stop(self, reason: str) -> None:
+        """Places (or cancels-and-replaces) a server-side STOP_MARKET
+        closePosition=true protective stop for the current position, sized
+        from the per-trade loss budget (MAX_TRADE_NET_LOSS_USDT /
+        MAX_TRADE_EXIT_BUFFER_USDT - same inputs as the client-side gate in
+        _manage_open_position). closePosition=true is used deliberately
+        instead of a fixed reduceOnly quantity: per Binance USD-M Futures
+        docs this order type always closes the ENTIRE current position,
+        cannot reverse/increase it, and needs no quantity bookkeeping
+        across DCA adds (a fixed-quantity reduceOnly stop would go stale -
+        and either under- or over-close - the instant a DCA changes
+        total_qty). No-op if PROTECTIVE_STOP_ENABLED is False,
+        MAX_TRADE_NET_LOSS_USDT<=0 (budget disabled), or the position has
+        no real economics yet.
+
+        Cancel-then-replace race window (accepted risk - see the task's
+        "explain the selected replace sequence and remaining risk"
+        requirement): Binance has no atomic "amend stopPrice in place" for
+        this order type - the only way to move it is cancel + place-new,
+        two separate requests, so there is a real (normally sub-second,
+        REST-latency-bound) window with NO protective stop resting on the
+        exchange between them. The alternative (place-new-before
+        cancelling-old) was rejected: two closePosition=true STOP_MARKET
+        orders on the same side/symbol resting simultaneously in One-Way
+        Mode risk Binance rejecting the second as a duplicate/conflicting
+        conditional order, which would leave the STALE stop as the only
+        one resting - worse than a short gap with none. This gap is
+        mitigated, not eliminated, by the fact that MAX_TRADE_NET_LOSS_USDT
+        is independently evaluated client-side on every price tick and is
+        NOT dependent on this order existing - this protective stop exists
+        specifically for when the client-side check cannot run at all
+        (REST cooldown/ban, process restart/outage). If placement fails,
+        the position enters PROTECTION_PENDING (new DCA blocked, existing
+        risk-reducing exits unaffected) rather than continuing silently
+        unprotected.
+        """
+        p = self.position
+        if not PROTECTIVE_STOP_ENABLED or MAX_TRADE_NET_LOSS_USDT <= 0:
+            return
+        if p.status != "OPEN" or not p.avg_entry_price or p.total_qty <= 0 or p.side not in ("LONG", "SHORT"):
+            return
+
+        stop_price = self._compute_protective_stop_price()
+        if stop_price is None:
+            return
+
+        # 2026-08 cooldown-scope fix (review finding 6): a placement attempt
+        # during an armed 418/429 cooldown cannot succeed - exchange.py's
+        # _request() refuses to send it and raises a synthetic 429 - so
+        # attempting one only produces a HIGH SEVERITY failure log on every
+        # caller tick. Mark the position PROTECTION_PENDING (so DCA stays
+        # blocked and the retry/fail-safe clock in _manage_open_position()
+        # runs) and return without touching REST at all.
+        is_cooldown_active = getattr(self.client, "is_cooldown_active", None)
+        if is_cooldown_active is not None and is_cooldown_active():
+            self._mark_protection_pending(f"REST cooldown active - placement deferred ({reason})")
+            if self._should_log_protection_pending():
+                print(color(
+                    f"{now_str()} [protective-stop] placement deferred - REST cooldown active "
+                    f"({reason}); position is PROTECTION_PENDING (new DCA blocked) and placement "
+                    f"will be retried once cooldown clears.", YELLOW,
+                ))
+            return
+
+        # 2026-08 cancel-confirmation fix (review finding 5): if the old
+        # order could NOT be confirmed cancelled, do not place a second
+        # protective stop on top of it - two resting closePosition=true
+        # STOP_MARKETs is exactly the duplicate-order state this sequence
+        # exists to avoid. Leave the tracked id in place and let the sweep
+        # retry the cancel first.
+        if p.protective_stop_order_id is not None:
+            confirmed_gone = await self._cancel_protective_stop(reason=f"replacing before: {reason}")
+            if not confirmed_gone:
+                self._mark_protection_pending(
+                    f"stale protective stop orderId={p.protective_stop_order_id} could not be "
+                    f"confirmed cancelled - not placing a replacement on top of it ({reason})"
+                )
+                return
+
+        close_side = "SELL" if p.side == "LONG" else "BUY"
+        client_order_id = self._new_protective_stop_client_order_id()
+
+        if DRY_RUN:
+            fake_id = -(int(time.time() * 1000) % 1_000_000) - 800000
+            p.protective_stop_order_id = fake_id
+            p.protective_stop_price = stop_price
+            p.protective_stop_client_order_id = client_order_id
+            p.protective_stop_cancel_pending = False
+            self._clear_protection_pending()
+            # Register in the same fill-routing map every other order uses,
+            # so a simulated protective-stop fill routes identically.
+            self._order_index[fake_id] = "protective_stop"
+            print(color(
+                f"{now_str()} [DRY RUN] would place PROTECTIVE STOP {close_side} "
+                f"closePosition=true stopPrice={stop_price:.4f} {self.symbol} "
+                f"clientOrderId={client_order_id} ({reason})", GRAY,
+            ))
+            return
+
+        try:
+            resp = await self.client.place_order(
+                symbol=self.symbol, side=close_side, type="STOP_MARKET",
+                stopPrice=f"{stop_price:.8f}", closePosition="true",
+                workingType=PROTECTIVE_STOP_WORKING_TYPE,
+                newClientOrderId=client_order_id,
+            )
+            order_id = resp["orderId"]
+            p.protective_stop_order_id = order_id
+            p.protective_stop_price = stop_price
+            p.protective_stop_client_order_id = client_order_id
+            p.protective_stop_cancel_pending = False
+            self._clear_protection_pending()
+            print(color(
+                f"{now_str()} [protective-stop] PLACED {close_side} closePosition=true "
+                f"stopPrice={stop_price:.4f} {self.symbol} orderId={order_id} "
+                f"clientOrderId={client_order_id} "
+                f"workingType={PROTECTIVE_STOP_WORKING_TYPE} ({reason})", CYAN,
+            ))
+            # 2026-08 protective-stop fill-routing fix (review finding 2):
+            # register this order in _order_index under its own role BEFORE
+            # anything else can await, so a later ORDER_TRADE_UPDATE FILLED
+            # event for it is routed through the normal close bookkeeping
+            # (_on_close_filled) instead of being dropped as
+            # "untracked_order_id". _register_order_and_replay() also
+            # replays a FILLED event that arrived BEFORE this registration
+            # (the exchange can trigger a stop the instant it is accepted),
+            # so the fill cannot be lost in either ordering.
+            already_filled = await self._register_order_and_replay(order_id, "protective_stop")
+            if not already_filled:
+                # Persist AFTER registration so the snapshot can never claim
+                # a protective stop that this process has not yet wired up
+                # for fill routing.
+                asyncio.create_task(self.save_dca_state(reason=f"protective stop placed: {reason}"))
+        except Exception as e:  # noqa: BLE001 - order placement must never crash the trading loop (matches _place_reduce_only_close_order's own convention; covers BinanceApiError/aiohttp/timeout and any unexpected error e.g. a missing/None client in a test harness)
+            p.protective_stop_order_id = None
+            p.protective_stop_price = None
+            p.protective_stop_client_order_id = None
+            p.protective_stop_cancel_pending = False
+            self._mark_protection_pending(f"placement failed: {e}")
+            print(color(
+                f"{now_str()} [protective-stop] *** HIGH SEVERITY *** failed to place protective "
+                f"stop for {self.symbol} ({reason}): {e} - position is UNPROTECTED against a REST "
+                f"outage/ban; entering PROTECTION_PENDING (new DCA blocked; client-side risk exits "
+                f"remain active; placement will be retried).", RED,
+            ))
+            asyncio.create_task(self.save_dca_state(reason="protective stop placement failed"))
+
+    async def _protective_stop_sweep(self, expected_position: Optional["PositionState"] = None) -> None:
+        """2026-08 review findings 3 + 5: the single periodic maintenance
+        pass for the exchange-native protective stop, called once per tick
+        from _manage_open_position().
+
+        Three responsibilities, in priority order:
+
+        1. **Stale-cancel retry (finding 5).** If a previous cancel could not
+           be confirmed (network error/timeout/cooldown), the order id was
+           deliberately retained rather than cleared. Retry the cancel here
+           until Binance either accepts it or proves the order is gone, so a
+           real resting order can never be orphaned under a forgotten id.
+
+        2. **Arm retry (finding 3).** While PROTECTION_PENDING, retry
+           placement every PROTECTIVE_STOP_RETRY_SEC. Previously placement was
+           only ever attempted on a confirmed entry/DCA fill or at startup -
+           and since PROTECTION_PENDING itself blocks new DCA, no further fill
+           could occur, so a position that failed to arm stayed unprotected
+           for the entire life of the trade with no retry at all.
+
+        3. **Bounded fail-safe (finding 3).** If protection still cannot be
+           armed after PROTECTION_PENDING_MAX_SEC of continuous trying, close
+           the position (risk-reducing, exit_reason=protection_unavailable)
+           rather than leaving a live position indefinitely unprotected
+           against the exact REST outage this feature guards. Disabled by
+           setting PROTECTION_PENDING_MAX_SEC<=0.
+
+        Retry-storm safety: every branch is time-throttled, and all of them
+        are skipped outright while exchange.py's shared 418/429 cooldown is
+        armed (a request would be refused locally anyway) - so this adds zero
+        REST traffic during a ban and resumes only once it clears.
+        """
+        p = self.position
+        if expected_position is not None and expected_position is not self.position:
+            return
+        if not PROTECTIVE_STOP_ENABLED or MAX_TRADE_NET_LOSS_USDT <= 0:
+            return
+        if p.status not in ("OPEN", "DCA_PENDING") or p.total_qty <= 0:
+            return
+
+        # Never touch REST while a cooldown/ban is armed (finding 6).
+        is_cooldown_active = getattr(self.client, "is_cooldown_active", None)
+        if is_cooldown_active is not None and is_cooldown_active():
+            return
+
+        now = time.time()
+
+        # (1) stale-cancel retry
+        if p.protective_stop_cancel_pending and p.protective_stop_order_id is not None:
+            if now - p.protection_last_retry_ts >= PROTECTIVE_STOP_RETRY_SEC:
+                p.protection_last_retry_ts = now
+                await self._cancel_protective_stop(reason="stale-cancel sweep retry")
+            return
+
+        if not p.protection_pending:
+            return
+
+        # (2) arm retry
+        if now - p.protection_last_retry_ts >= PROTECTIVE_STOP_RETRY_SEC:
+            p.protection_last_retry_ts = now
+            unprotected_for = now - (p.protection_pending_since or now)
+            print(color(
+                f"{now_str()} [protective-stop] retrying placement - position has been "
+                f"PROTECTION_PENDING for {unprotected_for:.0f}s "
+                f"(reason={p.protection_pending_reason or 'unknown'}).", YELLOW,
+            ))
+            await self._place_or_replace_protective_stop(reason="protection-pending retry")
+            if self.position is not p or not p.protection_pending:
+                return  # successfully armed (or position swapped) - nothing further
+
+        # (3) bounded fail-safe close
+        if PROTECTION_PENDING_MAX_SEC > 0 and p.protection_pending_since is not None:
+            unprotected_for = now - p.protection_pending_since
+            if unprotected_for >= PROTECTION_PENDING_MAX_SEC:
+                print(color(
+                    f"{now_str()} [protective-stop] *** HIGH SEVERITY *** FAIL-SAFE: position has "
+                    f"been unprotected for {unprotected_for:.0f}s >= "
+                    f"{PROTECTION_PENDING_MAX_SEC:.0f}s and a protective stop still cannot be armed "
+                    f"(reason={p.protection_pending_reason or 'unknown'}) - closing now rather than "
+                    f"leaving a live position exposed to a REST outage indefinitely.", RED,
+                ))
+                await self.close_position(
+                    f"protective stop could not be armed for {unprotected_for:.0f}s "
+                    f"({p.protection_pending_reason or 'unknown'}) - bounded fail-safe close",
+                    emergency=True, exit_reason_tag="protection_unavailable",
+                    expected_position=p,
+                )
+
+    def _mark_protection_pending(self, reason: str) -> None:
+        """2026-08 PROTECTION_PENDING fail-safe (review finding 3): enters
+        (or stays in) the unprotected state, starting the unprotected clock
+        exactly once so repeated failures cannot keep resetting it and
+        thereby postpone the bounded fail-safe close forever."""
+        p = self.position
+        p.protection_pending = True
+        p.protection_pending_reason = reason
+        if p.protection_pending_since is None:
+            p.protection_pending_since = time.time()
+
+    def _clear_protection_pending(self) -> None:
+        """Clears the unprotected state and its clock - called only when a
+        protective stop is confirmed armed on the exchange."""
+        p = self.position
+        p.protection_pending = False
+        p.protection_pending_reason = None
+        p.protection_pending_since = None
+        p.protection_last_retry_ts = 0.0
 
     async def partial_close_position(self, fraction: float, reason: str) -> None:
         """Reduces the position by `fraction` of its current qty via a
@@ -4072,6 +4918,67 @@ class MartingaleManager:
                 expected_position=p,
             )
             return
+
+        # --- Protective-stop sweep: cancel retry + arm retry + fail-safe ----------
+        # 2026-08 review findings 3 and 5. Runs every tick, immediately after
+        # Hard Stop (which must never be gated by anything) and before every
+        # other exit/DCA decision, because an unprotected position is the one
+        # state this whole feature exists to prevent. All three branches are
+        # throttled and skip entirely while a REST cooldown is armed, so this
+        # can never become a retry storm or contribute to a 418 ban.
+        await self._protective_stop_sweep(expected_position=p)
+        if self.position is not p or p.status not in ("OPEN", "DCA_PENDING"):
+            # The fail-safe close (or a concurrent resync) acted - stop
+            # reasoning about a position this tick no longer owns.
+            return
+
+        # --- Per-trade fee-net loss budget (item 5 - primary behavioral fix) ------
+        # Independent of MAX_DAILY_LOSS_USDT (a secondary, whole-day circuit
+        # breaker evaluated only at the entry gate) and evaluated BEFORE
+        # Profit Lock/TP/Smart-Exit/DCA below, second in priority only to
+        # Hard Stop above - risk-reducing, can close the position regardless
+        # of Brain/regime/DCA-availability. 2026-08 correction: this gate IS
+        # gated behind position_sync_ready, like Max-Hold-V2/DCA/Smart-Exit
+        # below - it is provisional-economics-dependent (it reads
+        # p.total_qty and accumulated commission via
+        # estimate_net_pnl_usdt_executable(), exactly the kind of
+        # local-state-derived quantity the Live incident showed can be
+        # corrupted/stale across a restart), NOT a simple deterministic
+        # pct-of-entry-price check the way Hard Stop above is. Uses the
+        # EXECUTABLE bid/ask closing-side price and actual accumulated
+        # commission (see estimate_net_pnl_usdt_executable's own docstring
+        # for why this is a separate method from estimate_net_pnl_usdt,
+        # used by Profit-Lock/diagnostics elsewhere in this function and
+        # deliberately left untouched). MAX_TRADE_NET_LOSS_USDT<=0 disables
+        # this gate entirely (falls back to Hard Stop / Max Hold Time /
+        # Smart Exit only - the previous behavior).
+        if MAX_TRADE_NET_LOSS_USDT > 0 and not self.position_sync_ready:
+            if self._should_log_sync_not_ready():
+                print(color(
+                    f"{now_str()} [trade-loss-budget-skip] position_sync_ready=False - the "
+                    f"per-trade net-loss budget check is withheld until an authoritative "
+                    f"exchange sync confirms this position's real qty/entry/fees; Hard Stop "
+                    f"remains active.", YELLOW,
+                ))
+        elif MAX_TRADE_NET_LOSS_USDT > 0:
+            loss_budget_trigger = -(MAX_TRADE_NET_LOSS_USDT - MAX_TRADE_EXIT_BUFFER_USDT)
+            est_net_pnl_exec = self.estimate_net_pnl_usdt_executable()
+            if est_net_pnl_exec <= loss_budget_trigger:
+                p.trade_loss_budget_trigger_pnl = est_net_pnl_exec
+                print(color(
+                    f"{now_str()} [trade-loss-budget] TRIGGERED: estimated fee-net pnl "
+                    f"${est_net_pnl_exec:+.4f} <= trigger ${loss_budget_trigger:+.4f} "
+                    f"(budget=${MAX_TRADE_NET_LOSS_USDT:.2f}, buffer=${MAX_TRADE_EXIT_BUFFER_USDT:.2f}) - "
+                    f"closing to contain the loss before it grows toward the full budget.", RED,
+                ))
+                await self.close_position(
+                    f"per-trade net-loss budget: estimated fee-net pnl ${est_net_pnl_exec:+.4f} <= "
+                    f"-${loss_budget_trigger*-1:.2f} trigger (budget=${MAX_TRADE_NET_LOSS_USDT:.2f}, "
+                    f"buffer=${MAX_TRADE_EXIT_BUFFER_USDT:.2f})",
+                    emergency=True, exit_reason_tag="max_trade_net_loss",
+                    expected_position=p,
+                )
+                return
 
         # Breakeven stop (armed only after a partial TP has been taken): if
         # price falls back through the original average entry, close the
@@ -4850,6 +5757,26 @@ class MartingaleManager:
                 ))
                 return
 
+            # item 6: while this process cannot confirm a protective stop
+            # is correctly resting on the exchange for this position
+            # (initial placement failed, a DCA-triggered replace failed, or
+            # startup reconciliation found none), do not add MORE exposure
+            # on top of an already-unprotected position. TP / Hard Stop /
+            # Profit Lock / Smart Exit / Max Hold / the per-trade net-loss
+            # budget all remain fully active and are, if anything, more
+            # relied upon while this is True - only a NEW DCA add is
+            # withheld here.
+            if p.protection_pending:
+                if self._should_log_protection_pending():
+                    print(color(
+                        f"{now_str()} [protective-stop] *** HIGH SEVERITY *** PROTECTION_PENDING "
+                        f"side={p.side} dca_step={p.dca_step}/{MAX_DCA_STEPS} reason="
+                        f"{p.protection_pending_reason or 'unknown'} - withholding new DCA add; "
+                        f"client-side risk exits (Hard Stop/Max Hold/net-loss budget) remain active.",
+                        RED,
+                    ))
+                return
+
             # 2026-08 position_sync_ready gate (this block only - the
             # step-exhaustion branch above only caps exposure and returns;
             # only a NEW DCA add - genuine additional exposure - is
@@ -4889,6 +5816,51 @@ class MartingaleManager:
                         f"held={held_sec_so_far/3600:.2f}h >= "
                         f"soft_threshold={effective_max_hold_sec/3600:.2f}h - withholding new DCA add "
                         f"(Max Hold Time V2 review governs from here)", YELLOW,
+                    ))
+                return
+
+            # item 8 - prospective post-DCA max-hold gate (this block only -
+            # every other gate/formula in this function, including
+            # dca_time_eligible/effective_max_hold_sec above, is untouched).
+            #
+            # Root cause (confirmed from the attached live incident):
+            # dca_time_eligible above is computed from effective_max_hold_sec,
+            # which uses the CURRENT p.dca_step - correct for deciding
+            # whether THIS position, as it stands right now, has timed out,
+            # but the WRONG threshold for deciding whether to SUBMIT a new
+            # DCA add. The instant this order fills, dca_step becomes >=1,
+            # which immediately multiplies the soft timeout by
+            # MAX_HOLD_TIME_DCA_MULTIPLIER (e.g. 4h -> 2h). Live evidence: a
+            # dca_step=0 position already held 3.10h passed the check above
+            # (4h soft cap, not yet reached) and DCA #1 was submitted and
+            # filled; on the very next tick, the SAME 3.10h now exceeded the
+            # post-DCA 2h soft cap, forcing an immediate max_hold_time close
+            # (net -$1.007) fractions of a second after paying DCA #1's
+            # entry commission - the DCA add could not possibly help and
+            # only added cost before a close that was already coming.
+            #
+            # Fix: compute the timeout that WILL apply the instant this DCA
+            # fills (post-fill dca_step is guaranteed >=1 regardless of
+            # which step this is, so this is NOT step-dependent like
+            # effective_max_hold_sec above) and withhold the DCA if the
+            # position is ALREADY past that prospective threshold. Max Hold
+            # Time V2's own recovery-risk review (evaluated earlier this
+            # same tick, unconditionally) remains the sole mechanism
+            # deciding hold-vs-close from here - identical in spirit to how
+            # dca_time_eligible already hands off to it above. TP / Hard
+            # Stop / Profit Lock / Smart Exit / the per-trade net-loss
+            # budget are all unaffected - this only withholds a NEW DCA
+            # order that would otherwise be immediately, unavoidably overdue.
+            prospective_post_dca_max_hold_sec = MAX_HOLD_TIME_SEC * MAX_HOLD_TIME_DCA_MULTIPLIER
+            if MAX_HOLD_TIME_ENABLED and held_sec_so_far >= prospective_post_dca_max_hold_sec:
+                if self._should_log_dca_post_step_timeout():
+                    print(color(
+                        f"{now_str()} [dca-blocked-post-step-timeout] dca_step={p.dca_step}/{MAX_DCA_STEPS} "
+                        f"held={held_sec_so_far/3600:.2f}h >= prospective_post_dca_limit="
+                        f"{prospective_post_dca_max_hold_sec/3600:.2f}h - this DCA would be "
+                        f"immediately overdue the instant it fills; withholding the add instead of "
+                        f"paying its commission right before a forced timeout close "
+                        f"(dca_blocked_post_step_timeout).", YELLOW,
                     ))
                 return
 
@@ -5045,6 +6017,52 @@ class MartingaleManager:
                     return
 
             size_mult = self.confidence_size_multiplier(self.last_confidence, self.last_regime)
+
+            # item 7 - DCA loss-budget gate (this block only - sizing,
+            # DCA_MULTIPLIER, MAX_DCA_STEPS, dca_distance_pct, and every
+            # other DCA formula above are untouched; does NOT widen
+            # MAX_TRADE_NET_LOSS_USDT to "make room" for a DCA - the budget
+            # itself is fixed, this only decides whether the add fits
+            # inside it). Before submitting this DCA, projects the
+            # position's fee-net PnL exactly as it would be immediately
+            # after this add fills (new blended avg_entry_price, this
+            # step's own entry commission, and an updated estimated closing
+            # commission on the LARGER post-DCA quantity - see
+            # estimate_net_pnl_usdt_executable's extra_qty/extra_entry_price
+            # parameters) and blocks the add if that projection cannot stay
+            # meaningfully inside the budget. A blocked DCA does not
+            # increment dca_step (this simply returns without calling
+            # _place_step_order) and does not count as a completed DCA -
+            # TP / Hard Stop / Profit Lock / Smart Exit / Max Hold Time /
+            # the per-trade net-loss budget itself all remain fully active
+            # afterward. See section 7 of the task for the accompanying
+            # economics note: at current $80 initial notional and ~0.05%
+            # taker fees, this gate is EXPECTED to block most or all DCA
+            # activity at the currently-configured size - that is the
+            # intended, accepted trade-off of keeping a strict $0.20
+            # fee-net budget with the existing $4 margin/DCA sizing.
+            add_notional = self.notional_for_step(p.dca_step + 1, size_mult)
+            add_qty = round_step(add_notional / price, self.filters.step_size) if price else 0.0
+            if add_qty > 0:
+                projected_net_pnl = self.estimate_net_pnl_usdt_executable(
+                    extra_qty=add_qty, extra_entry_price=price,
+                )
+                if MAX_TRADE_NET_LOSS_USDT > 0:
+                    loss_budget_trigger = -(MAX_TRADE_NET_LOSS_USDT - MAX_TRADE_EXIT_BUFFER_USDT)
+                    if projected_net_pnl <= loss_budget_trigger:
+                        remaining = projected_net_pnl - loss_budget_trigger
+                        if self._should_log_dca_loss_budget_blocked():
+                            print(color(
+                                f"{now_str()} [dca-budget] blocked step={p.dca_step + 1} "
+                                f"projected_net_loss={projected_net_pnl:+.4f} "
+                                f"budget=-{MAX_TRADE_NET_LOSS_USDT:.2f} "
+                                f"buffer={MAX_TRADE_EXIT_BUFFER_USDT:.2f} "
+                                f"trigger={loss_budget_trigger:+.4f} remaining={remaining:+.4f} - "
+                                f"adding this DCA would not remain meaningfully inside the "
+                                f"per-trade loss budget; withholding (dca_step unchanged).", YELLOW,
+                            ))
+                        return
+
             await self._place_step_order(
                 step=p.dca_step + 1, side_signal=p.side, size_mult=size_mult, expected_position=p,
             )
@@ -5122,22 +6140,53 @@ class MartingaleManager:
         never be mistaken for this fill. Never raises - any failure here
         just falls through to the existing untracked_order_id diagnostic
         and reconciliation safety net, unchanged."""
+        # 2026-08 idempotency guard (review finding 2 follow-up): this
+        # snapshot-based recovery must only ever fire for a trade that is
+        # still open locally. Once _on_close_filled() has finalized a trade
+        # the position is reset to FLAT, but the on-disk snapshot is
+        # rewritten asynchronously (save_flat_dca_state via create_task), so
+        # a DUPLICATE fill event arriving in that window would otherwise
+        # match the still-stale snapshot and finalize the same trade twice -
+        # double-counting realized PnL, the trade log and daily counters.
+        # The in-memory status is the authoritative, synchronous signal that
+        # this trade is already done.
+        if self.position.status not in ("OPEN", "DCA_PENDING", "CLOSING"):
+            return False
         try:
             snapshot = await self.load_dca_state_snapshot()
         except Exception:  # noqa: BLE001 - recovery must never crash the fill handler
             return False
         if not snapshot:
             return False
-        if snapshot.get("pending_role") != "close":
-            return False
-        snap_order_id = snapshot.get("pending_order_id")
-        if snap_order_id is None:
-            return False
-        try:
-            if int(snap_order_id) != int(order_id):
+        # 2026-08 protective-stop fill-routing fix (review finding 2):
+        # a protective stop rests on the exchange for the whole life of the
+        # trade, so a restart between placing it and its FILLED event
+        # arriving is far more likely than for an ordinary close order. The
+        # persisted snapshot records its order id separately (it is never
+        # this process's pending_order_id, which is reserved for in-flight
+        # orders), so match on that too - otherwise a protective stop that
+        # triggered while the process was down would be dropped here and the
+        # bot would resume managing an already-closed position.
+        matched_role = None
+        snap_protective_id = snapshot.get("protective_stop_order_id")
+        if snap_protective_id is not None:
+            try:
+                if int(snap_protective_id) == int(order_id):
+                    matched_role = "protective_stop"
+            except (TypeError, ValueError):
+                pass
+        if matched_role is None:
+            if snapshot.get("pending_role") != "close":
                 return False
-        except (TypeError, ValueError):
-            return False
+            snap_order_id = snapshot.get("pending_order_id")
+            if snap_order_id is None:
+                return False
+            try:
+                if int(snap_order_id) != int(order_id):
+                    return False
+            except (TypeError, ValueError):
+                return False
+            matched_role = "close"
 
         fill_price = float(o.get("ap") or 0.0)
         rp = float(o.get("rp") or 0.0)
@@ -5154,11 +6203,19 @@ class MartingaleManager:
                 self._position_fees_accum += comm
             else:
                 self._position_fees_reliable = False
+        if matched_role == "protective_stop":
+            # The stop triggered; it is gone from the exchange. Clear local
+            # tracking and tag the exit reason so the trade log records how
+            # this trade actually ended.
+            self.position.protective_stop_order_id = None
+            self.position.protective_stop_price = None
+            self.position.protective_stop_client_order_id = None
+            self.position.protective_stop_cancel_pending = False
+            self._pending_exit_reason = "protective_stop"
         print(color(
             f"{now_str()} [fill-trace] path=restart_recovery order_id={order_id} "
-            f"reason=matched_persisted_dca_state_snapshot (pending_role=close, "
-            f"pending_order_id={snap_order_id}) -> routing to _on_close_filled() "
-            f"despite empty in-memory _order_index (restart-safe recovery)", CYAN,
+            f"reason=matched_persisted_dca_state_snapshot (role={matched_role}) -> routing to "
+            f"_on_close_filled() despite empty in-memory _order_index (restart-safe recovery)", CYAN,
         ))
         await self._on_close_filled(fill_price, rp, order_id=order_id)
         return True
@@ -5501,7 +6558,7 @@ class MartingaleManager:
             self._entry_commission_accum += total_fee_this_order
         elif role == "dca":
             self._dca_commission_accum += total_fee_this_order
-        elif role in ("close", "partial_close"):
+        elif role in ("close", "partial_close", "protective_stop"):
             self._exit_commission_accum += total_fee_this_order
 
         if role in ("initial", "dca"):
@@ -5510,6 +6567,40 @@ class MartingaleManager:
             await self._apply_partial_close(
                 fill_qty, fill_price, actual_rp=total_rp, actual_fee=total_fee_this_order,
             )
+        elif role == "protective_stop":
+            # 2026-08 protective-stop fill-routing fix (review finding 2):
+            # the EXCHANGE closed this position for us (STOP_MARKET
+            # closePosition=true triggered). Previously this order was never
+            # registered in _order_index at all, so this event fell into the
+            # "untracked_order_id" branch above and was merely buffered: the
+            # bot kept believing the position was OPEN, kept managing/DCA-ing
+            # a position that no longer existed, and never logged the trade.
+            #
+            # It is routed through the SAME _on_close_filled() every other
+            # close uses, so realized PnL, commission, trade CSV/JSON
+            # logging, daily counters, Brain learning and the reset to FLAT
+            # all happen exactly once, through exactly one code path.
+            # Exactly-once is guaranteed by the _order_index.pop() above -
+            # a duplicate WebSocket/REST event for the same order_id no
+            # longer finds it registered.
+            #
+            # The order itself is GONE from the exchange (it triggered), so
+            # local tracking is cleared here WITHOUT a cancel call - there is
+            # nothing left to cancel, and issuing one would just produce a
+            # spurious -2011.
+            self.position.protective_stop_order_id = None
+            self.position.protective_stop_price = None
+            self.position.protective_stop_client_order_id = None
+            self.position.protective_stop_cancel_pending = False
+            self._pending_exit_reason = "protective_stop"
+            print(color(
+                f"{now_str()} [fill-trace] path=live_user_websocket order_id={order_id} "
+                f"trade_id={trade_id} close_time={_diag_close_time} "
+                f"reason=matched_local_order_index (role=protective_stop) -> exchange-native "
+                f"protective stop TRIGGERED and closed the position; routing to "
+                f"_on_close_filled() with exit_reason=protective_stop", CYAN,
+            ))
+            await self._on_close_filled(fill_price, total_rp, order_id=order_id)
         elif role == "close":
             # DIAGNOSTIC: confirms this close IS being routed through the
             # live path, for direct comparison against [fill-trace] lines
@@ -5619,6 +6710,14 @@ class MartingaleManager:
         self._last_dca_state_peak_saved = self.position.peak_unrealized_pnl
 
         asyncio.create_task(self.save_dca_state(reason=f"{step_label} filled"))
+
+        # item 6: (re)place the exchange-native protective stop immediately
+        # after every confirmed entry/DCA fill - awaited (not fired-and-
+        # forgotten) so a placement failure reliably sets
+        # protection_pending=True (blocking further DCA - see
+        # _manage_open_position) before this fill is considered fully
+        # handled, rather than racing the next price tick.
+        await self._place_or_replace_protective_stop(reason=f"{step_label} filled")
 
     async def _on_close_filled(self, fill_price: float, total_rp: float, order_id: Optional[int] = None) -> None:
         p = self.position
@@ -5873,8 +6972,42 @@ class MartingaleManager:
             "smart_exit_required_agree": smart_exit_diag["required_agree"] if smart_exit_diag else "",
             "smart_exit_signals_fired": smart_exit_diag["signals_fired"] if smart_exit_diag else "",
             "smart_exit_dca_distance_pct": smart_exit_diag["dca_distance_pct"] if smart_exit_diag else "",
+            # 2026-08 entry-quality audit fix (item 10): see TRADE_LOG_FIELDS's
+            # own comment - this is the actual composite score/threshold
+            # this trade was accepted under, distinct from entry_confidence
+            # above.
+            "entry_composite_score": p.entry_composite_score,
+            "entry_score_threshold": p.entry_score_threshold,
+            # 2026-08 per-trade net-loss budget fix (item 5): estimated
+            # fee-net PnL at the instant the MAX_TRADE_NET_LOSS_USDT gate
+            # triggered this close - "" for any trade that exited via a
+            # different path.
+            "loss_budget_trigger_est_net_pnl": (
+                p.trade_loss_budget_trigger_pnl if p.trade_loss_budget_trigger_pnl is not None else ""
+            ),
         }
         self._log_completed_trade(record)
+
+        # item 6: the position is confirmed flat (we only reach here once
+        # _fetch_exchange_position() above confirmed it, or in DRY_RUN) -
+        # cancel any resting protective stop now so TP/Hard-Stop/Profit-
+        # Lock/Smart-Exit/max-hold/manual closes can never leave one
+        # orphaned on the exchange.
+        if p.protective_stop_order_id is not None:
+            confirmed_gone = await self._cancel_protective_stop(
+                reason=f"position closed ({exit_reason})"
+            )
+            # 2026-08 cancel-confirmation fix (review finding 5): the
+            # PositionState below is discarded, so an unconfirmed cancel
+            # would lose the only record of a possibly-still-resting order.
+            # Hand it to the manager-level orphan sweep instead.
+            if not confirmed_gone and p.protective_stop_order_id is not None:
+                self._orphan_protective_stop_ids.add(p.protective_stop_order_id)
+                print(color(
+                    f"{now_str()} [protective-stop] orderId={p.protective_stop_order_id} could not "
+                    f"be confirmed cancelled while closing - handing to the orphan sweep so it is "
+                    f"retried until Binance accepts the cancel or proves it is gone.", YELLOW,
+                ))
 
         self.position = PositionState(last_close_time=time.time())
         # New (flat) position - reset the peak-save throttle so the next
@@ -6371,6 +7504,22 @@ async def initialize_sync(
     # to lose track of yet.
     restored_dca_blocked = True
     restored_dca_block_reason: Optional[str] = "no matching DCA-state snapshot restored for this position"
+    # item 6 - exchange-native protective stop: conservative defaults are
+    # "no confirmed protective stop, PROTECTION_PENDING" - identical
+    # reasoning to restored_dca_blocked above. Only cleared/populated below
+    # once a snapshot's own side/qty/avg_entry_price genuinely match what
+    # the exchange reports right now. reconcile_protective_stop_on_startup()
+    # (dca2.py, called once after initialize_sync() completes) is the
+    # actual authority that confirms/repairs this against Binance's own
+    # open orders - this restore is only a best-effort head start so that
+    # call has less work to do, never a substitute for it.
+    restored_protective_stop_order_id: Optional[int] = None
+    restored_protective_stop_price: Optional[float] = None
+    restored_protective_stop_client_order_id: Optional[str] = None
+    restored_protective_stop_cancel_pending: bool = False
+    restored_protection_pending = True
+    restored_protection_pending_reason: Optional[str] = "not yet reconciled against exchange open orders"
+    restored_protection_pending_since: Optional[float] = None
     snapshot_restored = False
     # A confirmed OPEN mismatch is now entering the authoritative rebuild
     # path, which contains awaits. Earlier failure/grace/pending/ambiguous
@@ -6464,6 +7613,49 @@ async def initialize_sync(
             if recovered_step_safety_reason is not None:
                 restored_dca_blocked = True
                 restored_dca_block_reason = recovered_step_safety_reason
+            # item 6 - exchange-native protective stop: restored under the
+            # exact same trust gate as dca_blocked above. Still subject to
+            # reconcile_protective_stop_on_startup()'s own authoritative
+            # check against Binance's open orders immediately after this
+            # function returns - a stale orderId here (e.g. it triggered
+            # while this process was down) is corrected there, not here.
+            try:
+                restored_protective_stop_order_id = snapshot.get("protective_stop_order_id")
+                restored_protective_stop_order_id = (
+                    int(restored_protective_stop_order_id)
+                    if restored_protective_stop_order_id is not None else None
+                )
+            except (TypeError, ValueError):
+                restored_protective_stop_order_id = None
+            try:
+                restored_protective_stop_price = snapshot.get("protective_stop_price")
+                restored_protective_stop_price = (
+                    float(restored_protective_stop_price)
+                    if restored_protective_stop_price is not None else None
+                )
+            except (TypeError, ValueError):
+                restored_protective_stop_price = None
+            restored_protection_pending = bool(snapshot.get("protection_pending", False))
+            restored_protection_pending_reason = snapshot.get("protection_pending_reason")
+            restored_protective_stop_client_order_id = snapshot.get("protective_stop_client_order_id")
+            restored_protective_stop_cancel_pending = bool(
+                snapshot.get("protective_stop_cancel_pending", False)
+            )
+            # 2026-08 PROTECTION_PENDING fail-safe (review finding 3): the
+            # unprotected clock must survive a restart, otherwise a process
+            # that restarts more often than PROTECTION_PENDING_MAX_SEC could
+            # never reach the bounded fail-safe. A snapshot predating this
+            # field leaves it None, and _mark_protection_pending() starts the
+            # clock fresh at the next failure - conservative, never earlier
+            # than reality.
+            try:
+                restored_protection_pending_since = snapshot.get("protection_pending_since")
+                restored_protection_pending_since = (
+                    float(restored_protection_pending_since)
+                    if restored_protection_pending_since is not None else None
+                )
+            except (TypeError, ValueError):
+                restored_protection_pending_since = None
             # 2026-08 CLOSING-resync opened_at fix: restore the real entry
             # timestamp from the snapshot (present on any snapshot saved by
             # the fixed _dca_state_snapshot() - older snapshots predating
@@ -6684,7 +7876,29 @@ async def initialize_sync(
         # fixes.
         dca_blocked=restored_dca_blocked,
         dca_block_reason=restored_dca_block_reason,
+        # item 6 - exchange-native protective stop: best-effort restore
+        # only - reconcile_protective_stop_on_startup() (dca2.py, called
+        # once right after initialize_sync()) is the actual authority that
+        # confirms this against Binance's own open orders and corrects it
+        # (including clearing a stale orderId, or placing a fresh stop if
+        # none is found resting).
+        protective_stop_order_id=restored_protective_stop_order_id,
+        protective_stop_price=restored_protective_stop_price,
+        protective_stop_client_order_id=restored_protective_stop_client_order_id,
+        protective_stop_cancel_pending=restored_protective_stop_cancel_pending,
+        protection_pending=restored_protection_pending,
+        protection_pending_reason=restored_protection_pending_reason,
+        protection_pending_since=restored_protection_pending_since,
     )
+    # 2026-08 protective-stop fill-routing fix (review finding 2): a
+    # protective stop restored from the snapshot must be wired into the
+    # in-memory fill-routing map too, so its FILLED event (which can arrive
+    # at any moment - it rests on the exchange for the whole trade) routes
+    # through _on_close_filled() rather than being dropped as
+    # "untracked_order_id". _try_recover_close_fill()'s snapshot lookup
+    # remains the fallback for any window this doesn't cover.
+    if restored_protective_stop_order_id is not None:
+        manager._order_index[restored_protective_stop_order_id] = "protective_stop"
     # Keep the peak-save throttle consistent with whatever peak was just
     # restored (or reset to 0.0 on a fresh/mismatched snapshot), so the
     # next Profit Lock peak update in _manage_open_position() is measured
@@ -6741,3 +7955,132 @@ async def initialize_sync(
     # authoritative PositionState is fully installed before readiness is
     # ever set.
     manager.position_sync_ready = True
+
+
+# ============================================================================
+# EXCHANGE-NATIVE PROTECTIVE STOP - STARTUP RECONCILIATION (item 6)
+# ============================================================================
+
+
+async def reconcile_protective_stop_on_startup(client: RestClient, manager: MartingaleManager) -> None:
+    """Best-effort startup reconciliation for the exchange-native
+    protective stop. Called exactly once, from dca2.py's main(), AFTER
+    initialize_sync() has already reconciled side/qty/avg_entry_price/
+    dca_step against the exchange - deliberately a separate top-level
+    function rather than folded into initialize_sync() itself (which is
+    already the single most complex/delicate function in this file and is
+    called from three different contexts - startup, every user-data-stream
+    reconnect, and every position_risk_poller tick - none of which need to
+    re-run this REST-heavy open-orders reconciliation). No-op in DRY_RUN
+    (nothing real to reconcile), when PROTECTIVE_STOP_ENABLED/
+    MAX_TRADE_NET_LOSS_USDT disable the feature, or when the position is
+    not OPEN with real economics (nothing to protect yet).
+
+    Queries Binance's own open orders for this symbol and looks for a
+    resting STOP_MARKET closePosition=true order on the correct
+    close-side:
+      - If found (exactly one): adopts its orderId/stopPrice, clears
+        PROTECTION_PENDING.
+      - If found (more than one - should not normally happen given
+        _place_or_replace_protective_stop()'s cancel-then-replace
+        discipline, but startup reconciliation must not assume that
+        invariant always held): adopts one, best-effort-cancels the rest
+        so at most one protective stop is ever resting.
+      - If NONE found for a genuinely OPEN position: this position is
+        REALLY unprotected right now (e.g. the process crashed between
+        entry fill and protective-stop placement, or Binance's own
+        housekeeping expired a stale conditional order) - attempts to
+        place a fresh one immediately via the same path a normal entry/DCA
+        fill uses. If that also fails, the position is left in
+        PROTECTION_PENDING (blocking new DCA; every client-side risk exit
+        remains fully active) with a high-severity log, rather than
+        silently continuing as if protected.
+    """
+    if DRY_RUN or not PROTECTIVE_STOP_ENABLED or MAX_TRADE_NET_LOSS_USDT <= 0:
+        return
+    p = manager.position
+    if p.status != "OPEN" or not p.avg_entry_price or p.total_qty <= 0 or p.side not in ("LONG", "SHORT"):
+        return
+
+    try:
+        open_orders = await client.get_open_orders(manager.symbol)
+    except Exception as e:  # noqa: BLE001 - a reconciliation fetch must never crash startup
+        print(color(
+            f"{now_str()} [protective-stop] *** HIGH SEVERITY *** startup reconciliation could not "
+            f"fetch open orders for {manager.symbol}: {e} - cannot confirm a protective stop is "
+            f"resting; leaving PROTECTION_PENDING (new DCA blocked; client-side risk exits remain "
+            f"active). Will be retried on the next entry/DCA fill.", RED,
+        ))
+        p.protection_pending = True
+        p.protection_pending_reason = f"startup open-orders fetch failed: {e}"
+        return
+
+    close_side = "SELL" if p.side == "LONG" else "BUY"
+    # 2026-08 protective-stop ownership fix (review finding 4): matching on
+    # type/side/closePosition ALONE would also match a STOP_MARKET the user
+    # placed manually, or one belonging to another system trading the same
+    # account/symbol - and this function both ADOPTS and CANCELS what it
+    # matches. Ownership is now proven by the bot-assigned clientOrderId
+    # prefix (PROTECTIVE_STOP_CLIENT_ID_PREFIX), which nothing else can
+    # accidentally carry. Foreign orders are counted for the log line and
+    # then left completely untouched.
+    candidates = [
+        o for o in open_orders
+        if o.get("type") == "STOP_MARKET"
+        and o.get("side") == close_side
+        and str(o.get("closePosition")).lower() == "true"
+    ]
+    matching = [o for o in candidates if manager._is_own_protective_stop(o)]
+    foreign = [o for o in candidates if not manager._is_own_protective_stop(o)]
+    if foreign:
+        print(color(
+            f"{now_str()} [protective-stop] startup reconciliation ignored {len(foreign)} "
+            f"STOP_MARKET order(s) on {manager.symbol} not owned by this bot (clientOrderId does "
+            f"not start with '{PROTECTIVE_STOP_CLIENT_ID_PREFIX}') - they are left untouched.",
+            GRAY,
+        ))
+
+    if matching:
+        chosen = next(
+            (o for o in matching if o.get("orderId") == p.protective_stop_order_id), matching[0]
+        )
+        p.protective_stop_order_id = chosen.get("orderId")
+        try:
+            p.protective_stop_price = float(chosen.get("stopPrice", 0) or 0) or None
+        except (TypeError, ValueError):
+            p.protective_stop_price = None
+        p.protective_stop_client_order_id = chosen.get("clientOrderId")
+        p.protective_stop_cancel_pending = False
+        manager._clear_protection_pending()
+        # review finding 2: an adopted stop must be wired into the
+        # fill-routing map, exactly like a freshly-placed one, or its FILLED
+        # event would be dropped as "untracked_order_id".
+        if p.protective_stop_order_id is not None:
+            manager._order_index[p.protective_stop_order_id] = "protective_stop"
+        if len(matching) > 1:
+            print(color(
+                f"{now_str()} [protective-stop] startup reconciliation found {len(matching)} resting "
+                f"protective stop(s) for {manager.symbol} - adopted orderId="
+                f"{p.protective_stop_order_id}; cancelling the rest so at most one remains.", YELLOW,
+            ))
+            for o in matching:
+                if o.get("orderId") != p.protective_stop_order_id:
+                    try:
+                        await client.cancel_order(manager.symbol, o["orderId"])
+                    except Exception:  # noqa: BLE001 - best-effort cleanup only
+                        pass
+        else:
+            print(color(
+                f"{now_str()} [protective-stop] startup reconciliation adopted existing "
+                f"orderId={p.protective_stop_order_id} stopPrice={p.protective_stop_price} for "
+                f"{manager.symbol}.", GREEN,
+            ))
+        asyncio.create_task(manager.save_dca_state(reason="protective stop reconciled on startup"))
+        return
+
+    print(color(
+        f"{now_str()} [protective-stop] startup reconciliation found NO resting protective stop "
+        f"for an OPEN {manager.symbol} position - this position is currently UNPROTECTED against a "
+        f"REST outage/ban; placing one now.", YELLOW,
+    ))
+    await manager._place_or_replace_protective_stop(reason="startup reconciliation - none found")

@@ -412,6 +412,7 @@ from trading import (
     MartingaleManager,
     sanitize_recovered_dca_step,
     initialize_sync,
+    reconcile_protective_stop_on_startup,
     BrainV2,
 )
 
@@ -895,6 +896,13 @@ async def main() -> None:
         await load_dca_state(manager)
 
         await initialize_sync(client, manager, context="startup")
+        # item 6: exchange-native protective stop reconciliation - MUST run
+        # after initialize_sync() (needs the authoritative post-reconcile
+        # side/qty/avg_entry_price) and before the long-running consumer
+        # loops start, so an OPEN position recovered above is never left
+        # believing it's protected without this process actually having
+        # confirmed that against Binance's own open orders.
+        await reconcile_protective_stop_on_startup(client, manager)
 
         await asyncio.gather(
             market_data_consumer(manager),

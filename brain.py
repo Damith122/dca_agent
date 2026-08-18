@@ -34,7 +34,7 @@ from typing import Optional
 import numpy as np
 from sklearn.linear_model import SGDRegressor, SGDClassifier
 
-from config import N_FEATURES_V2, BRAIN2_WARMUP_UPDATES
+from config import N_FEATURES_V2, BRAIN2_WARMUP_UPDATES, BRAIN_HEAD_MIN_SAMPLES
 
 # ----------------------------------------------------------------------------
 # Private helpers (identical copies of dca2.py's color()/YELLOW/clamp() -
@@ -174,6 +174,55 @@ class BrainV2:
         # starts at a sane prior and adapts slowly.
         self._trend_scale = 0.0015
 
+        # 2026-08 entry-quality audit fix (confirmed defect #6/#9 - see
+        # config.py's BRAIN_HEAD_MIN_SAMPLES comment for the full root
+        # cause): per-head sample counters and observed-class sets,
+        # SEPARATE from update_count (which only reflects the trend head's
+        # own tick-driven learning and is not a meaningful proxy for how
+        # reliable success/tp_hit/noise are). Used by predict_all() below
+        # to report a neutral 0.5 instead of a possibly one-class-saturated
+        # predict_proba() output until each classifier head has genuinely
+        # seen both outcome classes and at least BRAIN_HEAD_MIN_SAMPLES
+        # labeled samples.
+        self.noise_samples = 0
+        self.success_samples = 0
+        self.tp_hit_samples = 0
+        self._noise_classes_seen: set = set()
+        self._success_classes_seen: set = set()
+        self._tp_hit_classes_seen: set = set()
+
+    # -- head reliability (2026-08 entry-quality audit fix) -------------------
+
+    def _head_reliable(self, samples: int, classes_seen: set) -> bool:
+        """True once a classifier head has seen BOTH outcome classes and at
+        least BRAIN_HEAD_MIN_SAMPLES labeled samples - see config.py's
+        BRAIN_HEAD_MIN_SAMPLES comment for why "fitted" alone (flips True
+        after a single partial_fit call) is not a safe reliability signal
+        for a low-sample online SGDClassifier."""
+        return samples >= BRAIN_HEAD_MIN_SAMPLES and len(classes_seen) >= 2
+
+    def head_readiness(self) -> dict:
+        """READY / WARMING_UP summary per model head, for logging only (see
+        trading.py's entry-decision log) - does not affect predict_all()'s
+        own gating, which is computed independently each call from the same
+        underlying counters."""
+        def state(fitted: bool, reliable: bool) -> str:
+            if not fitted:
+                return "WARMING_UP"
+            return "READY" if reliable else "UNRELIABLE"
+
+        return {
+            "trend": "READY" if self.is_ready() else "WARMING_UP",
+            "noise": state(self.noise_fitted, self._head_reliable(self.noise_samples, self._noise_classes_seen)),
+            "success": state(self.success_fitted, self._head_reliable(self.success_samples, self._success_classes_seen)),
+            "tp_hit": state(self.tp_hit_fitted, self._head_reliable(self.tp_hit_samples, self._tp_hit_classes_seen)),
+            "quality": "READY" if self.quality_fitted else "WARMING_UP",
+            "update_count": self.update_count,
+            "noise_samples": self.noise_samples,
+            "success_samples": self.success_samples,
+            "tp_hit_samples": self.tp_hit_samples,
+        }
+
     # -- prediction -----------------------------------------------------------
 
     def predict_all(self, x: np.ndarray) -> dict:
@@ -184,9 +233,33 @@ class BrainV2:
 
         trend_pred = float(self.trend_model.predict(xn)[0]) if self.trend_fitted else 0.0
         quality_pred = float(self.quality_model.predict(xn)[0]) if self.quality_fitted else 0.0
-        noise_prob = float(self.noise_model.predict_proba(xn)[0][1]) if self.noise_fitted else 0.5
-        success_prob = float(self.success_model.predict_proba(xn)[0][1]) if self.success_fitted else 0.5
-        tp_hit_prob = float(self.tp_hit_model.predict_proba(xn)[0][1]) if self.tp_hit_fitted else 0.5
+
+        # 2026-08 entry-quality audit fix: each classifier head's reported
+        # probability falls back to the neutral prior (0.5) - identical to
+        # the existing "not yet fitted" default - until that head has both
+        # observed both outcome classes AND accumulated BRAIN_HEAD_MIN_SAMPLES
+        # labeled samples. A "fitted" head that hasn't cleared this bar is
+        # exactly the one-class/tiny-sample saturation scenario the attached
+        # live evidence showed (entry_success_prob=1.0 from ~1 completed
+        # trade) - this does not change what partial_fit() learns, only
+        # whether predict_all() treats the resulting predict_proba() as
+        # trustworthy enough to report.
+        noise_reliable = self._head_reliable(self.noise_samples, self._noise_classes_seen)
+        success_reliable = self._head_reliable(self.success_samples, self._success_classes_seen)
+        tp_hit_reliable = self._head_reliable(self.tp_hit_samples, self._tp_hit_classes_seen)
+
+        noise_prob = (
+            float(self.noise_model.predict_proba(xn)[0][1])
+            if (self.noise_fitted and noise_reliable) else 0.5
+        )
+        success_prob = (
+            float(self.success_model.predict_proba(xn)[0][1])
+            if (self.success_fitted and success_reliable) else 0.5
+        )
+        tp_hit_prob = (
+            float(self.tp_hit_model.predict_proba(xn)[0][1])
+            if (self.tp_hit_fitted and tp_hit_reliable) else 0.5
+        )
 
         self.last_trend_pred = trend_pred
         self.last_noise_prob = noise_prob
@@ -229,6 +302,8 @@ class BrainV2:
         classes = np.array([0, 1]) if not self.noise_fitted else None
         self.noise_model.partial_fit(xn, [1 if is_noise else 0], classes=classes)
         self.noise_fitted = True
+        self.noise_samples += 1
+        self._noise_classes_seen.add(1 if is_noise else 0)
 
     def learn_success(self, x: np.ndarray, was_success: bool) -> None:
         x = np.asarray(x, dtype=float)
@@ -238,6 +313,8 @@ class BrainV2:
         classes = np.array([0, 1]) if not self.success_fitted else None
         self.success_model.partial_fit(xn, [1 if was_success else 0], classes=classes)
         self.success_fitted = True
+        self.success_samples += 1
+        self._success_classes_seen.add(1 if was_success else 0)
 
     def learn_tp_hit(self, x: np.ndarray, tp_was_hit: bool) -> None:
         x = np.asarray(x, dtype=float)
@@ -247,6 +324,8 @@ class BrainV2:
         classes = np.array([0, 1]) if not self.tp_hit_fitted else None
         self.tp_hit_model.partial_fit(xn, [1 if tp_was_hit else 0], classes=classes)
         self.tp_hit_fitted = True
+        self.tp_hit_samples += 1
+        self._tp_hit_classes_seen.add(1 if tp_was_hit else 0)
 
     def learn_quality(self, x: np.ndarray, reward: float) -> None:
         x = np.asarray(x, dtype=float)
@@ -263,7 +342,15 @@ class BrainV2:
 
     def to_state(self) -> dict:
         return {
-            "version": 2,
+            # 2026-08 entry-quality audit fix: version bumped 2 -> 3 to
+            # carry the new per-head sample counters/classes-seen sets
+            # (see __init__). from_bytes() below still ACCEPTS a version-2
+            # snapshot (migrates it - see load_state()'s .get() defaults)
+            # rather than rejecting it, so an existing live brain.pkl is
+            # never silently wiped by this change - only a genuinely
+            # unreadable/corrupt/wrong-n_features snapshot falls back to a
+            # fresh Brain, exactly as before.
+            "version": 3,
             "n_features": self.n_features,
             "warmup_updates": self.warmup_updates,
             "trend_model": self.trend_model, "quality_model": self.quality_model,
@@ -275,6 +362,12 @@ class BrainV2:
             "update_count": self.update_count,
             "_trend_scale": self._trend_scale,
             "norm": self.norm.state(),
+            "noise_samples": self.noise_samples,
+            "success_samples": self.success_samples,
+            "tp_hit_samples": self.tp_hit_samples,
+            "noise_classes_seen": sorted(self._noise_classes_seen),
+            "success_classes_seen": sorted(self._success_classes_seen),
+            "tp_hit_classes_seen": sorted(self._tp_hit_classes_seen),
         }
 
     def load_state(self, state: dict) -> None:
@@ -291,6 +384,23 @@ class BrainV2:
         self.update_count = state["update_count"]
         self._trend_scale = state.get("_trend_scale", 0.0015)
         self.norm.load(state["norm"])
+        # 2026-08 entry-quality audit fix - migration-safe: a version-2
+        # snapshot (or any snapshot predating this fix) simply has none of
+        # these keys, so every counter/class-set below defaults to "no
+        # confirmed-reliable samples yet" - the CONSERVATIVE direction
+        # (predict_all() reports neutral 0.5 for that head until enough
+        # NEW samples accumulate post-upgrade). The underlying learned
+        # model weights themselves (trend/quality/noise/success/tp_hit
+        # models above) are restored unchanged either way - this never
+        # resets/discards learned state, it only resets the reliability
+        # bookkeeping for classifier heads whose sample provenance predates
+        # this fix and was never tracked.
+        self.noise_samples = int(state.get("noise_samples", 0))
+        self.success_samples = int(state.get("success_samples", 0))
+        self.tp_hit_samples = int(state.get("tp_hit_samples", 0))
+        self._noise_classes_seen = set(state.get("noise_classes_seen", []))
+        self._success_classes_seen = set(state.get("success_classes_seen", []))
+        self._tp_hit_classes_seen = set(state.get("tp_hit_classes_seen", []))
 
     def to_bytes(self) -> bytes:
         return pickle.dumps(self.to_state(), protocol=pickle.HIGHEST_PROTOCOL)
@@ -299,11 +409,20 @@ class BrainV2:
     def from_bytes(cls, data: bytes, n_features: int, warmup_updates: int) -> "BrainV2":
         """Falls back to a fresh (cold) brain on any corruption, version
         mismatch, or feature-shape mismatch - a bad/stale snapshot must
-        never prevent the bot from starting."""
+        never prevent the bot from starting.
+
+        2026-08 entry-quality audit fix (this version check only - every
+        other line of load behavior is unchanged): accepts BOTH version 2
+        (the pre-existing on-disk/GitHub format - every currently deployed
+        brain.pkl) and version 3 (this fix's new format, adding per-head
+        sample counters) so upgrading this code never rejects/wipes an
+        existing live-learned Brain snapshot. See load_state() for exactly
+        what a migrated version-2 snapshot defaults to.
+        """
         brain = cls(n_features, warmup_updates)
         try:
             state = pickle.loads(data)
-            if state.get("version") != 2 or state.get("n_features") != n_features:
+            if state.get("version") not in (2, 3) or state.get("n_features") != n_features:
                 print(color(
                     f"[brain] snapshot incompatible (version={state.get('version')}, "
                     f"n_features={state.get('n_features')}, expected {n_features}) - "
@@ -311,6 +430,14 @@ class BrainV2:
                 ))
                 return brain
             brain.load_state(state)
+            if state.get("version") == 2:
+                print(color(
+                    "[brain] migrated version-2 snapshot to version-3 (added per-head "
+                    "sample-reliability counters, all starting at 0/no-classes-seen for "
+                    "success/tp_hit/noise - existing learned model weights unchanged; "
+                    "those heads will report neutral 0.5 until enough new samples "
+                    "accumulate under the new reliability gate).", YELLOW,
+                ))
         except Exception as e:  # noqa: BLE001 - corrupted/incompatible snapshot must not crash startup
             print(color(f"[brain] failed to deserialize snapshot ({e}), starting fresh.", YELLOW))
             return cls(n_features, warmup_updates)

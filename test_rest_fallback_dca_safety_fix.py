@@ -50,6 +50,11 @@ os.environ.setdefault("MAX_DCA_STEPS", "2")
 # behavior in production; this only affects this test process's env.
 os.environ.setdefault("SMART_EXIT_ENABLED", "false")
 os.environ.setdefault("MAX_HOLD_TIME_ENABLED", "false")
+# Same isolation rationale as above, for the 2026-08 per-trade fee-net loss
+# budget (item 5, trading.py _manage_open_position): this file's test
+# position sizes were never tuned against that gate, so disable it (0 =
+# off) here to keep this file focused on REST-fallback DCA-safety behavior.
+os.environ.setdefault("MAX_TRADE_NET_LOSS_USDT", "0")
 os.environ.setdefault("TRADE_LOG_JSON_PATH", "/tmp/test_rest_fallback_trades_log.jsonl")
 os.environ.setdefault("TRADE_LOG_CSV_PATH", "/tmp/test_rest_fallback_trades_log.csv")
 os.environ.setdefault("STATS_JSON_PATH", "/tmp/test_rest_fallback_performance_stats.json")

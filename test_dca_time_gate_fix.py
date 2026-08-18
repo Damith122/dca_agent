@@ -50,6 +50,13 @@ os.environ.setdefault("STATS_CSV_PATH", "/tmp/test_dca_time_gate_stats.csv")
 os.environ.setdefault("BRAIN_LOCAL_PATH", "/tmp/test_dca_time_gate_brain.pkl")
 os.environ.setdefault("DCA_STATE_PATH", "/tmp/test_dca_time_gate_dca_state.json")
 os.environ.setdefault("SMART_EXIT_ENABLED", "false")
+# This file exercises the Max Hold V2 / DCA time-gate interaction in
+# isolation, at test position sizes never tuned against the 2026-08
+# per-trade fee-net loss budget (item 5, trading.py _manage_open_position) -
+# disabled here (0 = off) so that unrelated gate cannot preempt/relabel the
+# specific soft-timeout/defer log lines under test, exactly like
+# SMART_EXIT_ENABLED=false above.
+os.environ.setdefault("MAX_TRADE_NET_LOSS_USDT", "0")
 # Deliberately NOT overriding any MAX_HOLD_TIME_* value - tests run against
 # the real production defaults (4h soft / 8h hard / 0.5 DCA multiplier / 2
 # min-agree) so they validate actual deployed behavior, not a test-only

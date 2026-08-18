@@ -349,6 +349,19 @@ class RestClient:
             "DELETE", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id}, signed=True
         )
 
+    async def get_open_orders(self, symbol: str) -> list:
+        """Signed GET /fapi/v1/openOrders - all currently OPEN orders for
+        `symbol` (e.g. a resting STOP_MARKET protective stop). 2026-08
+        exchange-native protective-stop fix: used by trading.py's startup
+        reconciliation to discover/adopt an already-placed protective stop
+        after a restart, and to detect an OPEN position with no protective
+        order resting on the exchange (see PROTECTION_PENDING handling).
+        Docs: https://developers.binance.com/en/docs/derivatives/usds-margined-futures/trade/rest-api
+        """
+        return await self._request(
+            "GET", "/fapi/v1/openOrders", {"symbol": symbol}, signed=True
+        )
+
     async def get_order(self, symbol: str, order_id: int) -> dict:
         """Signed GET /fapi/v1/order - query a single order's current
         status by orderId. REST fallback used when a fill's WebSocket
