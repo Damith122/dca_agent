@@ -240,6 +240,11 @@ from typing import Deque, Dict, List, Optional, Tuple
 import aiohttp
 import numpy as np
 
+# 2026-08 post-only (maker) entry execution: the SELL-side maker price must
+# round UP to the tick grid, which round_step() (ROUND_DOWN only) cannot do.
+# Decimal is used for the same precision reason round_step() itself uses it.
+from decimal import Decimal, ROUND_UP
+
 from config import (
     SYMBOL,
     RUNTIME_ENV,
@@ -350,9 +355,50 @@ from config import (
     SESSION_START_DATE,
     DCA_STATE_PATH,
     GITHUB_DCA_STATE_PATH,
+    # ------------------------------------------------------------------
+    # 2026-08 high-frequency orderflow upgrade (appended config block -
+    # see the banner at the bottom of config.py). Every name below is
+    # NEW; not one pre-existing import above was removed or renamed.
+    # ------------------------------------------------------------------
+    ENABLE_ORDERBOOK_GUARD,
+    ORDERBOOK_IMBALANCE_THRESHOLD,
+    AGG_TRADE_DELTA_WINDOW_SEC,
+    MAX_STOP_LOSS_USD,
+    TARGET_PROFIT_USD,
+    COOL_OFF_PERIOD_MINUTES,
+    USE_POST_ONLY_LIMIT,
+    ORDERBOOK_SUPPORT_MIN,
+    AGG_TRADE_DELTA_MIN,
+    ORDERBOOK_GUARD_REQUIRES_DATA,
+    MIN_STOP_LOSS_USD,
+    MIN_TARGET_PROFIT_USD,
+    ENFORCE_RISK_REWARD_USD,
+    POST_ONLY_LIMIT_OFFSET_TICKS,
+    POST_ONLY_LIMIT_TIMEOUT_SEC,
+    POST_ONLY_MARKET_FALLBACK,
+    CONTINUOUS_24_7_TRADING,
+    COOL_OFF_IMBALANCE_TIGHTEN,
+    COOL_OFF_SUPPORT_MIN,
+    SMART_ORDERFLOW_EXIT_ENABLED,
+    SMART_ORDERFLOW_EXIT_IMBALANCE,
+    SMART_ORDERFLOW_EXIT_MIN_LOSS_USD,
+    SMART_ORDERFLOW_EXIT_MAX_LOSS_USD,
+    SMART_ORDERFLOW_EXIT_MIN_HOLD_SEC,
+    DCA_REQUIRE_ORDERBOOK_SUPPORT,
+    DCA_RESCUE_SUPPORT_MIN,
+    DCA_RESCUE_BREAKEVEN_ENABLED,
+    DCA_RESCUE_BREAKEVEN_MIN_NET_USD,
 )
 from indicators import clamp, safe_div, ema_series, round_step
 from exchange import BinanceApiError, RestClient, SymbolFilters
+# 2026-08 high-frequency orderflow upgrade: OrderFlowTracker is the bounded
+# in-memory ring-buffer data layer defined in websocket.py (the module that
+# owns the market feed it is fed from). websocket.py imports only config +
+# exchange + stdlib and never imports this module, so this is a plain
+# one-directional dependency - no circular import is created, and dca2.py's
+# existing `from websocket import ...` / initialize_sync injection is
+# completely unaffected.
+from websocket import OrderFlowTracker
 
 # ----------------------------------------------------------------------------
 # Private helpers (identical copies of dca2.py's now_str()/color()/color
@@ -902,6 +948,10 @@ class RiskEngine:
 # ============================================================================
 
 from brain import RunningNormalizer, BrainV2
+# 2026-08 strategy upgrade: the Liquidity & Flow Guard lives alongside the
+# Brain (see brain.py's own banner for why) and is applied by EntryEngineV2
+# below, after every pre-existing technical check has already run.
+from brain import LiquidityFlowGuard
 
 
 # ============================================================================
@@ -996,6 +1046,12 @@ class EntryEngineV2:
     def __init__(self):
         self._last_log_ts: float = 0.0
         self._log_interval_sec: float = 15.0
+        # 2026-08 Liquidity & Flow Guard (brain.py). Stateless and pure -
+        # constructed once here purely to avoid re-allocating it on every
+        # tick. All per-decision thresholds are passed in at call time by
+        # evaluate() below, so the post-loss cool-off can tighten them
+        # without mutating any shared state.
+        self.liquidity_guard = LiquidityFlowGuard()
 
     def _should_log(self) -> bool:
         now = time.time()
@@ -1012,6 +1068,9 @@ class EntryEngineV2:
         momentum: float,
         features: np.ndarray,
         brain_readiness: Optional[dict] = None,
+        orderflow: Optional[dict] = None,
+        imbalance_threshold: Optional[float] = None,
+        support_min: Optional[float] = None,
     ) -> EntryDecision:
         # 2026-08 entry-quality audit fix (item 10): brain_readiness is
         # purely a logging input (READY/WARMING_UP/UNRELIABLE per model
@@ -1152,15 +1211,70 @@ class EntryEngineV2:
         )
         components["threshold"] = active_threshold
 
-        should_enter = (not regime_blocked) and score >= active_threshold
+        # --- Liquidity & Flow Guard (2026-08 upgrade) ------------------------
+        # Applied here, AFTER every pre-existing technical component has
+        # already been computed and scored - the EMA/RSI/ATR stack, the
+        # regime gate, the dead-market floor, the counter-momentum block and
+        # the composite ENTRY_WEIGHTS score above are all completely
+        # untouched by this upgrade. This adds two things:
+        #
+        #   (a) A HARD VETO on the proposed side, on the same footing as the
+        #       existing regime/dead-market/counter-momentum hard blocks: a
+        #       vetoed side can never reach should_enter=True regardless of
+        #       how strong the technical score is.
+        #           BLOCK LONG  if imbalance < -threshold OR 10s delta < 0
+        #           BLOCK SHORT if imbalance > +threshold OR 10s delta > 0
+        #
+        #   (b) MULTI-FACTOR CONFIRMATION: technical_signal AND
+        #       orderbook_support AND flow_delta_alignment must ALL hold.
+        #       `technical_ok` below is exactly the pre-upgrade acceptance
+        #       decision (regime allowed AND score >= threshold), so this is
+        #       a strict tightening - it can only ever reject a trade the
+        #       old code would have taken, never accept one it would have
+        #       refused.
+        #
+        # `orderflow=None` (no orderflow wiring at all - e.g. a focused unit
+        # test constructing EntryEngineV2 directly) makes the guard inert
+        # and preserves the exact pre-upgrade behavior. See
+        # LiquidityFlowGuard in brain.py.
+        liquidity = self.liquidity_guard.evaluate(
+            conf.trend_direction,
+            orderflow,
+            imbalance_threshold=imbalance_threshold,
+            support_min=support_min,
+        )
+        liquidity_blocked = bool(liquidity["blocked"])
+        components["liquidity_blocked"] = liquidity_blocked
+        components["liquidity_reason"] = liquidity["reason"]
+        components["orderbook_imbalance"] = liquidity["imbalance"]
+        components["trade_delta"] = liquidity["trade_delta"]
+        components["orderbook_support"] = liquidity["book_support"]
+        components["flow_aligned"] = liquidity["flow_aligned"]
+        components["orderflow_data_available"] = liquidity["data_available"]
+        components["liquidity_guard_active"] = liquidity["active"]
+        components["imbalance_threshold_used"] = liquidity["threshold"]
+
+        technical_ok = (not regime_blocked) and score >= active_threshold
+        components["technical_signal"] = technical_ok
+        # The three confirmation factors, all required.
+        multi_factor_confirmed = (
+            technical_ok and liquidity["book_support"] and liquidity["flow_aligned"]
+        )
+        components["multi_factor_confirmed"] = multi_factor_confirmed
+
+        should_enter = technical_ok and (not liquidity_blocked) and multi_factor_confirmed
         if regime_blocked:
             rejection_reason = (
                 "dead_market_blocked" if dead_market_blocked
                 else "sideways_counter_momentum_blocked" if sideways_counter_momentum_blocked
                 else "regime_not_allowed"
             )
-        elif not should_enter:
+        elif not technical_ok:
             rejection_reason = f"score {score:.4f} below threshold {active_threshold:.4f}"
+        elif liquidity_blocked:
+            rejection_reason = f"liquidity_guard: {liquidity['reason']}"
+        elif not multi_factor_confirmed:
+            rejection_reason = "multi_factor_confirmation_incomplete"
         else:
             rejection_reason = "accepted"
         components["rejection_reason"] = rejection_reason
@@ -1185,6 +1299,11 @@ class EntryEngineV2:
                 f"success_p={conf.success_probability:.4f} tp_hit_p={conf.tp_hit_probability:.4f} "
                 f"final_score={score:.4f} threshold={active_threshold:.4f} "
                 f"decision={rejection_reason} "
+                f"ob_imbalance={liquidity['imbalance']:+.4f} "
+                f"flow_delta={liquidity['trade_delta']:+.4f} "
+                f"ob_support={liquidity['book_support']} flow_aligned={liquidity['flow_aligned']} "
+                f"orderflow_data={liquidity['data_available']} "
+                f"imbalance_thr={liquidity['threshold']:.3f} "
                 f"brain_ready=[trend={readiness.get('trend','?')} "
                 f"success={readiness.get('success','?')}({readiness.get('success_samples','?')}) "
                 f"tp_hit={readiness.get('tp_hit','?')}({readiness.get('tp_hit_samples','?')}) "
@@ -1213,6 +1332,10 @@ class EntryEngineV2:
                 f"raw_momentum={momentum:+.6f} "
                 f"momentum_magnitude={momentum_magnitude:.4f} "
                 f"momentum_aligned={momentum_aligned} "
+                f"ob_imbalance={liquidity['imbalance']:+.4f} "
+                f"flow_delta={liquidity['trade_delta']:+.4f} "
+                f"imbalance_thr={liquidity['threshold']:.3f} "
+                f"multi_factor_confirmed={multi_factor_confirmed} "
                 f"brain_ready=[trend={readiness.get('trend','?')} "
                 f"success={readiness.get('success','?')}({readiness.get('success_samples','?')}) "
                 f"tp_hit={readiness.get('tp_hit','?')}({readiness.get('tp_hit_samples','?')}) "
@@ -2053,6 +2176,156 @@ class MartingaleManager:
         # a persistence-throttling detail - does not affect Profit Lock's
         # own activation/ratio/close decisions in any way.
         self._last_dca_state_peak_saved: float = 0.0
+
+        # ==================================================================
+        # 2026-08 HIGH-FREQUENCY ORDERFLOW UPGRADE - manager-level state
+        # ==================================================================
+        # All ADDITIVE. Nothing above this block was removed or changed.
+
+        # The bounded in-memory rolling data layer (websocket.py). Fed by
+        # on_depth_update() / on_agg_trade() below, read by the entry guard,
+        # the Smart Orderflow Early Exit and the Safe DCA rescue rule. Its
+        # deques carry a hard maxlen, so this costs a fixed, known amount of
+        # RAM for the life of the process - the Railway constraint.
+        self.orderflow = OrderFlowTracker()
+        # Same pure guard object EntryEngineV2 holds; used here for the
+        # position-management side (DCA rescue book support) so entry and
+        # management can never disagree about what "book support" means.
+        self.liquidity_guard = LiquidityFlowGuard()
+
+        # --- Dynamic post-loss cool-off window ----------------------------
+        # _cool_off_until: no NEW entry may be opened before this wall-clock
+        #   timestamp. Armed by _arm_cool_off() from _on_close_filled()
+        #   whenever a trade closes at a fee-net loss.
+        # _cool_off_guard_until: for an equally long window AFTER the hard
+        #   block expires, the entry orderbook guard stays TIGHTENED (the
+        #   adverse-imbalance veto trips earlier and real same-side book
+        #   support is required) - this is the anti-revenge-trading half of
+        #   the rule, and it is what makes the first trade after a loss
+        #   materially harder to open than an ordinary one.
+        # Deliberately in-memory only: a cool-off is a short-lived reaction
+        # to a just-observed loss, and a process restart already re-derives
+        # every risk-relevant fact from the exchange. Nothing is written to
+        # the DCA-state snapshot schema, so no persisted file format changes.
+        self._cool_off_until: float = 0.0
+        self._cool_off_guard_until: float = 0.0
+        self._cool_off_reason: str = ""
+        self._last_cool_off_log_ts: float = 0.0
+        self._last_continuous_trading_log_ts: float = 0.0
+        self._last_orderflow_exit_log_ts: float = 0.0
+        self._last_dca_orderbook_block_log_ts: float = 0.0
+
+        # --- Post-only (maker) entry execution ----------------------------
+        # Set to the orderId of an in-flight POST-ONLY (GTX) entry/DCA limit
+        # order, alongside the timestamp it was submitted. A maker order can
+        # legitimately rest unfilled forever if price walks away, and the
+        # existing sync machinery correctly treats a resting NEW order as
+        # "keep waiting" - so this upgrade owns its own timeout, cancels the
+        # stale order, and lets the next tick re-decide from scratch. See
+        # _post_only_entry_watchdog().
+        self._post_only_order_id: Optional[int] = None
+        self._post_only_submitted_ts: float = 0.0
+
+    # ---------------------------------------------------------------------
+    # 2026-08 orderflow helpers (all additive)
+    # ---------------------------------------------------------------------
+
+    def orderflow_snapshot(self) -> dict:
+        """One consistent orderflow reading for this decision. Every caller
+        in this file takes the snapshot ONCE per tick and passes the same
+        dict around, so the entry guard, the Smart Orderflow Early Exit and
+        the DCA rescue rule can never see three different books within a
+        single tick."""
+        return self.orderflow.snapshot()
+
+    def in_cool_off(self, now: Optional[float] = None) -> bool:
+        """True while the post-loss hard entry block is still active."""
+        ref = time.time() if now is None else now
+        return ref < self._cool_off_until
+
+    def cool_off_remaining_sec(self, now: Optional[float] = None) -> float:
+        ref = time.time() if now is None else now
+        return max(0.0, self._cool_off_until - ref)
+
+    def cool_off_guard_active(self, now: Optional[float] = None) -> bool:
+        """True while the TIGHTENED orderbook thresholds apply. Spans both
+        the hard-block window and the equally long window after it."""
+        ref = time.time() if now is None else now
+        return ref < self._cool_off_guard_until
+
+    def entry_imbalance_threshold(self, now: Optional[float] = None) -> float:
+        """Imbalance veto threshold for THIS decision. Tightened (lowered,
+        so an adverse book trips the veto sooner) while the post-loss guard
+        window is active. Floored at 0.05 so it can never collapse to a
+        degenerate zero-tolerance value through configuration alone."""
+        if not self.cool_off_guard_active(now):
+            return ORDERBOOK_IMBALANCE_THRESHOLD
+        return max(0.05, ORDERBOOK_IMBALANCE_THRESHOLD - COOL_OFF_IMBALANCE_TIGHTEN)
+
+    def entry_support_min(self, now: Optional[float] = None) -> float:
+        """Minimum same-side imbalance that counts as book support for THIS
+        decision. Raised to COOL_OFF_SUPPORT_MIN while the post-loss guard
+        window is active - i.e. after a loss the book must genuinely back
+        the new trade, not merely fail to oppose it."""
+        if not self.cool_off_guard_active(now):
+            return ORDERBOOK_SUPPORT_MIN
+        return max(ORDERBOOK_SUPPORT_MIN, COOL_OFF_SUPPORT_MIN)
+
+    def _arm_cool_off(self, net_pnl: float, exit_reason: str) -> None:
+        """Start the dynamic cool-off window after a losing trade.
+
+        Called from _on_close_filled()'s finalize block only, and only for a
+        genuinely negative fee-net result. Does not touch, cancel or modify
+        any open position - by construction there is none at that point, the
+        position has just been confirmed flat."""
+        if COOL_OFF_PERIOD_MINUTES <= 0:
+            return
+        window = COOL_OFF_PERIOD_MINUTES * 60.0
+        now = time.time()
+        self._cool_off_until = now + window
+        # Tightened thresholds outlast the hard block by the same duration.
+        self._cool_off_guard_until = self._cool_off_until + window
+        self._cool_off_reason = (
+            f"loss ${net_pnl:+.4f} on exit_reason={exit_reason}"
+        )
+        print(color(
+            f"{now_str()} [cool-off] ARMED after a losing trade ({self._cool_off_reason}): "
+            f"no new entry for {COOL_OFF_PERIOD_MINUTES:.0f} min, then a further "
+            f"{COOL_OFF_PERIOD_MINUTES:.0f} min with the entry orderbook guard TIGHTENED "
+            f"(imbalance veto {ORDERBOOK_IMBALANCE_THRESHOLD:.2f} -> "
+            f"{max(0.05, ORDERBOOK_IMBALANCE_THRESHOLD - COOL_OFF_IMBALANCE_TIGHTEN):.2f}, "
+            f"required book support >= {max(ORDERBOOK_SUPPORT_MIN, COOL_OFF_SUPPORT_MIN):.2f}). "
+            f"Open-position management (TP/SL/Profit-Lock/Smart-Exit/DCA) is unaffected.",
+            YELLOW,
+        ))
+
+    def _should_log_cool_off(self, interval_sec: float = 60.0) -> bool:
+        now = time.time()
+        if now - self._last_cool_off_log_ts >= interval_sec:
+            self._last_cool_off_log_ts = now
+            return True
+        return False
+
+    def _should_log_continuous_trading(self, interval_sec: float = 3600.0) -> bool:
+        now = time.time()
+        if now - self._last_continuous_trading_log_ts >= interval_sec:
+            self._last_continuous_trading_log_ts = now
+            return True
+        return False
+
+    def _should_log_orderflow_exit(self, interval_sec: float = 30.0) -> bool:
+        now = time.time()
+        if now - self._last_orderflow_exit_log_ts >= interval_sec:
+            self._last_orderflow_exit_log_ts = now
+            return True
+        return False
+
+    def _should_log_dca_orderbook_block(self, interval_sec: float = 30.0) -> bool:
+        now = time.time()
+        if now - self._last_dca_orderbook_block_log_ts >= interval_sec:
+            self._last_dca_orderbook_block_log_ts = now
+            return True
+        return False
 
     # -- Persistent Adaptive Learning: startup load / ongoing persistence ----
 
@@ -3225,6 +3498,51 @@ class MartingaleManager:
 
     # -- tick plumbing -----------------------------------------------------------
 
+    # ---------------------------------------------------------------------
+    # 2026-08 strict 1:2 risk-to-reward envelope
+    # ---------------------------------------------------------------------
+    # Sized for the documented account shape - $4 initial margin @ 20x
+    # leverage on a ~$20 wallet, i.e. ~$80 notional per entry - where a
+    # $0.20 fee-net stop and a $0.40 fee-net target are exactly 1:2.
+    #
+    # These are USD (fee-net) envelopes evaluated on the WHOLE position, so
+    # they stay correct after a DCA rescue changes the quantity - they are
+    # not percentage rules that silently mean different dollar amounts at
+    # different sizes.
+    #
+    # IMPORTANT - what was NOT changed: the pre-existing per-trade budget
+    # (MAX_TRADE_NET_LOSS_USDT, default $0.20) and the exchange-native
+    # protective STOP_MARKET derived from it (_compute_protective_stop_price)
+    # are untouched and still armed exactly as before. At their default
+    # values the two agree to the cent; these helpers add an independent
+    # client-side envelope on top rather than replacing that machinery, so
+    # nothing that already protected a position was weakened or removed.
+
+    def rr_stop_loss_usd(self) -> float:
+        """Hard fee-net loss ceiling for one trade ($0.20 by default)."""
+        return MAX_STOP_LOSS_USD
+
+    def rr_target_profit_usd(self) -> float:
+        """Fee-net profit target for one trade ($0.40 by default)."""
+        return TARGET_PROFIT_USD
+
+    def rr_enforcement_active(self) -> bool:
+        """The RR envelope is inert unless explicitly enabled AND the
+        pre-existing per-trade loss budget is itself enabled. Deployments
+        (and focused tests) that disable the budget with
+        MAX_TRADE_NET_LOSS_USDT=0 therefore keep exactly the behavior they
+        had before this upgrade - one switch still disables both."""
+        return (
+            ENFORCE_RISK_REWARD_USD
+            and MAX_TRADE_NET_LOSS_USDT > 0
+            and MAX_STOP_LOSS_USD > 0
+            and TARGET_PROFIT_USD > 0
+        )
+
+    def rr_ratio(self) -> float:
+        """Realized reward:risk of the configured envelope, for logging."""
+        return safe_div(TARGET_PROFIT_USD, MAX_STOP_LOSS_USD, 0.0)
+
     def update_price_history(self, price: float) -> None:
         self.price_history.append(price)
         if len(self.price_history) > SIGNAL_LOOKBACK_TICKS + 1:
@@ -3246,6 +3564,27 @@ class MartingaleManager:
     
     def on_agg_trade(self, qty: float, is_buyer_maker: bool) -> None:
         self.candles.on_trade(qty, is_buyer_maker)
+        # 2026-08 high-frequency orderflow upgrade (this line only - the
+        # pre-existing CandleAggregator ingestion above is untouched and
+        # still feeds the candle/volume-delta features exactly as before):
+        # the same aggregated trade also feeds the rolling 10s trade-volume
+        # delta used by the entry Liquidity & Flow Guard. Both consumers use
+        # the identical isBuyerMaker convention, so they can never disagree
+        # about which side was the aggressor.
+        self.orderflow.on_agg_trade(qty, is_buyer_maker)
+
+    def on_depth_update(self, bids, asks) -> None:
+        """Ingest one @depth<N>@100ms partial-book frame from the market
+        websocket (websocket.py). Deliberately NOT async and deliberately
+        does NOT drive on_price_tick(): depth arrives ~10x/second and must
+        never become the trading decision clock - bookTicker remains the
+        sole tick driver, exactly as before this upgrade. Wrapped so a
+        malformed frame can never propagate an exception back into the
+        socket read loop."""
+        try:
+            self.orderflow.on_depth(bids, asks)
+        except Exception as e:  # noqa: BLE001 - a bad depth frame must never kill the feed
+            print(color(f"{now_str()} [orderflow] depth frame skipped: {e}", YELLOW))
 
     def _spread_pct(self) -> float:
         if not self.best_bid_price or not self.best_ask_price:
@@ -3687,6 +4026,13 @@ class MartingaleManager:
 
     async def on_price_tick(self) -> None:
         await self._sweep_orphan_protective_stops()
+        # 2026-08 post-only (maker) entry execution: a GTX limit order can
+        # legitimately rest unfilled forever if price walks away from it.
+        # Runs here, before any entry/exit reasoning, so a stale resting
+        # entry is cleaned up promptly rather than pinning the state machine
+        # in ENTERING/DCA_PENDING. No-op unless a post-only order is
+        # actually in flight. See _post_only_entry_watchdog().
+        await self._post_only_entry_watchdog()
         features = self.build_features()
         candles = self.candles.all_candles_incl_live()
         self.last_regime = self.regime_engine.evaluate(candles)
@@ -3709,6 +4055,27 @@ class MartingaleManager:
 
         if self.position.status == "FLAT":
             if time.time() - self.last_trade_action_ts < TRADE_COOLDOWN_SEC:
+                return
+
+            # 2026-08 dynamic post-loss cool-off (entry gating ONLY -
+            # identical in structure and scope to the position_sync_ready /
+            # Daily Loss gates below: exit/DCA/risk management for an
+            # already-open position, Brain learning and every other function
+            # are untouched). Armed by _arm_cool_off() whenever a trade
+            # closes at a fee-net loss; blocks new entries outright for
+            # COOL_OFF_PERIOD_MINUTES, after which the TIGHTENED orderbook
+            # thresholds (entry_imbalance_threshold()/entry_support_min())
+            # keep applying for an equally long window. This is the
+            # anti-revenge-trading rule.
+            if self.in_cool_off():
+                if self._should_log_cool_off():
+                    print(color(
+                        f"{now_str()} [cool-off] entries paused for another "
+                        f"{self.cool_off_remaining_sec():.0f}s after a losing trade "
+                        f"({self._cool_off_reason or 'recent loss'}) - the orderbook guard "
+                        f"stays tightened for a further {COOL_OFF_PERIOD_MINUTES:.0f} min "
+                        f"after that. Open positions, if any, are unaffected.", YELLOW,
+                    ))
                 return
 
             # 2026-08 position_sync_ready startup gate (isolated to entry
@@ -3777,16 +4144,46 @@ class MartingaleManager:
             # touch any currently-open position - Hard Stop/TP/Profit Lock/
             # DCA/Max Hold Time all continue exactly as before for a trade
             # that's already running when the limit is hit.
+            # 2026-08 CONTINUOUS 24/7 EXECUTION (this `if
+            # CONTINUOUS_24_7_TRADING` wrapper only - the daily accounting
+            # itself, _maybe_reset_daily_loss_tracker(), daily_realized_pnl,
+            # MAX_DAILY_LOSS_USDT / DAILY_PROFIT_TARGET_USDT and both
+            # diagnostic log lines are all PRESERVED verbatim below): the
+            # bot must keep trading around the clock and must not shut
+            # itself down for the rest of a UTC day on a daily profit or
+            # loss figure. With CONTINUOUS_24_7_TRADING=true (the default)
+            # the two daily halts become periodic informational notices
+            # instead of hard `return`s; setting it to false restores the
+            # previous daily-halt behavior exactly, with no code change.
+            #
+            # Risk is not being discarded here, it is being relocated to
+            # per-trade controls that this same upgrade tightens: the strict
+            # $0.20 fee-net stop (per-trade budget + exchange-native
+            # protective STOP_MARKET), the 1:2 RR target, the Smart
+            # Orderflow Early Exit, and the post-loss cool-off window - all
+            # of which act per trade rather than by freezing the bot for
+            # hours at a time.
             self._maybe_reset_daily_loss_tracker()
             if MAX_DAILY_LOSS_USDT > 0 and self.daily_realized_pnl <= -MAX_DAILY_LOSS_USDT:
-                if self._should_log_daily_loss_block():
+                if not CONTINUOUS_24_7_TRADING:
+                    if self._should_log_daily_loss_block():
+                        print(color(
+                            f"{now_str()} [daily-loss] entries halted: today's realized PnL "
+                            f"${self.daily_realized_pnl:+.4f} <= -${MAX_DAILY_LOSS_USDT:.2f} limit - "
+                            f"no new trades until the next UTC day (existing open positions, if any, "
+                            f"are unaffected)", RED,
+                        ))
+                    return
+                if self._should_log_continuous_trading():
                     print(color(
-                        f"{now_str()} [daily-loss] entries halted: today's realized PnL "
-                        f"${self.daily_realized_pnl:+.4f} <= -${MAX_DAILY_LOSS_USDT:.2f} limit - "
-                        f"no new trades until the next UTC day (existing open positions, if any, "
-                        f"are unaffected)", RED,
+                        f"{now_str()} [continuous-24-7] today's realized PnL "
+                        f"${self.daily_realized_pnl:+.4f} is past the -${MAX_DAILY_LOSS_USDT:.2f} "
+                        f"daily-loss reference, but CONTINUOUS_24_7_TRADING is enabled - the bot "
+                        f"keeps trading. Per-trade risk (${MAX_STOP_LOSS_USD:.2f} fee-net stop, "
+                        f"1:{self.rr_ratio():.0f} RR target, orderflow early exit, "
+                        f"{COOL_OFF_PERIOD_MINUTES:.0f}-min post-loss cool-off) governs from here.",
+                        YELLOW,
                     ))
-                return
 
             # Fee-net Daily Profit Lock: once the configured UTC-day target
             # has been realized AFTER commissions, preserve it by refusing
@@ -3798,14 +4195,27 @@ class MartingaleManager:
                 DAILY_PROFIT_TARGET_USDT > 0
                 and self.daily_realized_pnl >= DAILY_PROFIT_TARGET_USDT
             ):
-                if self._should_log_daily_profit_block():
+                # 2026-08 CONTINUOUS 24/7 EXECUTION - same treatment as the
+                # daily-loss gate above: the target and its accounting are
+                # preserved exactly, but hitting it no longer stops the bot
+                # for the remainder of the UTC day.
+                if not CONTINUOUS_24_7_TRADING:
+                    if self._should_log_daily_profit_block():
+                        print(color(
+                            f"{now_str()} [daily-profit] entries halted: today's realized NET PnL "
+                            f"${self.daily_realized_pnl:+.4f} >= +${DAILY_PROFIT_TARGET_USDT:.2f} "
+                            f"target - profit locked, no new trades until the next UTC day "
+                            f"(existing open positions, if any, are unaffected)", GREEN,
+                        ))
+                    return
+                if self._should_log_continuous_trading():
                     print(color(
-                        f"{now_str()} [daily-profit] entries halted: today's realized NET PnL "
-                        f"${self.daily_realized_pnl:+.4f} >= +${DAILY_PROFIT_TARGET_USDT:.2f} "
-                        f"target - profit locked, no new trades until the next UTC day "
-                        f"(existing open positions, if any, are unaffected)", GREEN,
+                        f"{now_str()} [continuous-24-7] today's realized NET PnL "
+                        f"${self.daily_realized_pnl:+.4f} has passed the "
+                        f"+${DAILY_PROFIT_TARGET_USDT:.2f} daily target, but "
+                        f"CONTINUOUS_24_7_TRADING is enabled - the bot keeps trading instead of "
+                        f"standing down for the rest of the UTC day.", GREEN,
                     ))
-                return
 
             # 2026-08 Startup Warm-up Gate (isolated to entry gating only -
             # DCA/exit management for an already-open position, Brain
@@ -3861,9 +4271,19 @@ class MartingaleManager:
             # pairing left this scoring component effectively inert.
             momentum = float(features[4]) if len(features) > 4 else 0.0  # rolling_return_5
 
+            # 2026-08 Liquidity & Flow Guard: ONE orderflow snapshot per
+            # decision, taken here and threaded through, so the entry guard
+            # can never see a different book than the rest of this tick.
+            # The imbalance/support thresholds are the cool-off-aware
+            # values (tightened for the window following a losing trade) -
+            # see entry_imbalance_threshold()/entry_support_min().
+            orderflow_now = self.orderflow_snapshot()
             decision = self.entry_engine.evaluate(
                 self.last_confidence, self.last_regime, volume_z, momentum, features,
                 brain_readiness=self.brain.head_readiness(),
+                orderflow=orderflow_now,
+                imbalance_threshold=self.entry_imbalance_threshold(),
+                support_min=self.entry_support_min(),
             )
             self.last_entry_decision = decision
             if decision.should_enter and decision.side is not None:
@@ -3902,6 +4322,240 @@ class MartingaleManager:
         if p.side == "LONG":
             return (self.current_price - p.avg_entry_price) / p.avg_entry_price
         return (p.avg_entry_price - self.current_price) / p.avg_entry_price
+
+    # ---------------------------------------------------------------------
+    # 2026-08 POST-ONLY (MAKER) ENTRY EXECUTION
+    # ---------------------------------------------------------------------
+    # Entries and the single DCA rescue add are submitted as post-only
+    # (timeInForce=GTX) LIMIT orders resting at the near touch, so they pay
+    # the MAKER fee instead of the taker fee and take zero spread slippage.
+    # On a $80 notional round trip at Binance USD-M's standard rates that is
+    # roughly a 0.02% saving on the entry leg plus the half-spread - money
+    # that matters a great deal against a $0.40 profit target.
+    #
+    # Three things make this safe rather than merely cheaper:
+    #   1. Binance REJECTS (rather than fills) a GTX order that would cross,
+    #      so a post-only entry can never silently become a taker fill. We
+    #      re-price one tick further from the touch and retry exactly once.
+    #   2. If it still cannot rest, POST_ONLY_MARKET_FALLBACK (default on)
+    #      falls back to the ORIGINAL MARKET order, so a fast tape can never
+    #      leave the bot unable to trade at all. Set it to false to require
+    #      maker-only execution.
+    #   3. A resting maker order that price walks away from is cancelled by
+    #      _post_only_entry_watchdog() after POST_ONLY_LIMIT_TIMEOUT_SEC and
+    #      the decision is simply re-made on a later tick.
+    # EXITS ARE DELIBERATELY UNCHANGED: every close path (hard stop, TP,
+    # profit lock, smart exit, max hold, the reduceOnly close-verify
+    # retries, the exchange-native protective stop) still uses immediate
+    # MARKET/STOP_MARKET execution. Risk-reducing orders must fill, and a
+    # resting maker exit is exactly the order that does not fill when it is
+    # needed most.
+
+    @staticmethod
+    def _is_post_only_reject(e: BinanceApiError) -> bool:
+        """True when Binance refused a GTX order specifically because it
+        would have executed as a taker (-5022), or the equivalent
+        'would immediately trigger/match' rejection (-2010/-2021)."""
+        if e.code in (-5022, -2010, -2021):
+            return True
+        msg = ""
+        if isinstance(e.data, dict):
+            msg = str(e.data.get("msg", "")).lower()
+        return "post only" in msg or "post-only" in msg or "immediately match" in msg
+
+    def _round_price_to_tick(self, price: float, side: str) -> float:
+        """Snap a maker price to the symbol's tick grid, always AWAY from
+        the crossing direction: a BUY rounds DOWN (stays at/below the bid),
+        a SELL rounds UP (stays at/above the ask). round_step() only ever
+        rounds down, so the SELL case is computed explicitly here.
+
+        Both branches go through Decimal for the same reason round_step()
+        does: a plain `math.ceil(price / tick) * tick` reintroduces binary
+        float artifacts (e.g. 80.01000000000001), and Binance rejects a
+        price whose precision does not match the symbol's tick size."""
+        tick = self.filters.tick_size
+        if not tick or tick <= 0:
+            return price
+        if side == "BUY":
+            return round_step(price, tick)
+        d_price = Decimal(str(price))
+        d_tick = Decimal(str(tick))
+        steps = (d_price / d_tick).to_integral_value(rounding=ROUND_UP)
+        return float(steps * d_tick)
+
+    def _post_only_entry_price(self, order_side: str, offset_ticks: int = 0) -> Optional[float]:
+        """Resting maker price for an entry on `order_side`.
+
+        A BUY rests at the best bid, a SELL at the best ask - the near
+        touch, i.e. the most aggressive price that is still passive.
+        `offset_ticks` steps further away from the touch (used by the single
+        re-price retry after a post-only rejection). Returns None when no
+        live book is available, in which case the caller falls back to the
+        original MARKET behavior rather than guessing a price."""
+        tick = self.filters.tick_size or 0.0
+        if order_side == "BUY":
+            base = self.best_bid_price or self.current_price
+            if not base:
+                return None
+            price = base - offset_ticks * tick
+        else:
+            base = self.best_ask_price or self.current_price
+            if not base:
+                return None
+            price = base + offset_ticks * tick
+        if price <= 0:
+            return None
+        return self._round_price_to_tick(price, order_side)
+
+    async def _submit_entry_order(
+        self, order_side: str, qty: float, step_label: str,
+    ) -> Tuple[dict, str, bool]:
+        """Submit one entry/DCA order and return (response, label, was_post_only).
+
+        Raises BinanceApiError exactly like the original inline
+        place_order() call did, so _place_step_order()'s existing
+        error-handling / pending-state-revert path is unchanged."""
+        if not USE_POST_ONLY_LIMIT:
+            resp = await self.client.place_order(
+                symbol=self.symbol, side=order_side, type="MARKET", quantity=qty,
+            )
+            return resp, "MARKET", False
+
+        base_offset = max(POST_ONLY_LIMIT_OFFSET_TICKS, 0)
+        last_error: Optional[BinanceApiError] = None
+        # Attempt 0 rests at the touch; attempt 1 steps one further tick
+        # back after a post-only rejection (the book moved between our
+        # snapshot and the order reaching the matching engine).
+        for attempt in range(2):
+            price = self._post_only_entry_price(order_side, base_offset + attempt)
+            if price is None:
+                break
+            try:
+                resp = await self.client.place_order(
+                    symbol=self.symbol, side=order_side, type="LIMIT",
+                    timeInForce="GTX", price=price, quantity=qty,
+                )
+                print(color(
+                    f"{now_str()} [post-only] {step_label} resting as MAKER: {order_side} {qty} "
+                    f"@ {price} (attempt {attempt + 1}/2, GTX - Binance rejects rather than "
+                    f"crossing, so this can never become a taker fill)", CYAN,
+                ))
+                return resp, "LIMIT/GTX (post-only)", True
+            except BinanceApiError as e:
+                if not self._is_post_only_reject(e):
+                    raise
+                last_error = e
+                print(color(
+                    f"{now_str()} [post-only] {step_label} rejected as it would have crossed "
+                    f"(attempt {attempt + 1}/2, {e}) - re-pricing one tick further from the "
+                    f"touch.", YELLOW,
+                ))
+
+        if not POST_ONLY_MARKET_FALLBACK:
+            if last_error is not None:
+                raise last_error
+            raise BinanceApiError(
+                400,
+                {"code": -5022, "msg": "post-only entry could not be priced (no live book)"},
+            )
+
+        print(color(
+            f"{now_str()} [post-only] {step_label} could not rest as maker - falling back to the "
+            f"original MARKET execution so the signal is not lost (set "
+            f"POST_ONLY_MARKET_FALLBACK=false to require maker-only entries).", YELLOW,
+        ))
+        resp = await self.client.place_order(
+            symbol=self.symbol, side=order_side, type="MARKET", quantity=qty,
+        )
+        return resp, "MARKET (post-only fallback)", False
+
+    async def _post_only_entry_watchdog(self) -> None:
+        """Cancel a post-only entry/DCA order that has rested unfilled for
+        longer than POST_ONLY_LIMIT_TIMEOUT_SEC.
+
+        Why this is needed: the existing sync machinery correctly treats a
+        REST-confirmed NEW order as "keep waiting" (see initialize_sync's
+        resolution == "pending" branches), which is exactly right for a
+        MARKET order that simply has not reported yet - but a maker order
+        price has walked away from can rest forever, pinning the state
+        machine in ENTERING/DCA_PENDING.
+
+        On a confirmed cancel this only clears the pending bookkeeping and
+        returns the position to its prior state (FLAT for an entry, OPEN for
+        a DCA add); it deliberately does NOT re-derive quantities or place a
+        replacement order. If the order had partially filled, the
+        authoritative exchange resync (initialize_sync, running every
+        POSITION_RISK_POLL_SEC independently of this) rebuilds real state -
+        the same self-healing path every other ambiguous-order case in this
+        file already relies on."""
+        order_id = self._post_only_order_id
+        if order_id is None:
+            return
+        p = self.position
+        if p.pending_order_id != order_id or p.status not in ("ENTERING", "DCA_PENDING"):
+            # Filled, replaced, or resolved by some other path - stop
+            # tracking it; nothing to cancel.
+            self._post_only_order_id = None
+            self._post_only_submitted_ts = 0.0
+            return
+        if time.time() - self._post_only_submitted_ts < POST_ONLY_LIMIT_TIMEOUT_SEC:
+            return
+        if DRY_RUN:
+            self._post_only_order_id = None
+            self._post_only_submitted_ts = 0.0
+            return
+        is_cooldown_active = getattr(self.client, "is_cooldown_active", None)
+        if is_cooldown_active is not None and is_cooldown_active():
+            return  # retry on a later tick; never add REST load during a 418/429 cooldown
+
+        print(color(
+            f"{now_str()} [post-only] entry order_id={order_id} has rested unfilled for "
+            f"{time.time() - self._post_only_submitted_ts:.0f}s (>= "
+            f"{POST_ONLY_LIMIT_TIMEOUT_SEC:.0f}s) - cancelling; the decision will be re-made "
+            f"from scratch on a later tick.", YELLOW,
+        ))
+        try:
+            await self.client.cancel_order(symbol=self.symbol, order_id=order_id)
+        except BinanceApiError as e:
+            if e.code == -2011:  # "Unknown order sent" - already filled or already gone
+                print(color(
+                    f"{now_str()} [post-only] order_id={order_id} no longer exists on Binance "
+                    f"(filled or already cancelled) - leaving state for the normal fill/resync "
+                    f"path to resolve.", GRAY,
+                ))
+                self._post_only_order_id = None
+                self._post_only_submitted_ts = 0.0
+                return
+            print(color(
+                f"{now_str()} [post-only] cancel of order_id={order_id} FAILED ({e}) - leaving "
+                f"state untouched; will retry on a later tick.", RED,
+            ))
+            return
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            print(color(
+                f"{now_str()} [post-only] cancel of order_id={order_id} failed to reach Binance "
+                f"({e}) - leaving state untouched; will retry on a later tick.", RED,
+            ))
+            return
+
+        self._post_only_order_id = None
+        self._post_only_submitted_ts = 0.0
+        # Re-read self.position: a concurrent resync may have replaced it
+        # while the cancel was in flight, in which case that authoritative
+        # rebuild owns the state and must not be overwritten here.
+        p = self.position
+        if p.pending_order_id != order_id:
+            return
+        self._order_index.pop(order_id, None)
+        p.pending_order_id = None
+        p.pending_role = None
+        p.status = "OPEN" if p.total_qty > 0 else "FLAT"
+        if p.status == "FLAT":
+            p.side = None
+        print(color(
+            f"{now_str()} [post-only] cancel confirmed - position returned to {p.status}; "
+            f"entry/DCA will be re-evaluated on the next qualifying tick.", GRAY,
+        ))
 
     async def _place_step_order(
         self, step: int, side_signal: str, size_mult: float = 1.0,
@@ -4026,7 +4680,9 @@ class MartingaleManager:
             fake_id = -(int(time.time() * 1000) % 1_000_000) - step
             print(color(
                 f"{now_str()} [DRY RUN] would place {step_label} {order_side} {qty} "
-                f"{self.symbol} @ market (~{price:.2f}, notional=${notional:.2f}, "
+                f"{self.symbol} @ "
+                f"{'post-only LIMIT/GTX' if USE_POST_ONLY_LIMIT else 'market'} "
+                f"(~{price:.2f}, notional=${notional:.2f}, "
                 f"size_mult={size_mult:.2f}, regime={self.last_regime.regime}, "
                 f"confidence={self.last_confidence.confidence_score:.2f})", GRAY
             ))
@@ -4065,10 +4721,22 @@ class MartingaleManager:
         self.position.pending_order_ts = time.time()
 
         try:
-            resp = await self.client.place_order(
-                symbol=self.symbol, side=order_side, type="MARKET", quantity=qty,
+            # 2026-08 post-only (maker) entry execution: replaces the bare
+            # `place_order(type="MARKET", ...)` that used to be inline here.
+            # Every line after this call - _register_order_and_replay(), the
+            # already_filled race handling, the pending bookkeeping, the
+            # BinanceApiError revert path below - is unchanged, and with
+            # USE_POST_ONLY_LIMIT=false _submit_entry_order() issues the
+            # exact same MARKET order this used to.
+            resp, exec_label, was_post_only = await self._submit_entry_order(
+                order_side, qty, step_label,
             )
             order_id = resp["orderId"]
+            if was_post_only:
+                # Track it so _post_only_entry_watchdog() can cancel it if
+                # price walks away and it never fills.
+                self._post_only_order_id = order_id
+                self._post_only_submitted_ts = time.time()
             # 2026-08 fill-tracking race fix: was a bare
             # `self._order_index[resp["orderId"]] = role` - now goes through
             # _register_order_and_replay() so a FILLED event that arrived
@@ -4085,7 +4753,7 @@ class MartingaleManager:
                 self.last_trade_action_ts = time.time()
             print(color(
                 f"{now_str()} {step_label} PLACED  {order_side} {qty} {self.symbol} "
-                f"@ market (notional=${notional:.2f}, orderId={order_id}, "
+                f"@ {exec_label} (notional=${notional:.2f}, orderId={order_id}, "
                 f"size_mult={size_mult:.2f}, regime={self.last_regime.regime})",
                 CYAN,
             ))
@@ -4100,6 +4768,10 @@ class MartingaleManager:
             self.position.status = prior_status
             self.position.side = prior_side
             self.position.pending_order_ts = prior_pending_ts
+            # 2026-08 post-only: nothing is resting on the exchange after a
+            # rejected/failed submission, so clear the watchdog tracking too.
+            self._post_only_order_id = None
+            self._post_only_submitted_ts = 0.0
 
     async def _fetch_exchange_position(self) -> Optional[Tuple[Optional[str], float]]:
         """Fetches THIS symbol's authoritative position from Binance.
@@ -5364,6 +6036,106 @@ class MartingaleManager:
                 )
                 return
 
+        # --- 2026-08 STRICT 1:2 RR - absolute fee-net stop ceiling ---------------
+        # An independent ceiling layered ON TOP of the per-trade loss budget
+        # directly above (which is unchanged and still fires first at its own
+        # buffered trigger whenever the two are configured to their matching
+        # defaults). Its job is different: the budget gate is relative to
+        # MAX_TRADE_NET_LOSS_USDT, whichever value that is configured to,
+        # whereas this enforces the RR envelope's own absolute risk leg -
+        # one trade may never lose more than MAX_STOP_LOSS_USD ($0.20)
+        # fee-net, which is exactly half of the $0.40 TARGET_PROFIT_USD
+        # reward leg enforced further below. Together they are the 1:2.
+        #
+        # Gated behind position_sync_ready and rr_enforcement_active() for
+        # the same reason as the budget gate: it reads provisional
+        # local economics (qty + accumulated commission), so it must not act
+        # on state an authoritative exchange sync has not confirmed. Hard
+        # Stop above is unaffected and remains active regardless.
+        if self.rr_enforcement_active() and self.position_sync_ready:
+            rr_est_net = self.estimate_net_pnl_usdt_executable()
+            if rr_est_net <= -self.rr_stop_loss_usd():
+                print(color(
+                    f"{now_str()} [rr-stop] TRIGGERED: estimated fee-net pnl "
+                    f"${rr_est_net:+.4f} <= -${self.rr_stop_loss_usd():.2f} absolute stop "
+                    f"ceiling (1:{self.rr_ratio():.0f} envelope, reward leg "
+                    f"${self.rr_target_profit_usd():.2f}) - closing now.", RED,
+                ))
+                await self.close_position(
+                    f"1:{self.rr_ratio():.0f} RR stop: estimated fee-net pnl "
+                    f"${rr_est_net:+.4f} reached the ${self.rr_stop_loss_usd():.2f} "
+                    f"per-trade risk ceiling",
+                    emergency=True, exit_reason_tag="rr_stop_loss",
+                    expected_position=p,
+                )
+                return
+
+        # --- 2026-08 SMART ORDERFLOW EARLY EXIT ----------------------------------
+        # If the resting book flips violently AGAINST an open position before
+        # the stop is reached, exiting at a micro-loss beats riding it down to
+        # the full $0.20 stop. Requires BOTH microstructure signals to have
+        # turned (imbalance past SMART_ORDERFLOW_EXIT_IMBALANCE against us AND
+        # the 10s aggregated trade delta on the wrong side), and only fires
+        # inside the $0.05-$0.10 fee-net micro-loss band - above that band the
+        # position is still effectively flat and ordinary chop should not close
+        # it; below it, the RR stop ceiling above has already taken over.
+        #
+        # Independent of, and strictly earlier than, the existing multi-signal
+        # Smart Exit V2 further down (which is untouched): this reacts to live
+        # orderflow within seconds, where Smart Exit V2 reasons about
+        # candle/regime/confidence evidence over a much longer horizon.
+        if (
+            SMART_ORDERFLOW_EXIT_ENABLED
+            and ENABLE_ORDERBOOK_GUARD
+            and self.position_sync_ready
+            and (time.time() - p.opened_at) >= SMART_ORDERFLOW_EXIT_MIN_HOLD_SEC
+        ):
+            flow = self.orderflow_snapshot()
+            if flow.get("data_available"):
+                flow_imbalance = float(flow.get("imbalance", 0.0) or 0.0)
+                flow_delta = float(flow.get("trade_delta", 0.0) or 0.0)
+                book_flipped = (
+                    (p.side == "LONG" and flow_imbalance <= -SMART_ORDERFLOW_EXIT_IMBALANCE)
+                    or (p.side == "SHORT" and flow_imbalance >= SMART_ORDERFLOW_EXIT_IMBALANCE)
+                )
+                flow_against = (
+                    (p.side == "LONG" and flow_delta < 0)
+                    or (p.side == "SHORT" and flow_delta > 0)
+                )
+                of_est_net = self.estimate_net_pnl_usdt_executable()
+                in_micro_loss_band = (
+                    -SMART_ORDERFLOW_EXIT_MAX_LOSS_USD
+                    <= of_est_net
+                    <= -SMART_ORDERFLOW_EXIT_MIN_LOSS_USD
+                )
+                if book_flipped and flow_against and in_micro_loss_band:
+                    print(color(
+                        f"{now_str()} [orderflow-exit] TRIGGERED: book flipped against the "
+                        f"{p.side} (imbalance={flow_imbalance:+.4f}, threshold "
+                        f"{SMART_ORDERFLOW_EXIT_IMBALANCE:.2f}) with 10s flow delta "
+                        f"{flow_delta:+.4f} - exiting at a micro-loss of "
+                        f"${of_est_net:+.4f} instead of riding it to the "
+                        f"${self.rr_stop_loss_usd():.2f} stop.", YELLOW,
+                    ))
+                    await self.close_position(
+                        f"SMART ORDERFLOW EXIT: orderbook imbalance flipped to "
+                        f"{flow_imbalance:+.4f} against the {p.side} with 10s trade delta "
+                        f"{flow_delta:+.4f} - closing at a ${of_est_net:+.4f} micro-loss "
+                        f"before the stop",
+                        exit_reason_tag="orderflow_smart_exit",
+                        expected_position=p,
+                    )
+                    return
+                elif book_flipped and flow_against and self._should_log_orderflow_exit():
+                    print(color(
+                        f"{now_str()} [orderflow-exit] book flipped against the {p.side} "
+                        f"(imbalance={flow_imbalance:+.4f}, delta={flow_delta:+.4f}) but "
+                        f"fee-net pnl ${of_est_net:+.4f} is outside the micro-loss band "
+                        f"[-${SMART_ORDERFLOW_EXIT_MAX_LOSS_USD:.2f}, "
+                        f"-${SMART_ORDERFLOW_EXIT_MIN_LOSS_USD:.2f}] - holding; the RR stop "
+                        f"ceiling and every other exit remain active.", GRAY,
+                    ))
+
         # Breakeven stop (armed only after a partial TP has been taken): if
         # price falls back through the original average entry, close the
         # remaining runner instead of letting a locked-in partial win turn
@@ -5930,6 +6702,92 @@ class MartingaleManager:
         held_long_enough = (time.time() - p.opened_at) >= MIN_HOLD_SEC_BEFORE_EXIT
         dynamic_tp_pct = self.get_dynamic_take_profit_pct()
 
+        # --- 2026-08 STRICT 1:2 RR - reward leg -----------------------------------
+        # The mirror of the RR stop ceiling above, and the reason the envelope
+        # is 1:2 rather than merely "a stop plus a percentage target": the
+        # existing percentage-based TP below is left completely untouched and
+        # still runs, but a winner can no longer drift past the configured
+        # dollar target while the ATR-derived percentage TP waits for a move
+        # that may never come.
+        #
+        # Two rungs, both fee-net and both on the WHOLE position (so they stay
+        # correct after a DCA rescue changes the quantity):
+        #   - TARGET_PROFIT_USD ($0.40): the full target - bank it.
+        #   - MIN_TARGET_PROFIT_USD ($0.35): the band's lower edge - bank it
+        #     early if live orderflow has already turned against the position,
+        #     rather than giving back a nearly-complete win waiting for the
+        #     last five cents.
+        # Both rungs still respect the pre-existing MIN_NET_PROFIT_USDT
+        # fee-safe floor, and both reuse exit_reason_tag="take_profit" so
+        # trade-log classification, tp_hit labelling, the Brain's success
+        # label and every performance statistic keep their existing meaning.
+        if self.rr_enforcement_active() and held_long_enough:
+            rr_net_pnl = self.estimate_net_pnl_usdt(price)
+            if rr_net_pnl >= self.rr_target_profit_usd() and rr_net_pnl >= MIN_NET_PROFIT_USDT:
+                await self.close_position(
+                    f"1:{self.rr_ratio():.0f} RR target reached: est. fee-net pnl "
+                    f"${rr_net_pnl:+.4f} >= ${self.rr_target_profit_usd():.2f} target "
+                    f"(risk leg ${self.rr_stop_loss_usd():.2f}, {pct_move*100:.2f}% move)",
+                    exit_reason_tag="take_profit",
+                    expected_position=p,
+                )
+                return
+            if rr_net_pnl >= MIN_TARGET_PROFIT_USD and rr_net_pnl >= MIN_NET_PROFIT_USDT:
+                rr_flow = self.orderflow_snapshot()
+                if ENABLE_ORDERBOOK_GUARD and rr_flow.get("data_available"):
+                    rr_imbalance = float(rr_flow.get("imbalance", 0.0) or 0.0)
+                    rr_delta = float(rr_flow.get("trade_delta", 0.0) or 0.0)
+                    turning = (
+                        (p.side == "LONG" and rr_imbalance < -ORDERBOOK_IMBALANCE_THRESHOLD and rr_delta < 0)
+                        or (p.side == "SHORT" and rr_imbalance > ORDERBOOK_IMBALANCE_THRESHOLD and rr_delta > 0)
+                    )
+                    if turning:
+                        await self.close_position(
+                            f"1:{self.rr_ratio():.0f} RR target banked early: est. fee-net pnl "
+                            f"${rr_net_pnl:+.4f} >= ${MIN_TARGET_PROFIT_USD:.2f} and orderflow "
+                            f"turned against the {p.side} (imbalance={rr_imbalance:+.4f}, "
+                            f"10s delta={rr_delta:+.4f})",
+                            exit_reason_tag="take_profit",
+                            expected_position=p,
+                        )
+                        return
+
+        # --- 2026-08 SAFE DCA: fast break-even exit after the 1-step rescue -------
+        # Once the single permitted rescue add has filled, the position's goal
+        # changes: it is no longer hunting the full RR target on a book that
+        # has already moved against it - it wants OUT at break-even (a small
+        # but genuinely positive fee-net result) as soon as the rescue works.
+        # This is the "target a fast Break-Even exit" half of the Safe DCA
+        # rule; the "only add once, only with book support" half is enforced
+        # at the DCA placement gate further below.
+        #
+        # DCA_RESCUE_BREAKEVEN_MIN_NET_USD is fee-NET, so this can never
+        # realize a loss dressed up as break-even. Every other exit (TP, RR
+        # target, Profit Lock, Smart Exit, Hard Stop, Max Hold, the RR stop
+        # ceiling) remains fully active for a rescued position too.
+        if (
+            DCA_RESCUE_BREAKEVEN_ENABLED
+            and p.dca_step >= 1
+            and held_long_enough
+            and self.position_sync_ready
+        ):
+            be_net_pnl = self.estimate_net_pnl_usdt(price)
+            if be_net_pnl >= DCA_RESCUE_BREAKEVEN_MIN_NET_USD:
+                print(color(
+                    f"{now_str()} [dca-breakeven] rescued position recovered to a fee-net "
+                    f"${be_net_pnl:+.4f} (>= ${DCA_RESCUE_BREAKEVEN_MIN_NET_USD:.2f}) - taking "
+                    f"the fast break-even exit the Safe DCA rescue targets rather than "
+                    f"re-risking the recovery on the full RR target.", GREEN,
+                ))
+                await self.close_position(
+                    f"Safe DCA break-even exit: rescued {p.side} position "
+                    f"(dca_step={p.dca_step}/{MAX_DCA_STEPS}) recovered to est. fee-net pnl "
+                    f"${be_net_pnl:+.4f} at {pct_move*100:.2f}%",
+                    exit_reason_tag="dca_breakeven",
+                    expected_position=p,
+                )
+                return
+
         # --- Partial Take Profit ---------------------------------------------------
         if (
             PARTIAL_TP_ENABLED and not p.partial_tp_done and held_long_enough
@@ -6293,6 +7151,42 @@ class MartingaleManager:
                     # placed, dca_step unchanged, position stays exactly as
                     # it is. Hard Stop/Smart Exit/TP/Profit Lock/Max Hold
                     # all remain fully active in the meantime.
+                    return
+
+            # --- 2026-08 SAFE DCA: orderbook support requirement ----------------
+            # The DCA add is now a single-step RESCUE order (MAX_DCA_STEPS
+            # defaults to 1), and a rescue is only worth paying for when the
+            # resting book actually backs the reversal it is betting on:
+            # bids stacked under a losing LONG, asks stacked over a losing
+            # SHORT. Without that, averaging down is just buying more of a
+            # move that has not finished.
+            #
+            # Placed here - after every pre-existing DCA gate (step cap,
+            # dca_blocked, protection_pending, sync-ready, both time gates,
+            # spacing) and before the final-DCA risk gate and the loss-budget
+            # projection below - so it can only ever WITHHOLD an add those
+            # gates already approved. A withheld add does not increment
+            # dca_step and does not count as a used DCA; TP / RR target /
+            # Hard Stop / RR stop / Profit Lock / Smart Exit / orderflow exit
+            # / Max Hold all remain fully active meanwhile, and the add is
+            # re-evaluated on any later qualifying tick once the book turns.
+            if DCA_REQUIRE_ORDERBOOK_SUPPORT and ENABLE_ORDERBOOK_GUARD:
+                dca_flow = self.orderflow_snapshot()
+                if not self.liquidity_guard.supports_reversal(
+                    p.side, dca_flow, support_min=DCA_RESCUE_SUPPORT_MIN,
+                ):
+                    if self._should_log_dca_orderbook_block():
+                        print(color(
+                            f"{now_str()} [dca-orderbook-block] withholding the "
+                            f"{'rescue ' if MAX_DCA_STEPS <= 1 else ''}DCA add "
+                            f"step={p.dca_step + 1}/{MAX_DCA_STEPS} for the {p.side}: the book "
+                            f"does not support the reversal (imbalance="
+                            f"{dca_flow.get('imbalance', 0.0):+.4f}, required "
+                            f"{'>' if p.side == 'LONG' else '<'} "
+                            f"{DCA_RESCUE_SUPPORT_MIN if p.side == 'LONG' else -DCA_RESCUE_SUPPORT_MIN:+.2f}, "
+                            f"orderflow_data={dca_flow.get('data_available')}). dca_step "
+                            f"unchanged; every exit path remains active.", YELLOW,
+                        ))
                     return
 
             # --- Final-DCA low-probability-recovery gate (2026-07 final-DCA
@@ -6996,6 +7890,14 @@ class MartingaleManager:
 
 
     async def _on_entry_filled(self, role: str, fill_price: float, fill_qty: float, order_id: Optional[int] = None) -> None:
+        # 2026-08 post-only (maker) entry execution: this order has filled,
+        # so there is nothing left resting for the timeout watchdog to
+        # cancel. Clearing here (rather than only in the watchdog) means a
+        # maker fill can never be followed by a spurious cancel attempt
+        # against an order Binance has already closed.
+        if order_id is not None and self._post_only_order_id == order_id:
+            self._post_only_order_id = None
+            self._post_only_submitted_ts = 0.0
         self.position.entries.append((fill_price, fill_qty))
         total_notional = sum(p * q for p, q in self.position.entries)
         total_qty = sum(q for _, q in self.position.entries)
@@ -7298,6 +8200,20 @@ class MartingaleManager:
             ))
 
         was_success = combined_net_pnl > 0
+
+        # 2026-08 DYNAMIC POST-LOSS COOL-OFF: arm the anti-revenge-trading
+        # window whenever this trade closed at a fee-net loss. Entry-gating
+        # only (see _arm_cool_off / on_price_tick's cool-off gate) - the
+        # position has just been confirmed flat here, so nothing open is or
+        # can be affected. Deliberately keyed off the same combined_net_pnl
+        # that drives every other outcome decision in this block, so a trade
+        # the logs call a loss and a trade that triggers a cool-off are
+        # always the same set. infra_only_exit is computed just below and
+        # is excluded on purpose: an exit forced by a local REST/API failure
+        # says nothing about market conditions, so it must not suppress
+        # trading for the next 15 minutes.
+        if combined_net_pnl < 0 and exit_reason not in INFRASTRUCTURE_ONLY_EXIT_REASONS:
+            self._arm_cool_off(combined_net_pnl, exit_reason)
 
         # 2026-08 Brain-contamination fix: some exits say nothing whatsoever
         # about whether the ENTRY was a good decision - they are forced by
