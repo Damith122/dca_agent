@@ -231,9 +231,14 @@ async def userdata_consumer(client: RestClient, manager: MartingaleManager) -> N
             if USE_TESTNET:
                 url = f"{WS_USERDATA_BASE}/ws/{listen_key}"
             else:
+                # 2026-08 Algo-Service migration: ALGO_UPDATE carries the
+                # lifecycle of conditional (algo) orders - the exchange-native
+                # protective stop now lives there, so it MUST be subscribed
+                # alongside the existing two events or the stop's
+                # NEW/TRIGGERED/FINISHED transitions would never arrive.
                 url = (
                     f"{WS_USERDATA_BASE}/private/ws?listenKey={listen_key}"
-                    f"&events=ORDER_TRADE_UPDATE/ACCOUNT_UPDATE"
+                    f"&events=ORDER_TRADE_UPDATE/ACCOUNT_UPDATE/ALGO_UPDATE"
                 )
             # Never log the full URL (it embeds the listenKey) - keep the
             # existing generic "connecting ..." message exactly as before.
@@ -279,6 +284,16 @@ async def userdata_consumer(client: RestClient, manager: MartingaleManager) -> N
                                         CYAN,
                                     ))
                                 await manager.handle_order_update(event)
+                            elif etype == "ALGO_UPDATE":
+                                # 2026-08 Algo-Service migration: lifecycle of
+                                # the exchange-native protective stop. One
+                                # credential-free receipt marker (no listenKey,
+                                # no API key), then the same conservative
+                                # handler the REST recovery path uses.
+                                print(color(
+                                    f"{now_str()} [user-ws] ALGO_UPDATE received", CYAN,
+                                ))
+                                await manager.handle_algo_update(event)
                             elif etype == "ACCOUNT_UPDATE":
                                 for b in event.get("a", {}).get("B", []):
                                     if b.get("a") == "USDT":
