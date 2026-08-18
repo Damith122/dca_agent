@@ -480,6 +480,15 @@ DCA_STATE_PEAK_SAVE_MIN_DELTA_USDT = 0.02
 RECONCILE_BACKOFF_BASE_SEC = 30.0     # initial cooldown armed after the first failure
 RECONCILE_BACKOFF_MAX_SEC = 300.0     # cap on the cooldown even after repeated failures
 
+# 2026-08 orphan-close self-heal (fix D). How far back to re-fetch Binance
+# trade history, by time, when the reconciliation window turns out to start
+# AFTER a closed position's entry leg (leaving a close fill with no matching
+# entry - see reconcile_trade_history_from_exchange). Must comfortably cover
+# the longest a position can be held: MAX_HOLD_TIME_HARD_CAP_SEC is 8h by
+# default, so 24h leaves ample margin while staying well inside Binance's
+# 7-day userTrades startTime/endTime limit.
+ORPHAN_REWIND_LOOKBACK_MS = 24 * 60 * 60 * 1000
+
 
 # ============================================================================
 # SESSION START FILTER (new - 2026-07 session-start filter, see config.py's
@@ -2083,6 +2092,21 @@ class MartingaleManager:
         self._last_dca_loss_budget_log_ts: float = 0.0  # throttles the [dca-budget] blocked diagnostic line (item 7)
         self._last_order_cooldown_block_log_ts: float = 0.0  # throttles the [order-cooldown-block] diagnostic line (item 4 - REST cooldown retry-storm fix)
         self._last_protection_pending_log_ts: float = 0.0  # throttles the [protective-stop] high-severity PROTECTION_PENDING diagnostic line (item 6)
+        self._last_algo_envelope_warn_ts: float = 0.0  # throttles the [algo-update] UNATTRIBUTED diagnostic (2026-08 fix A)
+        # 2026-08 reconciliation entry-leg fix (fix B): the SMALLEST Binance
+        # trade id belonging to the position that is currently open. Set on
+        # the first fill observed after being flat, cleared whenever the
+        # position returns to FLAT, and persisted in the DCA-state snapshot
+        # so it survives a restart. reconcile_trade_history_from_exchange()
+        # uses it as a floor so the userTrades window can never start AFTER
+        # this position's own entry leg - which is what turned the LIVE
+        # protective-stop close into an unrecoverable orphan fill.
+        self._open_position_first_trade_id: Optional[int] = None
+        # 2026-08 orphan-close self-heal (fix D): the orphan trade id this
+        # process has already attempted a time-based backfill for, so a
+        # genuinely unmatchable fill is retried once and then left alone
+        # instead of re-fetching Binance history on every poll.
+        self._orphan_rewind_attempted_id: Optional[int] = None
 
         # --- Brain V2 stack -----------------------------------------------------
         self.candles = CandleAggregator()
@@ -2646,6 +2670,11 @@ class MartingaleManager:
             # untracked_order_id recovery path below.
             "pending_order_id": p.pending_order_id,
             "pending_role": p.pending_role,
+            # 2026-08 fix B: persisted so the reconciliation entry-leg floor
+            # survives a restart - without it, a process that restarts while
+            # a position is open loses the only marker that keeps the entry
+            # and close fills in the same userTrades window.
+            "open_position_first_trade_id": self._open_position_first_trade_id,
             # 2026-08 CLOSING-resync opened_at fix: the real entry
             # timestamp, so a full process restart (where the in-memory
             # PositionState is gone entirely, unlike an in-process resync
@@ -3179,6 +3208,64 @@ class MartingaleManager:
         except Exception as e:  # noqa: BLE001 - belt-and-suspenders; upload() already catches internally
             print(color(f"[reconcile] unexpected error pushing trade-sync cursor: {e}", RED))
 
+    def _position_is_live(self) -> bool:
+        """True while a real position is open locally. Used by the
+        orphan-close self-heal (fix D) to tell 'this lifecycle has not closed
+        yet' apart from 'this lifecycle's entry leg is missing from the
+        window'."""
+        p = self.position
+        return p.status in ("OPEN", "DCA_PENDING", "CLOSING") and p.total_qty > 0
+
+    @staticmethod
+    def _reconstruct_lifecycles(fills: List[dict]):
+        """Rebuilds flat -> open -> flat position lifecycles from a
+        chronologically sorted list of Binance userTrades fills.
+
+        Extracted verbatim (2026-08 fix D) from
+        reconcile_trade_history_from_exchange() so the same reconstruction
+        can be run a second time over a widened window when an orphan close
+        is detected. Behavior is unchanged - BUY=+qty, SELL=-qty on a running
+        signed size, one-way mode only. Returns (completed_lifecycles,
+        still_open_lifecycle_or_None).
+        """
+        lifecycles: List[dict] = []
+        running = 0.0
+        current: Optional[dict] = None
+        eps = 1e-9
+        for t in fills:
+            signed_qty = float(t["qty"]) * (1.0 if t["side"] == "BUY" else -1.0)
+            was_flat = abs(running) < eps
+            running += signed_qty
+            if was_flat and abs(running) > eps:
+                current = {
+                    "open_side": "LONG" if running > 0 else "SHORT",
+                    "fills": [],
+                    "open_time": int(t["time"]),
+                }
+            if current is not None:
+                current["fills"].append(t)
+            if not was_flat and abs(running) < eps and current is not None:
+                current["close_time"] = int(t["time"])
+                lifecycles.append(current)
+                current = None
+        return lifecycles, current
+
+    def _open_position_reconcile_floor(self) -> Optional[int]:
+        """2026-08 fix B. Lowest Binance trade id that reconciliation must
+        include so the CURRENTLY-OPEN position's entry leg is always fetched
+        alongside its close.
+
+        Returns None when flat (nothing needs keeping together, so the
+        normal cursor applies unchanged) or when this position's first
+        trade id is genuinely unknown - in which case the caller keeps its
+        previous behavior rather than guessing at a window."""
+        p = self.position
+        if p.status not in ("OPEN", "DCA_PENDING", "CLOSING") or p.total_qty <= 0:
+            return None
+        if self._open_position_first_trade_id is None:
+            return None
+        return max(1, int(self._open_position_first_trade_id))
+
     async def reconcile_trade_history_from_exchange(self, context: str = "reconcile") -> None:
         """Fetches executed fills for `self.symbol` from Binance starting
         just after the persisted cursor (or the optional explicit backfill
@@ -3233,7 +3320,36 @@ class MartingaleManager:
                     f"{TRADE_RECONCILE_BACKFILL_FROM_ID!r} is not a valid trade id - ignoring.", YELLOW,
                 ))
         elif not first_run:
+            # 2026-08 reconciliation entry-leg fix (fix B - the reason the
+            # LIVE 18:07:48 close could never be recovered by the safety
+            # net, and why the cursor wedged at close_trade_id - 1).
+            #
+            # `_last_live_trade_id` tracks the newest fill this process
+            # handled on the websocket. For an OPEN position that is the
+            # ENTRY fill - so starting the fetch just after it meant the
+            # next pass saw only the eventual CLOSE fill, with no matching
+            # entry. The lifecycle reconstruction below then read that lone
+            # BUY as a brand-new LONG *opening*, found it never closed
+            # inside the window, skipped it, and pinned cursor_cap one
+            # below it. Every subsequent pass repeated that forever: the
+            # trade was invisible and the cursor never advanced again.
+            #
+            # Fix: while a position is open locally, never start the window
+            # after its own entry fills. Rewind to the oldest trade id that
+            # belongs to the currently-open position so the entry and the
+            # close are always fetched together and the lifecycle closes
+            # properly. Falls back to the previous behavior whenever we are
+            # flat (nothing to keep together) or no entry id is known.
             from_id = max(self._trade_sync_cursor, self._last_live_trade_id) + 1
+            open_leg_from_id = self._open_position_reconcile_floor()
+            if open_leg_from_id is not None and open_leg_from_id < from_id:
+                print(color(
+                    f"[reconcile:{context}] position is open locally - rewinding userTrades "
+                    f"window from id>{from_id - 1} back to id>={open_leg_from_id} so this "
+                    f"position's entry leg is fetched together with its close "
+                    f"(prevents an orphan close fill being misread as a new opening).", GRAY,
+                ))
+                from_id = open_leg_from_id
 
         try:
             fills = await self.client.get_user_trades(self.symbol, from_id=from_id, limit=1000)
@@ -3274,8 +3390,6 @@ class MartingaleManager:
             return
 
         fills = sorted(fills, key=lambda t: int(t.get("id", 0)))
-        max_id_seen = max(int(t["id"]) for t in fills)
-        cursor_cap = max_id_seen
 
         # Reconstruct each flat -> open -> flat position lifecycle from the
         # running signed position size (BUY=+qty, SELL=-qty; this bot only
@@ -3283,22 +3397,66 @@ class MartingaleManager:
         # which always use plain BUY/SELL with no positionSide). A lifecycle
         # still open at the end of the fetched window is the CURRENT live
         # position and is skipped - it hasn't closed yet.
-        lifecycles: List[dict] = []
-        running = 0.0
-        current: Optional[dict] = None
-        eps = 1e-9
-        for t in fills:
-            signed_qty = float(t["qty"]) * (1.0 if t["side"] == "BUY" else -1.0)
-            was_flat = abs(running) < eps
-            running += signed_qty
-            if was_flat and abs(running) > eps:
-                current = {"open_side": "LONG" if running > 0 else "SHORT", "fills": [], "open_time": int(t["time"])}
-            if current is not None:
-                current["fills"].append(t)
-            if not was_flat and abs(running) < eps and current is not None:
-                current["close_time"] = int(t["time"])
-                lifecycles.append(current)
-                current = None
+        lifecycles, current = self._reconstruct_lifecycles(fills)
+
+        # 2026-08 orphan-close self-heal (fix D - unwedges a cursor that is
+        # already stuck, and stops any future wedge from becoming permanent).
+        #
+        # An unclosed lifecycle at the end of the window normally means "this
+        # is the live position". But if the bot is FLAT locally, that reading
+        # is impossible: what we are actually looking at is a CLOSE fill whose
+        # matching ENTRY sits BEFORE the window, so the reconstruction misread
+        # a closing BUY as an opening LONG (or a closing SELL as an opening
+        # SHORT). That is precisely the LIVE 18:07:48 state - and because
+        # cursor_cap then pins the cursor one below that orphan fill, every
+        # later pass re-fetched the same fill, made the same misreading, and
+        # never advanced again. The trade was unrecoverable and the whole
+        # trade-log safety net was jammed behind it.
+        #
+        # Recovery: re-fetch by TIME (userTrades accepts startTime; a bounded
+        # look-back well inside Binance's 7-day limit) so the missing entry
+        # leg is pulled in, then reconstruct again over the merged set. Tried
+        # at most once per distinct orphan id, so a genuinely unmatched fill
+        # degrades to the old skip-and-hold behavior instead of re-fetching
+        # forever.
+        if current is not None and not self._position_is_live():
+            orphan_first_id = min(int(t["id"]) for t in current["fills"])
+            orphan_first_time = min(int(t["time"]) for t in current["fills"])
+            if self._orphan_rewind_attempted_id != orphan_first_id:
+                self._orphan_rewind_attempted_id = orphan_first_id
+                start_ms = max(0, orphan_first_time - ORPHAN_REWIND_LOOKBACK_MS)
+                print(color(
+                    f"[reconcile:{context}] ORPHAN CLOSE DETECTED - trade id {orphan_first_id} "
+                    f"opens a lifecycle that never closes, but the bot is FLAT. Its entry leg "
+                    f"must predate this window; re-fetching userTrades from "
+                    f"{datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc):%Y-%m-%d %H:%M:%S} UTC "
+                    f"to recover the complete trade.", YELLOW,
+                ))
+                try:
+                    backfill = await self.client.get_user_trades(
+                        self.symbol, start_time_ms=start_ms, limit=1000
+                    )
+                except Exception as e:  # noqa: BLE001 - recovery is best-effort
+                    print(color(
+                        f"[reconcile:{context}] orphan-close backfill fetch failed ({e}) - "
+                        f"leaving the cursor where it is and retrying on a later pass.", YELLOW,
+                    ))
+                    backfill = None
+                if backfill:
+                    merged = {int(t["id"]): t for t in backfill}
+                    merged.update({int(t["id"]): t for t in fills})
+                    fills = [merged[k] for k in sorted(merged)]
+                    lifecycles, current = self._reconstruct_lifecycles(fills)
+                    print(color(
+                        f"[reconcile:{context}] orphan-close backfill merged "
+                        f"{len(backfill)} historical fill(s) - reconstruction now yields "
+                        f"{len(lifecycles)} complete lifecycle(s)"
+                        f"{' (orphan resolved)' if current is None else ' (still unmatched)'}.",
+                        GREEN if lifecycles else YELLOW,
+                    ))
+
+        max_id_seen = max(int(t["id"]) for t in fills)
+        cursor_cap = max_id_seen
 
         if current is not None:
             # Position still open at the end of this fetch window: do not
@@ -5211,6 +5369,8 @@ class MartingaleManager:
                             self._orphan_protective_algo_ids.add(self.position.protective_stop_algo_id)
                     self.position = PositionState(last_close_time=time.time())
                     self.last_trade_action_ts = time.time()
+                    # 2026-08 fix B: position gone - clear its entry-leg floor.
+                    self._open_position_first_trade_id = None
                     asyncio.create_task(self.save_flat_dca_state(reason="exchange already flat at close time"))
                     return
                 elif exchange_side != self.position.side:
@@ -5440,6 +5600,103 @@ class MartingaleManager:
             ))
             return None
 
+    # 2026-08 fix A: every documented/observed spelling of each ALGO_UPDATE
+    # field. Binance's USD-M streams use verbose names in the REST/docs
+    # payloads and short names on the wire, and the Algo Service migration
+    # is recent enough that both appear in the wild. Ordered most-specific
+    # first; the first non-empty match wins.
+    _ALGO_FIELD_ALIASES = {
+        "algo_id": ("algoId", "algoID", "algo_id", "strategyId", "ai", "si"),
+        "client_algo_id": (
+            "clientAlgoId", "clientAlgoID", "client_algo_id", "cai", "clientOrderId", "c",
+        ),
+        "status": (
+            "algoStatus", "algo_status", "strategyStatus", "status", "as", "st", "S", "X",
+        ),
+        "actual_order_id": (
+            "actualOrderId", "actualOrderID", "actual_order_id", "aoi", "orderId", "i",
+        ),
+    }
+
+    def _should_log_algo_envelope_warning(self, min_interval_sec: float = 30.0) -> bool:
+        """Throttles the UNATTRIBUTED ALGO_UPDATE diagnostic so a stream of
+        third-party algo events can never flood the log, while still making
+        sure the condition is never completely invisible again."""
+        now = time.time()
+        if now - self._last_algo_envelope_warn_ts < min_interval_sec:
+            return False
+        self._last_algo_envelope_warn_ts = now
+        return True
+
+    @classmethod
+    def _extract_algo_fields(cls, event: dict):
+        """2026-08 fix A. Pulls (payload, algo_id, client_algo_id, status,
+        actual_order_id) out of an ALGO_UPDATE event without depending on
+        the exact wrapper key or field spelling.
+
+        Strategy: collect every dict in the event (the event itself plus any
+        nested dicts, bounded depth so a pathological payload cannot spin),
+        score each by how many algo-ish fields it carries, and read the
+        fields from the best-scoring one - falling back to a merged view
+        across all of them for anything still missing. This is deliberately
+        permissive about WHERE the data lives and strict about WHAT is done
+        with it: the caller still proves ownership before acting, so a
+        loosely-matched third-party payload can never cause an action.
+
+        Returns the payload dict actually used (for diagnostics) plus the
+        four fields; every field is None/"" when genuinely absent.
+        """
+        if not isinstance(event, dict):
+            return {}, None, "", "", None
+
+        candidates: List[dict] = []
+
+        def walk(node, depth: int) -> None:
+            if depth > 3 or len(candidates) > 24:
+                return
+            if isinstance(node, dict):
+                candidates.append(node)
+                for value in node.values():
+                    walk(value, depth + 1)
+            elif isinstance(node, (list, tuple)):
+                for value in node[:8]:
+                    walk(value, depth + 1)
+
+        walk(event, 0)
+
+        def read(source: dict, logical: str):
+            for name in cls._ALGO_FIELD_ALIASES[logical]:
+                if name in source:
+                    value = source[name]
+                    if value not in (None, ""):
+                        return value
+            return None
+
+        def score(source: dict) -> int:
+            return sum(1 for logical in cls._ALGO_FIELD_ALIASES if read(source, logical) is not None)
+
+        best = max(candidates, key=score, default={})
+        if score(best) == 0:
+            best = event
+
+        def resolve(logical: str):
+            value = read(best, logical)
+            if value is not None:
+                return value
+            # Fall back to any other dict in the event that carries it.
+            for source in candidates:
+                value = read(source, logical)
+                if value is not None:
+                    return value
+            return None
+
+        algo_id = resolve("algo_id")
+        client_algo_id = resolve("client_algo_id") or ""
+        raw_status = resolve("status")
+        status = str(raw_status).upper() if raw_status is not None else ""
+        actual_order_id = resolve("actual_order_id")
+        return best, algo_id, client_algo_id, status, actual_order_id
+
     async def handle_algo_update(self, event: dict) -> None:
         """2026-08 Algo-Service migration: ALGO_UPDATE user-stream handler
         for the exchange-native protective stop.
@@ -5462,21 +5719,27 @@ class MartingaleManager:
           FINISHED                -> NEVER treated as a fill on its own; a
                                      REST query decides filled vs canceled
         """
-        a = None
-        for key in ("ao", "a", "o"):
-            candidate = event.get(key)
-            if isinstance(candidate, dict) and (
-                "algoId" in candidate or "algoStatus" in candidate or "clientAlgoId" in candidate
-            ):
-                a = candidate
-                break
-        if a is None:
-            a = event if isinstance(event, dict) else {}
-
-        algo_id = a.get("algoId")
-        client_algo_id = a.get("clientAlgoId") or ""
-        status = str(a.get("algoStatus") or a.get("status") or "").upper()
-        actual_order_id = a.get("actualOrderId")
+        # 2026-08 ALGO_UPDATE parse fix (fix A - root cause of the LIVE
+        # 18:07:48 incident, where a protective stop filled, closed the
+        # position on the exchange, and was never recorded as a trade).
+        # The previous parser looked for the payload under exactly three
+        # wrapper keys ("ao"/"a"/"o") and only recognised a dict carrying
+        # the literal names algoId/algoStatus/clientAlgoId. When the live
+        # envelope did not match, `a` silently fell back to the top-level
+        # event, every field came back None/"", ownership could not be
+        # established, and this method returned BEFORE its own
+        # [algo-update] diagnostic - so the failure was completely
+        # invisible in the logs (three "ALGO_UPDATE received" lines with
+        # zero "[algo-update]" lines is exactly what the incident showed).
+        #
+        # _extract_algo_fields() below walks the whole event structure and
+        # accepts every documented/observed spelling of each field, so an
+        # envelope difference can no longer blind this handler. Anything it
+        # still cannot parse is now LOGGED (throttled) instead of dropped
+        # in silence, and - when a protective stop is actually tracked and
+        # a position is open - escalated to an authoritative REST lookup
+        # rather than assumed irrelevant.
+        a, algo_id, client_algo_id, status, actual_order_id = self._extract_algo_fields(event)
         p = self.position
 
         # Ownership: only ever act on OUR protective stop. A manual or
@@ -5491,6 +5754,50 @@ class MartingaleManager:
             bool(client_algo_id) and client_algo_id == p.protective_stop_client_algo_id
         )
         if not owned_by_prefix and not matches_tracked:
+            # 2026-08 fix A: NEVER return silently here again. Two distinct
+            # cases, and the old code collapsed both into a silent drop:
+            #
+            #  (1) genuinely someone else's algo order - correct to ignore,
+            #      but say so at least occasionally so it is visible;
+            #  (2) OUR stop, whose identifying fields this build could not
+            #      parse out of the envelope. That is the incident case. If
+            #      we are tracking a protective stop on an open position,
+            #      an unattributable ALGO_UPDATE is treated as a possible
+            #      state change on OUR order and resolved authoritatively
+            #      over REST - which returns the real algoStatus and
+            #      actualOrderId regardless of the stream envelope's shape.
+            tracking_a_stop = (
+                p.protective_stop_algo_id is not None or bool(p.protective_stop_client_algo_id)
+            )
+            position_live = p.status in ("OPEN", "DCA_PENDING", "CLOSING") and p.total_qty > 0
+            unparsed = algo_id is None and not client_algo_id and not status
+            if self._should_log_algo_envelope_warning():
+                print(color(
+                    f"{now_str()} [algo-update] UNATTRIBUTED ALGO_UPDATE "
+                    f"(algoId={algo_id or '-'} clientAlgoId={client_algo_id or '-'} "
+                    f"status={status or 'UNKNOWN'} actualOrderId={actual_order_id or '-'} "
+                    f"envelope_keys={sorted(event.keys()) if isinstance(event, dict) else type(event).__name__} "
+                    f"parsed_payload_keys={sorted(a.keys()) if isinstance(a, dict) else '-'}) - "
+                    f"{'fields could not be parsed from this envelope' if unparsed else 'does not match our tracked stop'}; "
+                    f"tracking_a_stop={tracking_a_stop} position_live={position_live}.",
+                    YELLOW,
+                ))
+            if unparsed and tracking_a_stop and position_live:
+                info = await self._resolve_protective_algo_via_rest(
+                    context="unparsed ALGO_UPDATE envelope"
+                )
+                if info:
+                    rest_status = str(
+                        info.get("algoStatus") or info.get("status") or ""
+                    ).upper()
+                    print(color(
+                        f"{now_str()} [algo-update] resolved unparsed envelope over REST: "
+                        f"algoStatus={rest_status or 'UNKNOWN'} "
+                        f"actualOrderId={info.get('actualOrderId') or '-'}.", CYAN,
+                    ))
+                    await self._register_protective_child_order(
+                        info.get("actualOrderId"), context="REST after unparsed ALGO_UPDATE",
+                    )
             return
 
         print(color(
@@ -7953,7 +8260,18 @@ class MartingaleManager:
         trade_id = o.get("t")
         if trade_id is not None:
             try:
-                self._last_live_trade_id = max(self._last_live_trade_id, int(trade_id))
+                _tid = int(trade_id)
+                self._last_live_trade_id = max(self._last_live_trade_id, _tid)
+                # 2026-08 fix B: remember where THIS position's fills start,
+                # so reconciliation always fetches its entry leg together
+                # with its eventual close (see
+                # _open_position_reconcile_floor / from_id rewind).
+                if self._open_position_first_trade_id is None:
+                    self._open_position_first_trade_id = _tid
+                else:
+                    self._open_position_first_trade_id = min(
+                        self._open_position_first_trade_id, _tid
+                    )
             except (TypeError, ValueError):
                 pass
 
@@ -8492,6 +8810,9 @@ class MartingaleManager:
         # trade's Profit Lock starts measuring peak growth from zero
         # (2026-07 DCA-state-recovery fix).
         self._last_dca_state_peak_saved = 0.0
+        # 2026-08 fix B: this trade is finalized and logged - its entry-leg
+        # reconciliation floor must not carry into the next position.
+        self._open_position_first_trade_id = None
 
         asyncio.create_task(self.persist_brain(reason="trade closed"))
         asyncio.create_task(self.sync_trade_log_to_github())
@@ -8678,7 +8999,21 @@ async def initialize_sync(
             f"current position; will resume once it resolves.", GRAY,
         ))
     else:
-        await manager.reconcile_trade_history_from_exchange(context=context)
+        # 2026-08 hardening (fix C follow-up): this safety-net call is
+        # bookkeeping only - it must never be able to abort initialize_sync()
+        # and propagate out of the position-risk poller, whose own except
+        # clause only covers BinanceApiError/ClientError/TimeoutError. An
+        # unexpected error here would otherwise escape to the supervisor and
+        # restart the whole bot over a trade-log refresh. The method already
+        # handles its own API failures internally; this guards the rest.
+        try:
+            await manager.reconcile_trade_history_from_exchange(context=context)
+        except Exception as e:  # noqa: BLE001 - bookkeeping must never abort a state sync
+            print(color(
+                f"{now_str()} [sync:{context}] trade-history reconciliation raised "
+                f"({e}) - continuing with position sync; the trade log retries next pass.",
+                YELLOW,
+            ))
 
     if rows is None:
         try:
@@ -8794,13 +9129,52 @@ async def initialize_sync(
                 ))
                 return
         if p.status != "FLAT":
+            # 2026-08 close-accounting fix (fix C - the step that turned the
+            # LIVE 18:07:48 incident from "a fill we failed to route" into
+            # "a trade that never existed").
+            #
+            # Resetting straight to a blank PositionState() throws away the
+            # ONLY record of the position the fill belonged to: side, entry
+            # price, qty, opened_at, dca_step. Once that is gone nothing can
+            # attribute the close, so no trade is logged, no CSV row is
+            # written, and no GitHub push is triggered - which is exactly
+            # what happened live (status went OPEN -> FLAT with trades=0 and
+            # session_pnl=+0.0000 six seconds after the stop filled).
+            #
+            # The exchange going flat under an OPEN local position IS a
+            # close - by definition. So before discarding the state, give
+            # reconciliation one authoritative pass against Binance's own
+            # userTrades while the position (and therefore the entry-leg
+            # floor from fix B) is still intact. If it finds the lifecycle,
+            # the trade is logged/counted/pushed exactly as a normal close
+            # would be. Reconciliation is idempotent and deduped by order
+            # id, so a close the live path already handled is never
+            # double-counted here.
             print(color(
                 f"{now_str()} [sync:{context}] exchange reports NO open position, but local "
-                f"state was status={p.status} side={p.side}. Resetting to FLAT so the bot "
-                f"can evaluate a fresh entry instead of waiting on a fill that won't arrive.",
+                f"state was status={p.status} side={p.side} qty={p.total_qty} - the position "
+                f"closed on the exchange. Reconciling against Binance trade history BEFORE "
+                f"resetting local state, so the closed trade is recorded rather than lost.",
                 YELLOW,
             ))
+            try:
+                await manager.reconcile_trade_history_from_exchange(
+                    context=f"{context}:position-closed-on-exchange"
+                )
+            except Exception as e:  # noqa: BLE001 - a reset must never be blocked by bookkeeping
+                print(color(
+                    f"{now_str()} [sync:{context}] pre-reset reconciliation failed ({e}) - "
+                    f"resetting to FLAT anyway; the trade-log safety net will retry on a later "
+                    f"pass now that the cursor was not advanced past it.", RED,
+                ))
+            print(color(
+                f"{now_str()} [sync:{context}] resetting to FLAT so the bot can evaluate a "
+                f"fresh entry instead of waiting on a fill that won't arrive.", YELLOW,
+            ))
             manager.position = PositionState(last_close_time=time.time())
+            # 2026-08 fix B: this position is finished - its entry-leg floor
+            # must not leak into the NEXT position's reconciliation window.
+            manager._open_position_first_trade_id = None
         # 2026-08 position_sync_ready timing fix (this line only): the
         # exchange has now been confirmed genuinely flat (either local
         # state already agreed, or it was just reset to FLAT immediately
@@ -9274,6 +9648,17 @@ async def initialize_sync(
                 restored_opened_at = snap_opened_at if snap_opened_at > 0 else None
             except (TypeError, ValueError):
                 restored_opened_at = None
+            # 2026-08 fix B: restore this position's reconciliation entry-leg
+            # floor, so a process that restarts mid-position still fetches the
+            # entry and the eventual close in ONE userTrades window. Older
+            # snapshots predating this field simply leave it None, which keeps
+            # the pre-fix behavior rather than guessing at a window.
+            try:
+                snap_first_trade_id = snapshot.get("open_position_first_trade_id")
+                if snap_first_trade_id is not None:
+                    manager._open_position_first_trade_id = int(snap_first_trade_id)
+            except (TypeError, ValueError):
+                pass
             # 2026-08 DCA State Recovery V2: restore the full fill-by-fill
             # history (dca_history) if present and internally consistent
             # (a basic sanity check - its qty must sum to roughly the same
