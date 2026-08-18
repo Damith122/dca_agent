@@ -23,6 +23,7 @@
 """
 
 import os
+import random
 
 # ============================================================================
 # CONFIG
@@ -350,6 +351,40 @@ SYNC_PENDING_GRACE_SEC = int(os.environ.get("SYNC_PENDING_GRACE_SEC", "8"))
 # --- Candle aggregation (backs ATR / EMA / regime / volume features) --------
 CANDLE_INTERVAL_SEC = int(os.environ.get("CANDLE_INTERVAL_SEC", "60"))
 CANDLE_HISTORY = 180          # ~3 hours of 1m candles kept in memory
+
+# --- Instant warm-up via historical klines ------------------------------------
+# 2026-08 startup warm-up fix. The candle series that backs ATR / EMA / regime
+# used to be built EXCLUSIVELY from the live tick stream, so a fresh container
+# needed max(EMA_SLOW, ATR_PERIOD) + 2 = 57 one-minute candles - nearly an hour -
+# before a single entry could be considered ("[entry-skip] startup warm-up:
+# insufficient market history (candles=5/57)"). On startup the bot now issues ONE
+# REST call to GET /fapi/v1/klines and seeds the candle buffer with the last
+# KLINE_WARMUP_LIMIT closed candles, then hands the series straight over to the
+# live websocket stream for real-time updates. Indicators are valid within
+# seconds of boot, with no loss of real-time precision (only fully-CLOSED
+# historical candles are seeded; the in-progress bucket is always owned by the
+# live stream).
+#
+#   KLINE_WARMUP_ENABLED - set to "false" to fall back to the old
+#                          stream-only warm-up behavior.
+#   KLINE_WARMUP_LIMIT   - how many historical candles to request (Binance
+#                          allows up to 1500 in one call; 100 comfortably
+#                          exceeds the 57 the indicators need, and is clamped
+#                          to CANDLE_HISTORY since the buffer cannot hold more).
+#   KLINE_WARMUP_INTERVAL - Binance kline interval string. Derived from
+#                          CANDLE_INTERVAL_SEC so it can never silently
+#                          disagree with the aggregator's own bucket size.
+KLINE_WARMUP_ENABLED = os.environ.get("KLINE_WARMUP_ENABLED", "true").lower() in ("1", "true", "yes")
+KLINE_WARMUP_LIMIT = max(1, min(int(os.environ.get("KLINE_WARMUP_LIMIT", "100")), CANDLE_HISTORY))
+
+_KLINE_INTERVAL_BY_SEC = {
+    60: "1m", 180: "3m", 300: "5m", 900: "15m", 1800: "30m",
+    3600: "1h", 7200: "2h", 14400: "4h", 21600: "6h", 28800: "8h",
+    43200: "12h", 86400: "1d",
+}
+KLINE_WARMUP_INTERVAL = os.environ.get(
+    "KLINE_WARMUP_INTERVAL", _KLINE_INTERVAL_BY_SEC.get(CANDLE_INTERVAL_SEC, "1m")
+)
 
 # --- Technical feature params -------------------------------------------------
 ATR_PERIOD = 14
@@ -690,8 +725,88 @@ _warn_if_explicit_path_bypasses_isolation("GITHUB_DCA_STATE_PATH")
 
 # --- Timing -------------------------------------------------------------------
 LISTEN_KEY_KEEPALIVE_SEC = 25 * 60
-BALANCE_REFRESH_SEC = 60
-POSITION_RISK_POLL_SEC = 10
+
+# 2026-08 HTTP 429 REST rate-limit fix. Binance's own 429 body spells the
+# remedy out: "Please use the websocket for live updates to avoid polling the
+# API." The REST pollers are now (a) slower, (b) websocket-deferred whenever
+# the user-data stream is already delivering the same information, and (c)
+# jittered so they never line up into a synchronized burst.
+#
+# Every interval below is env-overridable and floor-clamped, so no deployment
+# can accidentally configure the bot back into a rate-limit ban.
+#
+#   POSITION_RISK_POLL_SEC      - GET /fapi/v2/positionRisk while a position is
+#                                 actually open (liquidation price is the one
+#                                 field the user-data stream never sends, so
+#                                 this poll cannot be dropped entirely).
+#                                 Floor-clamped to REST_POLL_MIN_SEC.
+#   POSITION_RISK_POLL_IDLE_SEC - the same poll while FLAT. Nothing is at risk,
+#                                 so it runs at the slow end of the band and
+#                                 exists only as a safety net behind the
+#                                 user-data stream's own ACCOUNT_UPDATE events.
+#   BALANCE_REFRESH_SEC         - GET /fapi/v2/balance. Skipped entirely
+#                                 whenever an ACCOUNT_UPDATE carrying the USDT
+#                                 wallet balance arrived over the websocket in
+#                                 the last BALANCE_WS_FRESH_SEC (see
+#                                 websocket.py's ACCOUNT_UPDATE handler).
+#   BALANCE_WS_FRESH_SEC        - how long a websocket balance stays "fresh
+#                                 enough" to suppress the REST refresh.
+#   REST_POLL_JITTER_PCT        - +/- fraction of random jitter applied to every
+#                                 poller sleep, so independent pollers (and
+#                                 independent bot instances behind one NAT IP)
+#                                 never resynchronize onto the same tick.
+REST_POLL_MIN_SEC = 15.0
+REST_POLL_MAX_SEC = 30.0
+
+
+def _clamped_poll_interval(name: str, default: float) -> float:
+    """Reads a poller interval from the environment and clamps it into the
+    [REST_POLL_MIN_SEC, REST_POLL_MAX_SEC] rate-limit-safe band. A
+    non-numeric value falls back to `default` rather than crashing startup."""
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        print(f"[config] {name} is not a number - using default {default}s")
+        value = default
+    clamped = min(max(value, REST_POLL_MIN_SEC), REST_POLL_MAX_SEC)
+    if clamped != value:
+        print(
+            f"[config] {name}={value}s is outside the rate-limit-safe band "
+            f"[{REST_POLL_MIN_SEC}s, {REST_POLL_MAX_SEC}s] - clamped to {clamped}s"
+        )
+    return clamped
+
+
+POSITION_RISK_POLL_SEC = _clamped_poll_interval("POSITION_RISK_POLL_SEC", 20.0)
+POSITION_RISK_POLL_IDLE_SEC = max(
+    _clamped_poll_interval("POSITION_RISK_POLL_IDLE_SEC", 30.0), POSITION_RISK_POLL_SEC
+)
+# Balance is refreshed far less often than position risk (it is websocket-fed),
+# so it is only floor-clamped, never capped at REST_POLL_MAX_SEC.
+try:
+    BALANCE_REFRESH_SEC = max(float(os.environ.get("BALANCE_REFRESH_SEC", "60")), REST_POLL_MIN_SEC)
+except (TypeError, ValueError):
+    BALANCE_REFRESH_SEC = 60.0
+try:
+    BALANCE_WS_FRESH_SEC = max(float(os.environ.get("BALANCE_WS_FRESH_SEC", "90")), 0.0)
+except (TypeError, ValueError):
+    BALANCE_WS_FRESH_SEC = 90.0
+try:
+    REST_POLL_JITTER_PCT = min(max(float(os.environ.get("REST_POLL_JITTER_PCT", "0.15")), 0.0), 0.5)
+except (TypeError, ValueError):
+    REST_POLL_JITTER_PCT = 0.15
+
+
+def jittered_interval(base_sec: float, jitter_pct: float = None) -> float:
+    """`base_sec` +/- up to `jitter_pct` of itself, never below 1s. Used by
+    every REST poller's sleep so concurrent pollers spread their requests
+    out instead of firing on the same wall-clock tick."""
+    pct = REST_POLL_JITTER_PCT if jitter_pct is None else jitter_pct
+    if pct <= 0:
+        return max(1.0, base_sec)
+    return max(1.0, base_sec * (1.0 + random.uniform(-pct, pct)))
+
+
 MAX_BACKOFF_SEC = 30
 IDLE_DATA_TIMEOUT_SEC = 20
 USER_WS_IDLE_FALLBACK_SEC = 20 * 60
@@ -772,6 +887,9 @@ __all__ = [
     "SYNC_PENDING_GRACE_SEC",
     "CANDLE_INTERVAL_SEC",
     "CANDLE_HISTORY",
+    "KLINE_WARMUP_ENABLED",
+    "KLINE_WARMUP_LIMIT",
+    "KLINE_WARMUP_INTERVAL",
     "ATR_PERIOD",
     "EMA_FAST",
     "EMA_MED",
@@ -840,7 +958,13 @@ __all__ = [
     "BRAIN_AUTO_PUSH_INTERVAL_SEC",
     "LISTEN_KEY_KEEPALIVE_SEC",
     "BALANCE_REFRESH_SEC",
+    "BALANCE_WS_FRESH_SEC",
     "POSITION_RISK_POLL_SEC",
+    "POSITION_RISK_POLL_IDLE_SEC",
+    "REST_POLL_MIN_SEC",
+    "REST_POLL_MAX_SEC",
+    "REST_POLL_JITTER_PCT",
+    "jittered_interval",
     "MAX_BACKOFF_SEC",
     "IDLE_DATA_TIMEOUT_SEC",
     "USER_WS_IDLE_FALLBACK_SEC",

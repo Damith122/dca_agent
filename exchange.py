@@ -289,6 +289,31 @@ class RestClient:
         """Current open interest. Best-effort feature source."""
         return await self._request("GET", "/fapi/v1/openInterest", {"symbol": symbol})
 
+    async def get_klines(self, symbol: str, interval: str = "1m", limit: int = 100) -> list:
+        """Public GET /fapi/v1/klines - historical OHLCV candles, oldest first.
+
+        2026-08 instant warm-up fix. Called EXACTLY ONCE per process, at
+        startup, to seed the candle buffer that backs ATR / EMA / regime so
+        the indicators are valid within seconds instead of after ~an hour of
+        waiting for the live tick stream to build 57 one-minute candles by
+        itself. This is a single unsigned request with a request weight of 1
+        for limit <= 100 (5 for limit <= 500, 10 for limit <= 1000) - it is
+        not a poller, and it adds nothing to the steady-state REST rate that
+        the 429 fix is reducing.
+
+        Binance caps `limit` at 1500; anything higher is clamped here rather
+        than rejected by the exchange. Each returned row is a list:
+            [0] openTime ms, [1] open, [2] high, [3] low, [4] close,
+            [5] volume, [6] closeTime ms, [7] quoteAssetVolume,
+            [8] numberOfTrades, [9] takerBuyBaseAssetVolume,
+            [10] takerBuyQuoteAssetVolume, [11] ignore
+        Docs: https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/Kline-Candlestick-Data
+        """
+        return await self._request(
+            "GET", "/fapi/v1/klines",
+            {"symbol": symbol, "interval": interval, "limit": max(1, min(int(limit), 1500))},
+        )
+
     # --- signed account endpoints -------------------------------------------
     async def get_balance(self) -> list:
         return await self._request("GET", "/fapi/v2/balance", signed=True)

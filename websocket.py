@@ -647,9 +647,25 @@ async def userdata_consumer(client: RestClient, manager: MartingaleManager) -> N
                                 ))
                                 await manager.handle_algo_update(event)
                             elif etype == "ACCOUNT_UPDATE":
-                                for b in event.get("a", {}).get("B", []):
-                                    if b.get("a") == "USDT":
-                                        manager.available_balance = float(b.get("cw") or b.get("wb") or 0)
+                                # 2026-08 HTTP 429 REST rate-limit fix -
+                                # websocket-first state tracking. The balance
+                                # assignment is unchanged in effect; it now
+                                # lives in MartingaleManager.on_account_update()
+                                # alongside a timestamp and this symbol's
+                                # streamed position amount, so the REST pollers
+                                # in dca2.py can skip the balance refresh while
+                                # this copy is fresh and idle the positionRisk
+                                # poll while the stream says we are flat.
+                                # getattr-guarded so any manager stub without
+                                # the new method still gets the original
+                                # inline balance behavior.
+                                on_account_update = getattr(manager, "on_account_update", None)
+                                if callable(on_account_update):
+                                    on_account_update(event)
+                                else:
+                                    for b in event.get("a", {}).get("B", []):
+                                        if b.get("a") == "USDT":
+                                            manager.available_balance = float(b.get("cw") or b.get("wb") or 0)
                         except Exception as e:  # noqa: BLE001 - one bad message must not kill the socket
                             print(color(f"[user-ws] error processing message, skipping: {e}", RED))
                 finally:
