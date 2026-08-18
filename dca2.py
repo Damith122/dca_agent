@@ -27,8 +27,12 @@ for that reality, beyond what a laptop-only bot needs:
 
 Also: the online-learning brain and DCA step counters live in memory only
 (brain weights ARE persisted to brain_v2.pkl / GitHub - see BRAIN V2
-PERSISTENCE below - but candle/feature buffers are not, so there's a short
-re-warmup period for regime/ATR context after every restart).
+PERSISTENCE below - but candle/feature buffers are not). As of the 2026-08
+instant warm-up fix that no longer costs an hour of downtime: startup issues
+ONE REST call to GET /fapi/v1/klines and seeds the candle buffer with the
+last KLINE_WARMUP_LIMIT closed 1m candles, so ATR/RSI/EMA/regime are valid
+within seconds of boot; the live websocket stream then continues the same
+series in real time (see warm_up_candles_from_klines in trading.py).
 
 SAFETY DEFAULTS (unchanged)
 ----------------------------------------------------------
@@ -164,6 +168,9 @@ from config import (
     SYNC_PENDING_GRACE_SEC,
     CANDLE_INTERVAL_SEC,
     CANDLE_HISTORY,
+    KLINE_WARMUP_ENABLED,
+    KLINE_WARMUP_LIMIT,
+    KLINE_WARMUP_INTERVAL,
     ATR_PERIOD,
     EMA_FAST,
     EMA_MED,
@@ -215,7 +222,11 @@ from config import (
     BRAIN_AUTO_PUSH_INTERVAL_SEC,
     LISTEN_KEY_KEEPALIVE_SEC,
     BALANCE_REFRESH_SEC,
+    BALANCE_WS_FRESH_SEC,
     POSITION_RISK_POLL_SEC,
+    POSITION_RISK_POLL_IDLE_SEC,
+    REST_POLL_JITTER_PCT,
+    jittered_interval,
     MAX_BACKOFF_SEC,
     IDLE_DATA_TIMEOUT_SEC,
     USER_WS_IDLE_FALLBACK_SEC,
@@ -412,6 +423,7 @@ from trading import (
     MartingaleManager,
     sanitize_recovered_dca_step,
     initialize_sync,
+    warm_up_candles_from_klines,
     reconcile_protective_stop_on_startup,
     BrainV2,
 )
@@ -600,6 +612,18 @@ async def balance_refresher(client: RestClient, manager: MartingaleManager) -> N
         if client.is_cooldown_active():
             await client.wait_out_cooldown_silently()
             continue
+        # 2026-08 HTTP 429 REST rate-limit fix - websocket-first state
+        # tracking. Binance pushes the USDT wallet balance on every
+        # ACCOUNT_UPDATE (see MartingaleManager.on_account_update), so while
+        # that stream copy is fresher than BALANCE_WS_FRESH_SEC there is
+        # nothing a GET /fapi/v2/balance could add - skip the request
+        # entirely rather than spend rate limit re-learning what the socket
+        # already told us. getattr-guarded so a manager without the field
+        # (older stubs/tests) simply keeps polling exactly as before.
+        last_ws_ts = getattr(manager, "last_account_update_ts", 0.0) or 0.0
+        if BALANCE_WS_FRESH_SEC > 0 and (time.time() - last_ws_ts) < BALANCE_WS_FRESH_SEC:
+            await asyncio.sleep(jittered_interval(BALANCE_REFRESH_SEC))
+            continue
         try:
             balances = await client.get_balance()
             usdt = next((b for b in balances if b["asset"] == "USDT"), None)
@@ -608,7 +632,7 @@ async def balance_refresher(client: RestClient, manager: MartingaleManager) -> N
                 manager.available_balance = min(real_balance, 50.0)
         except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
             print(color(f"[balance] refresh failed: {e}", RED))
-        await asyncio.sleep(BALANCE_REFRESH_SEC)
+        await asyncio.sleep(jittered_interval(BALANCE_REFRESH_SEC))
 
 
 async def funding_oi_poller(client: RestClient, manager: MartingaleManager) -> None:
@@ -631,16 +655,65 @@ async def funding_oi_poller(client: RestClient, manager: MartingaleManager) -> N
             manager.open_interest = float(oi.get("openInterest", 0) or 0)
         except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
             print(color(f"[funding] openInterest poll failed (continuing without it): {e}", YELLOW))
-        await asyncio.sleep(FUNDING_OI_POLL_SEC)
+        # 2026-08 HTTP 429 fix: jittered so this poller never lines up with
+        # the balance/positionRisk pollers on the same wall-clock tick.
+        await asyncio.sleep(jittered_interval(FUNDING_OI_POLL_SEC))
+
+
+def _position_risk_interval(manager: MartingaleManager) -> float:
+    """2026-08 HTTP 429 REST rate-limit fix. Chooses this cycle's positionRisk
+    poll interval from the rate-limit-safe 15-30s band:
+
+      - POSITION_RISK_POLL_SEC (active, default 20s) whenever something is
+        actually at risk - a live position, or anything mid-flight
+        (ENTERING / DCA_PENDING / CLOSING / a pending order) where the
+        liquidation price and the exchange-vs-local resync genuinely matter.
+      - POSITION_RISK_POLL_IDLE_SEC (idle, default 30s) while flat, where the
+        poll is only a safety net behind the user-data stream.
+
+    The user-data stream's own ACCOUNT_UPDATE view (see
+    MartingaleManager.has_ws_position_hint) is consulted FIRST and can only
+    ever escalate to the active cadence, never suppress it: if the websocket
+    says a position exists we poll actively even when local state still
+    believes it is flat. A stale/absent hint falls through to local state, so
+    this can never poll LESS often than the old behavior would have when
+    something is open.
+    """
+    ws_hint = None
+    hint_fn = getattr(manager, "has_ws_position_hint", None)
+    if callable(hint_fn):
+        ws_hint = hint_fn(POSITION_RISK_POLL_IDLE_SEC * 3)
+    if ws_hint:
+        return POSITION_RISK_POLL_SEC
+
+    position = getattr(manager, "position", None)
+    status = getattr(position, "status", "FLAT") if position is not None else "FLAT"
+    busy = (
+        status != "FLAT"
+        or (position is not None and getattr(position, "total_qty", 0.0))
+        or (position is not None and getattr(position, "pending_order_id", None) is not None)
+        or getattr(manager, "liquidation_price", None) is not None
+    )
+    return POSITION_RISK_POLL_SEC if busy else POSITION_RISK_POLL_IDLE_SEC
 
 
 async def position_risk_poller(client: RestClient, manager: MartingaleManager) -> None:
     """Polls Binance's OWN authoritative liquidation price, sanity-checks it
-    against mark price, and re-syncs local state on every cycle. Unchanged
-    from the previous build."""
+    against mark price, and re-syncs local state on every cycle.
+
+    2026-08 HTTP 429 REST rate-limit fix (cadence only - every risk check,
+    sanity band, emergency-close condition and the initialize_sync() call
+    below are byte-for-byte unchanged): this used to fire every 10s
+    unconditionally, forever, open or flat. Binance answered with
+    "-1003 Too many requests ... Please use the websocket for live updates to
+    avoid polling the API", which then suppressed ALL REST traffic on the
+    shared cooldown for ~30s at a time. The poll now runs on the adaptive
+    15-30s cadence chosen by _position_risk_interval() above, with jitter, and
+    the liquidation price stays the ONLY thing it is needed for - it is the
+    single risk field the user-data websocket never sends."""
     while True:
         if DRY_RUN:
-            await asyncio.sleep(POSITION_RISK_POLL_SEC)
+            await asyncio.sleep(jittered_interval(_position_risk_interval(manager)))
             continue
         # 2026-08 HTTP 418/429 cooldown-survival fix - same pattern as
         # balance_refresher() above. Deliberately does NOT call
@@ -698,7 +771,7 @@ async def position_risk_poller(client: RestClient, manager: MartingaleManager) -
             await initialize_sync(client, manager, context="periodic poll", rows=rows)
         except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
             print(color(f"[risk] position risk poll failed: {e}", RED))
-        await asyncio.sleep(POSITION_RISK_POLL_SEC)
+        await asyncio.sleep(jittered_interval(_position_risk_interval(manager)))
 
 
 async def brain_sync_loop(manager: MartingaleManager, interval_sec: int = BRAIN_AUTO_PUSH_INTERVAL_SEC) -> None:
@@ -791,6 +864,23 @@ async def main() -> None:
         f" Daily fee-net locks (UTC): profit=+${DAILY_PROFIT_TARGET_USDT:.2f}  "
         f"loss=-${MAX_DAILY_LOSS_USDT:.2f}  (new entries only)", GRAY,
     ))
+    # 2026-08 rate-limit + warm-up fixes: surface both cadences up front, so a
+    # Live log makes it obvious which REST budget and warm-up path is in play.
+    print(color(
+        f" REST polling: positionRisk {POSITION_RISK_POLL_SEC:.0f}s active / "
+        f"{POSITION_RISK_POLL_IDLE_SEC:.0f}s idle, balance {BALANCE_REFRESH_SEC:.0f}s "
+        f"(skipped while the user-stream copy is <{BALANCE_WS_FRESH_SEC:.0f}s old), "
+        f"+/-{REST_POLL_JITTER_PCT * 100:.0f}% jitter", GRAY,
+    ))
+    print(color(
+        f" Candle warm-up: "
+        + (
+            f"{KLINE_WARMUP_LIMIT} historical {KLINE_WARMUP_INTERVAL} klines via one REST call, "
+            f"then live websocket updates"
+            if KLINE_WARMUP_ENABLED else
+            "DISABLED - live stream only (~1h before indicators are valid)"
+        ), GRAY,
+    ))
     if DRY_RUN:
         print(color(" *** DRY RUN MODE - no real orders will be sent ***", YELLOW))
     if not USE_TESTNET:
@@ -851,6 +941,20 @@ async def main() -> None:
         else:
             manager.available_balance = 500.0
         print(color(f"[setup] available balance: {manager.available_balance:.2f} USDT", GRAY))
+
+        # 2026-08 instant warm-up fix: ONE REST call to GET /fapi/v1/klines
+        # seeds the candle buffer with the last KLINE_WARMUP_LIMIT closed 1m
+        # candles, so ATR / RSI / EMA / regime are valid within seconds of
+        # boot instead of after ~an hour of the live tick stream building 57
+        # candles by itself ("[entry-skip] startup warm-up: insufficient
+        # market history (candles=5/57)"). Runs BEFORE the first
+        # on_book_ticker() below and before the websocket consumers start, so
+        # the live stream simply continues the series from the seeded history
+        # - only fully-closed historical candles are seeded, the in-progress
+        # bucket is always owned by the live stream (see
+        # CandleAggregator.prime_from_klines). Best-effort: a failure here
+        # just restores the old stream-only warm-up, it never blocks startup.
+        await warm_up_candles_from_klines(client, manager)
 
         book = await retry_with_backoff(client.get_book_ticker, SYMBOL, label="get_book_ticker")
         bid, ask = float(book["bidPrice"]), float(book["askPrice"])

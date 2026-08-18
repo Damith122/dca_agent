@@ -298,6 +298,9 @@ from config import (
     SYNC_PENDING_GRACE_SEC,
     CANDLE_INTERVAL_SEC,
     CANDLE_HISTORY,
+    KLINE_WARMUP_ENABLED,
+    KLINE_WARMUP_LIMIT,
+    KLINE_WARMUP_INTERVAL,
     ATR_PERIOD,
     EMA_FAST,
     EMA_MED,
@@ -528,8 +531,11 @@ class CandleAggregator:
     """Builds fixed-interval OHLCV candles from the raw bookTicker mid-price
     tick stream (for O/H/L/C) plus the aggTrade stream (for buy/sell volume
     delta - bookTicker alone carries no trade volume). Keeps a rolling
-    history in memory; nothing here is persisted to disk (a short re-warmup
-    after a restart is an acceptable tradeoff - see header notes)."""
+    history in memory; nothing here is persisted to disk. As of the 2026-08
+    instant warm-up fix, a restart no longer has to rebuild that history one
+    streamed candle at a time: prime_from_klines() below seeds it from a
+    single REST klines call at startup, and the live streams take over from
+    there (see warm_up_candles_from_klines)."""
 
     def __init__(self, interval_sec: int = CANDLE_INTERVAL_SEC, max_history: int = CANDLE_HISTORY):
         self.interval_sec = interval_sec
@@ -563,6 +569,76 @@ class CandleAggregator:
             self._current.sell_volume += qty
         else:
             self._current.buy_volume += qty
+
+    def prime_from_klines(self, klines: List[list], now_ts: Optional[float] = None) -> int:
+        """2026-08 instant warm-up fix. Seeds the rolling history with
+        already-CLOSED historical candles fetched in one REST call
+        (GET /fapi/v1/klines - see RestClient.get_klines), so ATR / EMA /
+        regime are valid within seconds of boot instead of after ~an hour of
+        the live tick stream building 57 one-minute candles by itself.
+
+        Real-time precision is deliberately NOT traded away for this:
+
+          - Only candles whose bucket is strictly OLDER than the current
+            bucket are seeded. Binance's last kline row is the still-forming
+            candle; it is dropped, because the in-progress bucket belongs to
+            the live websocket stream alone (self._current, fed by on_price).
+          - Any bucket the live stream has already produced WINS over the
+            seeded one, so priming after ticks have started flowing can never
+            overwrite real observed data with a REST snapshot.
+          - self._current and self._bucket_start are never touched, so an
+            already-open live bucket keeps accumulating exactly as it was.
+
+        Buy/sell volume is reconstructed from the kline's own taker-buy base
+        volume (field [9]), matching on_trade()'s taker-side convention:
+        buy_volume = takerBuyBase, sell_volume = volume - takerBuyBase.
+
+        Malformed/short rows are skipped individually rather than aborting
+        the warm-up - a partial seed is still far better than none. Returns
+        the number of candles actually seeded.
+        """
+        if not klines:
+            return 0
+
+        now_ts = now_ts if now_ts is not None else time.time()
+        live_bucket = self._bucket_start if self._bucket_start is not None else self._bucket_for(now_ts)
+
+        seeded: Dict[float, Candle] = {}
+        for row in klines:
+            try:
+                if not isinstance(row, (list, tuple)) or len(row) < 6:
+                    continue
+                open_time = float(row[0]) / 1000.0
+                bucket = self._bucket_for(open_time)
+                if bucket >= live_bucket:
+                    continue  # in-progress bucket - owned by the live stream
+                volume = float(row[5] or 0)
+                taker_buy = float(row[9] or 0) if len(row) > 9 else volume / 2.0
+                buy_volume = max(0.0, min(taker_buy, volume))
+                seeded[bucket] = Candle(
+                    open_time=bucket,
+                    open=float(row[1]),
+                    high=float(row[2]),
+                    low=float(row[3]),
+                    close=float(row[4]),
+                    buy_volume=buy_volume,
+                    sell_volume=max(0.0, volume - buy_volume),
+                )
+            except (TypeError, ValueError, IndexError):
+                continue  # one malformed row must never abort the warm-up
+
+        if not seeded:
+            return 0
+
+        merged: Dict[float, Candle] = dict(seeded)
+        # Live-observed candles always win over a seeded historical one.
+        for candle in self.candles:
+            merged[candle.open_time] = candle
+
+        ordered = [merged[k] for k in sorted(merged)]
+        maxlen = self.candles.maxlen or len(ordered)
+        self.candles = deque(ordered[-maxlen:], maxlen=maxlen)
+        return sum(1 for c in self.candles if c.open_time in seeded)
 
     def closed_candles(self) -> List[Candle]:
         """All fully-closed candles, oldest first. Excludes the in-progress bucket."""
@@ -1946,6 +2022,22 @@ class MartingaleManager:
         self.prev_prev_price: Optional[float] = None
         self.available_balance: float = 0.0
         self.liquidation_price: Optional[float] = None
+        # 2026-08 HTTP 429 REST rate-limit fix - websocket-first state
+        # tracking. Binance's own 429 body asks callers to "use the
+        # websocket for live updates to avoid polling the API", and the
+        # user-data stream's ACCOUNT_UPDATE event already carries both the
+        # USDT wallet balance and this symbol's position amount. These three
+        # fields record what the stream last told us and when, so the REST
+        # pollers in dca2.py can (a) skip the balance refresh entirely while
+        # the websocket copy is fresh, and (b) drop the positionRisk poll to
+        # its slow idle cadence while the stream says nothing is open.
+        # Written ONLY by on_account_update() below; read-only everywhere
+        # else. Never used to open, size, close or DCA a position - the
+        # exchange-authoritative REST/reconcile paths remain the sole
+        # authority for every trading decision, exactly as before.
+        self.last_account_update_ts: float = 0.0
+        self.ws_position_amt: Optional[float] = None
+        self.ws_position_ts: float = 0.0
 
         self.price_history: List[float] = []   # kept for the fallback static momentum signal only
         self.trade_count = 0
@@ -3562,6 +3654,67 @@ class MartingaleManager:
         self.candles.on_price(price)
         self.feature_builder.update_vwap(price, (bid_qty + ask_qty) / 2.0)
     
+    def on_account_update(self, event: dict) -> None:
+        """2026-08 HTTP 429 REST rate-limit fix - websocket-first state
+        tracking. Handles the user-data stream's ACCOUNT_UPDATE event.
+
+        Binance pushes ACCOUNT_UPDATE on every balance/position change, which
+        makes it a strictly fresher (and free) source for the two things the
+        REST pollers were hammering the API for:
+
+          - the USDT wallet balance, which used to require a
+            GET /fapi/v2/balance every BALANCE_REFRESH_SEC;
+          - whether this symbol has an open position at all, which decides
+            whether the positionRisk poller needs its active cadence or can
+            sit at the slow idle one.
+
+        The balance assignment itself is byte-for-byte the behavior the
+        websocket handler already had (cross-wallet balance "cw", falling
+        back to wallet balance "wb"); everything else here only RECORDS what
+        the stream said plus a timestamp. Deliberately does NOT rebuild
+        manager.position, place/cancel anything, or feed any entry/exit/DCA
+        decision - initialize_sync() and the REST reconciliation paths stay
+        the sole authority on real position state, unchanged.
+
+        Never raises: a malformed event is ignored, because one bad frame
+        must not take down the user-data socket.
+        """
+        try:
+            payload = event.get("a", {}) or {}
+        except AttributeError:
+            return
+
+        now = time.time()
+        self.last_account_update_ts = now
+
+        for b in payload.get("B", []) or []:
+            try:
+                if b.get("a") == "USDT":
+                    self.available_balance = float(b.get("cw") or b.get("wb") or 0)
+            except (TypeError, ValueError, AttributeError):
+                continue
+
+        for pos in payload.get("P", []) or []:
+            try:
+                if pos.get("s") != self.symbol:
+                    continue
+                self.ws_position_amt = float(pos.get("pa") or 0)
+                self.ws_position_ts = now
+            except (TypeError, ValueError, AttributeError):
+                continue
+
+    def has_ws_position_hint(self, max_age_sec: float) -> Optional[bool]:
+        """True/False if the user-data stream told us within the last
+        `max_age_sec` whether this symbol has a non-zero position; None when
+        the stream has said nothing recent enough to rely on. Callers MUST
+        treat None as 'unknown' and fall back to their own state - this is a
+        polling-cadence hint only, never a trading signal."""
+        if self.ws_position_amt is None or not self.ws_position_ts:
+            return None
+        if time.time() - self.ws_position_ts > max_age_sec:
+            return None
+        return self.ws_position_amt != 0.0
+
     def on_agg_trade(self, qty: float, is_buyer_maker: bool) -> None:
         self.candles.on_trade(qty, is_buyer_maker)
         # 2026-08 high-frequency orderflow upgrade (this line only - the
@@ -8347,6 +8500,92 @@ class MartingaleManager:
             asyncio.create_task(self._persist_trade_sync_cursor(
                 self._last_live_trade_id, reason="live close"
             ))
+
+
+# ============================================================================
+# INSTANT WARM-UP (historical klines -> candle buffer -> live websocket)
+# ============================================================================
+
+
+async def warm_up_candles_from_klines(
+    client: RestClient,
+    manager: MartingaleManager,
+    limit: int = KLINE_WARMUP_LIMIT,
+    interval: str = KLINE_WARMUP_INTERVAL,
+) -> int:
+    """2026-08 instant warm-up fix - the startup-delay half of the live
+    incident this build addresses.
+
+    Before this, the candle series backing ATR / EMA / regime was built
+    exclusively from the live tick stream, so a fresh container logged
+    "[entry-skip] startup warm-up: insufficient market history
+    (candles=5/57)" for the better part of an hour before it could consider
+    a single entry. This runs ONE REST call
+    (GET /fapi/v1/klines, weight 1 at limit<=100) at initialization, seeds
+    the buffer with the last `limit` CLOSED candles, and then leaves the
+    series to the websocket stream for every subsequent real-time update -
+    instant indicators, unchanged live precision.
+
+    Called once from dca2.main(), before the websocket consumers start.
+    Best-effort by design: any failure (network, API error, an active REST
+    cooldown, a malformed payload) is logged and swallowed, leaving the bot
+    in exactly the old stream-only warm-up behavior rather than blocking
+    startup. Returns the number of candles seeded (0 if it did nothing).
+    """
+    if not KLINE_WARMUP_ENABLED:
+        print(color(
+            "[warmup] KLINE_WARMUP_ENABLED=false - skipping historical kline seed, "
+            "the candle buffer will warm up from the live stream only.", GRAY,
+        ))
+        return 0
+
+    is_cooldown_active = getattr(client, "is_cooldown_active", None)
+    if is_cooldown_active is not None and is_cooldown_active():
+        print(color(
+            "[warmup] REST cooldown active - skipping the historical kline seed "
+            "(the live stream still warms the buffer up as before).", YELLOW,
+        ))
+        return 0
+
+    needed = max(EMA_SLOW, ATR_PERIOD) + 2
+    try:
+        klines = await client.get_klines(manager.symbol, interval=interval, limit=limit)
+    except Exception as e:  # noqa: BLE001 - warm-up is best-effort; never block startup
+        print(color(
+            f"[warmup] historical kline fetch failed ({e}) - falling back to "
+            f"live-stream-only warm-up (~{needed} minutes before entries unlock).", YELLOW,
+        ))
+        return 0
+
+    seeded = manager.candles.prime_from_klines(klines)
+    if seeded <= 0:
+        print(color(
+            f"[warmup] historical kline fetch returned no usable candles "
+            f"(rows={len(klines) if klines else 0}) - falling back to "
+            f"live-stream-only warm-up.", YELLOW,
+        ))
+        return 0
+
+    # Evaluate the regime immediately off the freshly-seeded series so
+    # last_regime carries a real ATR reading (not the default atr_pct=0.0)
+    # from the very first tick - the entry warm-up gate checks BOTH the
+    # candle count and atr_pct > 0.
+    candles = manager.candles.all_candles_incl_live()
+    try:
+        manager.last_regime = manager.regime_engine.evaluate(candles)
+    except Exception as e:  # noqa: BLE001 - a regime hiccup must not block startup
+        print(color(f"[warmup] initial regime evaluation failed ({e}) - continuing.", YELLOW))
+
+    ready = len(candles) >= needed
+    print(color(
+        f"[warmup] seeded {seeded} historical {interval} candle(s) from a single REST call "
+        f"(buffer={len(candles)}/{needed} needed, regime={manager.last_regime.regime}, "
+        f"atr%={manager.last_regime.atr_pct * 100:.3f}) - "
+        f"{'indicators are warm, entries unlock as soon as Brain V2 is ready' if ready else 'still short of the indicator minimum, the live stream will finish the warm-up'}. "
+        f"Live websocket updates take over from here.",
+        GREEN if ready else YELLOW,
+    ))
+    return seeded
 
 
 # ============================================================================
