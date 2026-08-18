@@ -93,7 +93,25 @@ class FakeClient:
         self.placed_orders.append(kwargs)
         oid = self._next_id
         self._next_id += 1
-        return {"orderId": oid}
+        return {"orderId": oid, "algoId": oid}
+
+    # --- Algo (conditional) endpoints: the protective stop lives here now.
+    async def place_algo_order(self, **kwargs):
+        return await self.place_order(**kwargs)
+
+    async def cancel_algo_order(self, algo_id=None, client_algo_id=None):
+        return await self.cancel_order(None, algo_id if algo_id is not None else client_algo_id)
+
+    async def get_open_algo_orders(self, symbol=None):
+        return await self.get_open_orders(symbol)
+
+    async def get_algo_order(self, algo_id=None, client_algo_id=None):
+        for o in self._open_orders:
+            if (algo_id is not None and o.get("algoId") == algo_id) or (
+                client_algo_id is not None and o.get("clientAlgoId") == client_algo_id):
+                return o
+        return {"algoId": algo_id, "clientAlgoId": client_algo_id, "algoStatus": "NEW",
+                "actualOrderId": ""}
 
     async def cancel_order(self, symbol, order_id):
         self.cancel_calls.append(order_id)
@@ -178,29 +196,57 @@ def fill_event(order_id, ap=99.94, rp=-0.16, n=0.05, z=1.0, trade_id=991):
                   "ap": str(ap), "z": str(z), "t": trade_id, "T": int(time.time() * 1000)}}
 
 
+def algo_event(algo_id, status, client_algo_id=None, actual_order_id=""):
+    """ALGO_UPDATE envelope. 2026-08 Algo-Service migration: the algo order
+    itself never emits ORDER_TRADE_UPDATE - it reports its lifecycle here, and
+    only the triggered CHILD order (actualOrderId) fills."""
+    prefix = trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX
+    return {"e": "ALGO_UPDATE", "ao": {
+        "algoId": algo_id,
+        "clientAlgoId": client_algo_id if client_algo_id is not None else f"{prefix}-t-1",
+        "algoStatus": status,
+        "actualOrderId": actual_order_id,
+        "symbol": "SOLUSDT",
+    }}
+
+
+async def arm_and_trigger(m, client, child_order_id=8100):
+    """Places the protective algo stop and drives it to TRIGGERED, which is
+    what registers the child order for close bookkeeping."""
+    await m._place_or_replace_protective_stop(reason="entry filled")
+    algo_id = m.position.protective_stop_algo_id
+    cid = m.position.protective_stop_client_algo_id
+    await m.handle_algo_update(algo_event(algo_id, "TRIGGERED", cid, child_order_id))
+    return algo_id, child_order_id
+
+
 # ============================================================================
 # F2: protective-stop fill routing
 # ============================================================================
 async def test_f2_protective_stop_fill_is_registered_and_routed():
     m, client = await make_manager()
-    await m._place_or_replace_protective_stop(reason="entry filled")
-    oid = m.position.protective_stop_order_id
-    assert oid is not None
-    assert m._order_index.get(oid) == "protective_stop", (
-        "the protective stop MUST be registered for fill routing - this is the exact defect: "
-        f"_order_index.get({oid}) == {m._order_index.get(oid)!r}"
+    algo_id, child = await arm_and_trigger(m, client)
+    assert algo_id is not None
+    assert algo_id not in m._order_index, (
+        "an algoId must NEVER be put in _order_index - it is not an orderId and never "
+        "appears in ORDER_TRADE_UPDATE"
     )
+    assert m._order_index.get(child) == "protective_stop", (
+        "the TRIGGERED child order must be registered for fill routing: "
+        f"_order_index.get({child}) == {m._order_index.get(child)!r}"
+    )
+    assert m.position.protective_stop_actual_order_id == child
     client.report_flat = True  # the stop triggered: the exchange is now flat
     with Capture() as cap:
-        await m.handle_order_update(fill_event(oid))
+        await m.handle_order_update(fill_event(child))
     out = cap.text
     assert "untracked_order_id" not in out, out
     assert "role=protective_stop" in out, out
     assert m.position.status == "FLAT", f"position must be FLAT after the stop closed it, got {m.position.status}"
-    assert m.position.protective_stop_order_id is None
-    assert oid not in m._unmatched_fills, "must not be buffered as an unmatched fill"
-    print(f"protective stop orderId={oid} registered as role=protective_stop and routed to "
-          f"_on_close_filled(); position is FLAT")
+    assert m.position.protective_stop_algo_id is None
+    assert child not in m._unmatched_fills, "must not be buffered as an unmatched fill"
+    print(f"algoId={algo_id} triggered -> child order {child} registered as role=protective_stop "
+          f"and routed to _on_close_filled(); position is FLAT")
     print("PASS\n")
 
 
@@ -211,8 +257,7 @@ async def test_f2_fill_records_exit_reason_pnl_fees_and_trade_log():
         if os.path.exists(path):
             os.remove(path)
     m, client = await make_manager()
-    await m._place_or_replace_protective_stop(reason="entry filled")
-    oid = m.position.protective_stop_order_id
+    algo_id, oid = await arm_and_trigger(m, client)
     client.report_flat = True
     daily_before = m.daily_realized_pnl
     trades_before = m.trade_count
@@ -236,8 +281,7 @@ async def test_f2_fill_records_exit_reason_pnl_fees_and_trade_log():
 
 async def test_f2_duplicate_fill_events_are_idempotent():
     m, client = await make_manager()
-    await m._place_or_replace_protective_stop(reason="entry filled")
-    oid = m.position.protective_stop_order_id
+    algo_id, oid = await arm_and_trigger(m, client)
     client.report_flat = True
     with Capture():
         await m.handle_order_update(fill_event(oid))
@@ -259,32 +303,34 @@ async def test_f2_fill_arriving_before_registration_is_replayed():
     FILLED event can reach the websocket consumer before place_order()
     returns. _register_order_and_replay() must replay the buffered event."""
     m, client = await make_manager()
-    # Simulate the event arriving first, for the id the client will assign.
+    child = 8123
+    # The child MARKET order can fill in milliseconds - before ALGO_UPDATE
+    # tells us its actualOrderId. Simulate the fill arriving first.
     with Capture():
-        await m.handle_order_update(fill_event(7000))
-    assert 7000 in m._unmatched_fills, "event should be buffered while unregistered"
+        await m.handle_order_update(fill_event(child))
+    assert child in m._unmatched_fills, "event should be buffered while unregistered"
     client.report_flat = True
     with Capture() as cap:
-        await m._place_or_replace_protective_stop(reason="entry filled")
+        await arm_and_trigger(m, client, child_order_id=child)
     out = cap.text
     assert "replayed_unmatched_fill" in out, out
     assert m.position.status == "FLAT", "the replayed fill must close the position"
-    print("a FILLED event that arrived BEFORE registration was replayed and closed the position")
+    print("a child FILLED event that arrived BEFORE actualOrderId registration was replayed "
+          "and closed the position")
     print("PASS\n")
 
 
 async def test_f2_restart_recovery_uses_persisted_protective_order_id():
     """After a restart _order_index is empty. The persisted snapshot's
-    protective_stop_order_id must still route the fill."""
+    protective_stop_algo_id must still route the fill."""
     m, client = await make_manager()
-    await m._place_or_replace_protective_stop(reason="entry filled")
-    oid = m.position.protective_stop_order_id
+    algo_id, oid = await arm_and_trigger(m, client)
     await m.save_dca_state(reason="test")
     # Simulate a restart: same position state, but no in-memory order index.
     # clear_state=False so the snapshot just written above survives - that
     # snapshot is exactly what the restart-recovery path must match against.
     m2, client2 = await make_manager(client=FakeClient(), clear_state=False)
-    m2.position.protective_stop_order_id = None  # not yet restored into memory
+    m2.position.protective_stop_algo_id = None  # not yet restored into memory
     m2._order_index.clear()
     client2.report_flat = True
     with Capture() as cap:
@@ -293,7 +339,7 @@ async def test_f2_restart_recovery_uses_persisted_protective_order_id():
     assert "path=restart_recovery" in out, out
     assert "role=protective_stop" in out, out
     assert m2.position.status == "FLAT"
-    print(f"restart recovery matched the persisted protective_stop_order_id={oid} and closed cleanly")
+    print(f"restart recovery matched the persisted protective_stop_algo_id={oid} and closed cleanly")
     print("PASS\n")
 
 
@@ -315,7 +361,7 @@ async def test_f3_protection_pending_is_retried():
     out = cap.text
     assert "retrying placement" in out, out
     assert m.position.protection_pending is False, "a successful retry must clear PROTECTION_PENDING"
-    assert m.position.protective_stop_order_id is not None
+    assert m.position.protective_stop_algo_id is not None
     print("PROTECTION_PENDING was retried by the sweep and successfully armed")
     print("PASS\n")
 
@@ -410,30 +456,36 @@ async def test_f4_placed_stop_carries_bot_client_order_id():
     m, client = await make_manager()
     await m._place_or_replace_protective_stop(reason="entry filled")
     order = client.placed_orders[0]
-    cid = order.get("newClientOrderId")
-    assert cid, "protective stop must carry a newClientOrderId"
+    cid = order.get("clientAlgoId")
+    assert cid, "protective algo stop must carry a clientAlgoId"
+    assert order.get("algoType") == "CONDITIONAL"
+    assert order.get("type") == "STOP_MARKET"
+    assert order.get("triggerPrice"), "the Algo API uses triggerPrice"
+    assert "stopPrice" not in order and "newClientOrderId" not in order, (
+        "legacy plain-order field names must not be sent to the Algo endpoint"
+    )
     assert cid.startswith(trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX)
     assert len(cid) <= 36, f"clientOrderId must fit Binance's 36-char limit, got {len(cid)}"
-    assert m.position.protective_stop_client_order_id == cid
+    assert m.position.protective_stop_client_algo_id == cid
     print(f"placed protective stop carries bot-owned newClientOrderId={cid}")
     print("PASS\n")
 
 
 async def test_f4_manual_stop_is_never_adopted_or_cancelled():
-    manual = {"orderId": 4242, "type": "STOP_MARKET", "side": "SELL",
-              "closePosition": "true", "stopPrice": "80.00",
-              "clientOrderId": "my-own-manual-stop"}
+    manual = {"algoId": 4242, "orderType": "STOP_MARKET", "side": "SELL",
+              "closePosition": "true", "triggerPrice": "80.00",
+              "clientAlgoId": "my-own-manual-stop"}
     client = FakeClient(open_orders=[manual])
     m, client = await make_manager(client=client)
     with Capture() as cap:
         await trading.reconcile_protective_stop_on_startup(client, m)
     out = cap.text
     assert 4242 not in client.cancel_calls, "a manual stop must NEVER be cancelled"
-    assert m.position.protective_stop_order_id != 4242, "a manual stop must NEVER be adopted"
+    assert m.position.protective_stop_algo_id != 4242, "a manual stop must NEVER be adopted"
     assert "not owned by this bot" in out, out
     # It found no OWNED stop, so it must have placed its own fresh one.
     assert len(client.placed_orders) == 1
-    assert client.placed_orders[0]["newClientOrderId"].startswith(trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX)
+    assert client.placed_orders[0]["clientAlgoId"].startswith(trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX)
     print("manual STOP_MARKET (clientOrderId='my-own-manual-stop') left completely untouched; "
           "bot placed its own owned stop instead")
     print("PASS\n")
@@ -442,20 +494,20 @@ async def test_f4_manual_stop_is_never_adopted_or_cancelled():
 async def test_f4_mixed_bot_and_manual_orders():
     owned_cid = f"{trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX}-123-1"
     orders = [
-        {"orderId": 4242, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
-         "stopPrice": "80.00", "clientOrderId": "manual-user-stop"},
-        {"orderId": 5555, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
-         "stopPrice": "99.50", "clientOrderId": owned_cid},
+        {"algoId": 4242, "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+         "triggerPrice": "80.00", "clientAlgoId": "manual-user-stop"},
+        {"algoId": 5555, "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+         "triggerPrice": "99.50", "clientAlgoId": owned_cid},
     ]
     client = FakeClient(open_orders=orders)
     m, client = await make_manager(client=client)
     with Capture() as cap:
         await trading.reconcile_protective_stop_on_startup(client, m)
-    assert m.position.protective_stop_order_id == 5555, "must adopt only the bot-owned stop"
-    assert m.position.protective_stop_client_order_id == owned_cid
+    assert m.position.protective_stop_algo_id == 5555, "must adopt only the bot-owned stop"
+    assert m.position.protective_stop_client_algo_id == owned_cid
     assert 4242 not in client.cancel_calls, "the manual stop must remain untouched"
     assert client.cancel_calls == [], "nothing should have been cancelled"
-    assert m._order_index.get(5555) == "protective_stop", "adopted stop must be wired for fill routing"
+    assert 5555 not in m._order_index, "an algoId must never enter _order_index"
     print("with one manual and one bot-owned stop resting: adopted 5555 (bot-owned), left 4242 "
           "(manual) untouched, and wired 5555 for fill routing")
     print("PASS\n")
@@ -464,18 +516,18 @@ async def test_f4_mixed_bot_and_manual_orders():
 async def test_f4_dedupe_only_cancels_bot_owned_duplicates():
     prefix = trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX
     orders = [
-        {"orderId": 601, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
-         "stopPrice": "99.40", "clientOrderId": f"{prefix}-1-1"},
-        {"orderId": 602, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
-         "stopPrice": "99.30", "clientOrderId": f"{prefix}-2-1"},
-        {"orderId": 4242, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
-         "stopPrice": "80.00", "clientOrderId": "manual-user-stop"},
+        {"algoId": 601, "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+         "triggerPrice": "99.40", "clientAlgoId": f"{prefix}-1-1"},
+        {"algoId": 602, "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+         "triggerPrice": "99.30", "clientAlgoId": f"{prefix}-2-1"},
+        {"algoId": 4242, "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+         "triggerPrice": "80.00", "clientAlgoId": "manual-user-stop"},
     ]
     client = FakeClient(open_orders=orders)
     m, client = await make_manager(client=client)
     with Capture():
         await trading.reconcile_protective_stop_on_startup(client, m)
-    kept = m.position.protective_stop_order_id
+    kept = m.position.protective_stop_algo_id
     assert kept in (601, 602)
     other = 602 if kept == 601 else 601
     assert client.cancel_calls == [other], f"only the duplicate BOT-OWNED stop may be cancelled, got {client.cancel_calls}"
@@ -491,12 +543,12 @@ async def test_f4_dedupe_only_cancels_bot_owned_duplicates():
 async def test_f5_successful_cancel_clears_tracking():
     m, client = await make_manager()
     await m._place_or_replace_protective_stop(reason="entry filled")
-    oid = m.position.protective_stop_order_id
+    oid = m.position.protective_stop_algo_id
     with Capture():
         confirmed = await m._cancel_protective_stop(reason="test")
     assert confirmed is True
     assert client.cancel_calls == [oid]
-    assert m.position.protective_stop_order_id is None
+    assert m.position.protective_stop_algo_id is None
     assert m.position.protective_stop_cancel_pending is False
     print(f"successful cancel of orderId={oid} confirmed and cleared")
     print("PASS\n")
@@ -505,12 +557,12 @@ async def test_f5_successful_cancel_clears_tracking():
 async def test_f5_unknown_order_is_proven_gone_and_cleared():
     m, client = await make_manager()
     await m._place_or_replace_protective_stop(reason="entry filled")
-    oid = m.position.protective_stop_order_id
+    oid = m.position.protective_stop_algo_id
     client._fail_cancel = "unknown_order"  # Binance -2011
     with Capture() as cap:
         confirmed = await m._cancel_protective_stop(reason="test")
     assert confirmed is True, "-2011 proves the order is gone"
-    assert m.position.protective_stop_order_id is None
+    assert m.position.protective_stop_algo_id is None
     assert "already gone" in cap.text
     print("Binance -2011 (Unknown order sent) treated as PROOF the order is gone - tracking cleared")
     print("PASS\n")
@@ -520,12 +572,12 @@ async def test_f5_failed_cancel_retains_tracked_id():
     for mode, label in (("api", "API rejection"), ("network", "timeout")):
         m, client = await make_manager()
         await m._place_or_replace_protective_stop(reason="entry filled")
-        oid = m.position.protective_stop_order_id
+        oid = m.position.protective_stop_algo_id
         client._fail_cancel = mode
         with Capture() as cap:
             confirmed = await m._cancel_protective_stop(reason="test")
         assert confirmed is False, f"{label} must NOT be treated as confirmed cancellation"
-        assert m.position.protective_stop_order_id == oid, (
+        assert m.position.protective_stop_algo_id == oid, (
             f"{label}: the tracked id must be RETAINED - the order may still be resting"
         )
         assert m.position.protective_stop_cancel_pending is True
@@ -537,12 +589,12 @@ async def test_f5_failed_cancel_retains_tracked_id():
 async def test_f5_cancel_during_cooldown_defers_and_retains():
     m, client = await make_manager()
     await m._place_or_replace_protective_stop(reason="entry filled")
-    oid = m.position.protective_stop_order_id
+    oid = m.position.protective_stop_algo_id
     client.cooldown = True
     with Capture() as cap:
         confirmed = await m._cancel_protective_stop(reason="test")
     assert confirmed is False
-    assert m.position.protective_stop_order_id == oid, "tracked id retained through cooldown"
+    assert m.position.protective_stop_algo_id == oid, "tracked id retained through cooldown"
     assert client.cancel_calls == [], "no REST cancel may be attempted during cooldown"
     assert m.position.protective_stop_cancel_pending is True
     print("cancel during REST cooldown deferred without a REST call; tracked id retained")
@@ -552,7 +604,7 @@ async def test_f5_cancel_during_cooldown_defers_and_retains():
 async def test_f5_sweep_retries_failed_cancel_until_confirmed():
     m, client = await make_manager()
     await m._place_or_replace_protective_stop(reason="entry filled")
-    oid = m.position.protective_stop_order_id
+    oid = m.position.protective_stop_algo_id
     client._fail_cancel = "network"
     with Capture():
         await m._cancel_protective_stop(reason="test")
@@ -562,7 +614,7 @@ async def test_f5_sweep_retries_failed_cancel_until_confirmed():
     m.position.protection_last_retry_ts = 0.0
     with Capture():
         await m._protective_stop_sweep()
-    assert m.position.protective_stop_order_id is None, "sweep must resolve the pending cancel"
+    assert m.position.protective_stop_algo_id is None, "sweep must resolve the pending cancel"
     assert m.position.protective_stop_cancel_pending is False
     print(f"sweep retried the failed cancel for orderId={oid} and confirmed it gone")
     print("PASS\n")
@@ -571,7 +623,7 @@ async def test_f5_sweep_retries_failed_cancel_until_confirmed():
 async def test_f5_no_duplicate_stop_placed_over_unconfirmed_cancel():
     m, client = await make_manager()
     await m._place_or_replace_protective_stop(reason="entry filled")
-    first_id = m.position.protective_stop_order_id
+    first_id = m.position.protective_stop_algo_id
     placed_before = len(client.placed_orders)
     client._fail_cancel = "network"
     m.position.total_qty = 2.0  # a DCA would normally trigger a replace
@@ -580,7 +632,7 @@ async def test_f5_no_duplicate_stop_placed_over_unconfirmed_cancel():
     assert len(client.placed_orders) == placed_before, (
         "must NOT place a second protective stop while the first cannot be confirmed cancelled"
     )
-    assert m.position.protective_stop_order_id == first_id
+    assert m.position.protective_stop_algo_id == first_id
     assert m.position.protection_pending is True
     print("replace refused to stack a second stop on an unconfirmed-cancel order (no duplicates); "
           "position marked PROTECTION_PENDING so the sweep resolves it")
@@ -590,7 +642,7 @@ async def test_f5_no_duplicate_stop_placed_over_unconfirmed_cancel():
 async def test_f5_orphan_survives_position_going_flat():
     m, client = await make_manager()
     await m._place_or_replace_protective_stop(reason="entry filled")
-    oid = m.position.protective_stop_order_id
+    oid = m.position.protective_stop_algo_id
     client._fail_cancel = "network"
     client.report_flat = True
     with Capture() as cap:
@@ -598,7 +650,7 @@ async def test_f5_orphan_survives_position_going_flat():
         await m._on_close_filled(99.9, -0.16, order_id=12345)
     out = cap.text
     assert m.position.status == "FLAT"
-    assert oid in m._orphan_protective_stop_ids, (
+    assert oid in m._orphan_protective_algo_ids, (
         "an unconfirmed cancel at close time must be handed to the orphan sweep, not lost"
     )
     assert "orphan sweep" in out
@@ -607,7 +659,7 @@ async def test_f5_orphan_survives_position_going_flat():
     m._last_orphan_sweep_ts = 0.0
     with Capture() as cap2:
         await m._sweep_orphan_protective_stops()
-    assert oid not in m._orphan_protective_stop_ids
+    assert oid not in m._orphan_protective_algo_ids
     assert oid in client.cancel_calls
     print(f"orphaned orderId={oid} survived the position going FLAT and was cancelled by the "
           f"manager-level orphan sweep")
@@ -616,13 +668,13 @@ async def test_f5_orphan_survives_position_going_flat():
 
 async def test_f5_orphan_sweep_skips_cooldown():
     m, client = await make_manager()
-    m._orphan_protective_stop_ids.add(9999)
+    m._orphan_protective_algo_ids.add(9999)
     client.cooldown = True
     m._last_orphan_sweep_ts = 0.0
     with Capture():
         await m._sweep_orphan_protective_stops()
     assert client.cancel_calls == [], "orphan sweep must not touch REST during cooldown"
-    assert 9999 in m._orphan_protective_stop_ids, "the orphan must be retained for later"
+    assert 9999 in m._orphan_protective_algo_ids, "the orphan must be retained for later"
     print("orphan sweep suppressed during REST cooldown, orphan retained")
     print("PASS\n")
 
@@ -738,10 +790,10 @@ async def _flat_manager(client):
 async def test_f7_flat_startup_cancels_leftover_bot_owned_stops():
     prefix = trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX
     orders = [
-        {"orderId": 811, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
-         "stopPrice": "99.40", "clientOrderId": f"{prefix}-1-1"},
-        {"orderId": 812, "type": "STOP_MARKET", "side": "BUY", "closePosition": "true",
-         "stopPrice": "101.20", "clientOrderId": f"{prefix}-2-1"},
+        {"algoId": 811, "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+         "triggerPrice": "99.40", "clientAlgoId": f"{prefix}-1-1"},
+        {"algoId": 812, "orderType": "STOP_MARKET", "side": "BUY", "closePosition": "true",
+         "triggerPrice": "101.20", "clientAlgoId": f"{prefix}-2-1"},
     ]
     client = FakeClient(open_orders=orders)
     m, client = await _flat_manager(client)
@@ -762,14 +814,14 @@ async def test_f7_flat_startup_cancels_leftover_bot_owned_stops():
 async def test_f7_flat_startup_never_touches_foreign_orders():
     prefix = trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX
     orders = [
-        {"orderId": 900, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
-         "stopPrice": "50.00", "clientOrderId": "manual-user-stop"},
-        {"orderId": 901, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
-         "stopPrice": "51.00", "clientOrderId": None},
-        {"orderId": 902, "type": "LIMIT", "side": "SELL", "closePosition": "false",
-         "clientOrderId": f"{prefix}-x-1"},  # bot-owned but NOT a protective stop
-        {"orderId": 903, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
-         "stopPrice": "52.00", "clientOrderId": f"{prefix}-keep-1"},
+        {"algoId": 900, "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+         "triggerPrice": "50.00", "clientAlgoId": "manual-user-stop"},
+        {"algoId": 901, "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+         "triggerPrice": "51.00", "clientAlgoId": None},
+        {"algoId": 902, "orderType": "LIMIT", "side": "SELL", "closePosition": "false",
+         "clientAlgoId": f"{prefix}-x-1"},  # bot-owned but NOT a protective stop
+        {"algoId": 903, "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+         "triggerPrice": "52.00", "clientAlgoId": f"{prefix}-keep-1"},
     ]
     client = FakeClient(open_orders=orders)
     m, client = await _flat_manager(client)
@@ -785,14 +837,14 @@ async def test_f7_flat_startup_never_touches_foreign_orders():
 
 async def test_f7_flat_startup_retains_failed_cancel_for_retry():
     prefix = trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX
-    orders = [{"orderId": 850, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
-               "stopPrice": "99.40", "clientOrderId": f"{prefix}-1-1"}]
+    orders = [{"algoId": 850, "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+               "triggerPrice": "99.40", "clientAlgoId": f"{prefix}-1-1"}]
     client = FakeClient(open_orders=orders, fail_cancel="network")
     m, client = await _flat_manager(client)
     with Capture() as cap:
         await trading.reconcile_protective_stop_on_startup(client, m)
     assert "handed to the orphan sweep" in cap.text, cap.text
-    assert 850 in m._orphan_protective_stop_ids, (
+    assert 850 in m._orphan_protective_algo_ids, (
         "a failed leftover cancel must be retained for retry, not silently passed"
     )
     # And the sweep resolves it once cancellation works again.
@@ -800,7 +852,7 @@ async def test_f7_flat_startup_retains_failed_cancel_for_retry():
     m._last_orphan_sweep_ts = 0.0
     with Capture():
         await m._sweep_orphan_protective_stops()
-    assert 850 not in m._orphan_protective_stop_ids
+    assert 850 not in m._orphan_protective_algo_ids
     print("failed leftover cancel retained in the orphan registry and resolved by the sweep "
           "(no silent pass)")
     print("PASS\n")
@@ -808,14 +860,14 @@ async def test_f7_flat_startup_retains_failed_cancel_for_retry():
 
 async def test_f7_flat_startup_already_gone_is_not_retried():
     prefix = trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX
-    orders = [{"orderId": 860, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
-               "stopPrice": "99.40", "clientOrderId": f"{prefix}-1-1"}]
+    orders = [{"algoId": 860, "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+               "triggerPrice": "99.40", "clientAlgoId": f"{prefix}-1-1"}]
     client = FakeClient(open_orders=orders, fail_cancel="unknown_order")  # -2011
     m, client = await _flat_manager(client)
     with Capture() as cap:
         await trading.reconcile_protective_stop_on_startup(client, m)
     assert "already gone" in cap.text
-    assert 860 not in m._orphan_protective_stop_ids, "-2011 proves it is gone; no retry needed"
+    assert 860 not in m._orphan_protective_algo_ids, "-2011 proves it is gone; no retry needed"
     print("-2011 on a leftover cancel is treated as proof it is gone - not queued for retry")
     print("PASS\n")
 
@@ -824,15 +876,15 @@ async def test_f7_strict_prefix_matching():
     prefix = trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX
     m, _ = await make_manager()
     # Bare-prefix lookalikes belonging to someone else must NOT match.
-    assert m._is_own_protective_stop({"clientOrderId": f"{prefix}-1-1"}) is True
-    assert m._is_own_protective_stop({"clientOrderId": f"{prefix}XYZ-1"}) is False
-    assert m._is_own_protective_stop({"clientOrderId": f"{prefix}hedge-1"}) is False
-    assert m._is_own_protective_stop({"clientOrderId": prefix}) is False
-    assert m._is_own_protective_stop({"clientOrderId": None}) is False
+    assert m._is_own_protective_stop({"clientAlgoId": f"{prefix}-1-1"}) is True
+    assert m._is_own_protective_stop({"clientAlgoId": f"{prefix}XYZ-1"}) is False
+    assert m._is_own_protective_stop({"clientAlgoId": f"{prefix}hedge-1"}) is False
+    assert m._is_own_protective_stop({"clientAlgoId": prefix}) is False
+    assert m._is_own_protective_stop({"clientAlgoId": None}) is False
     assert m._is_own_protective_stop({}) is False
     # And a real generated id always matches its own predicate.
-    generated = m._new_protective_stop_client_order_id()
-    assert m._is_own_protective_stop({"clientOrderId": generated}) is True
+    generated = m._new_protective_stop_client_algo_id()
+    assert m._is_own_protective_stop({"clientAlgoId": generated}) is True
     print(f"strict '{prefix}-' matching: '{prefix}XYZ-1'/'{prefix}hedge-1'/'{prefix}' rejected, "
           f"generated id '{generated}' accepted")
     print("PASS\n")
@@ -855,7 +907,7 @@ async def test_f7_failed_reconciliation_blocks_blind_placement():
         "placement must stay blocked until reconciliation succeeds - otherwise a stop this "
         "process could not see would be duplicated"
     )
-    assert m.position.protective_stop_order_id is None
+    assert m.position.protective_stop_algo_id is None
     print("open-orders enumeration failure blocks ALL protective-stop placement (no blind stacking)")
     print("PASS\n")
 
@@ -929,7 +981,7 @@ async def test_f8_entry_gate_blocks_while_stale_unresolved():
         ("stale_possible", FakeClient(fail_open_orders=True),
          lambda mm: setattr(mm, "_stale_protective_stops_possible", True)),
         ("orphans_remaining", FakeClient(fail_cancel="network"),
-         lambda mm: mm._orphan_protective_stop_ids.add(777)),
+         lambda mm: mm._orphan_protective_algo_ids.add(777)),
     )
     for label, client, setup in cases:
         m, client = await _flat_manager(client)
@@ -949,8 +1001,8 @@ async def test_f8_flat_sweep_retries_reconciliation_and_cancels_leftover():
     """The whole point: while FLAT, the sweep must keep retrying until the
     leftover is found and cancelled - so the entry gate can re-open."""
     prefix = trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX
-    leftover = {"orderId": 870, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
-                "stopPrice": "88.00", "clientOrderId": f"{prefix}-old-1"}
+    leftover = {"algoId": 870, "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+                "triggerPrice": "88.00", "clientAlgoId": f"{prefix}-old-1"}
     client = FakeClient(open_orders=[leftover], fail_open_orders=True)
     m, client = await _flat_manager(client)
     with Capture():
@@ -978,21 +1030,21 @@ async def test_f8_flat_sweep_retries_reconciliation_and_cancels_leftover():
 
 async def test_f8_flat_sweep_keeps_blocking_while_cancel_keeps_failing():
     prefix = trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX
-    leftover = {"orderId": 871, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
-                "stopPrice": "88.00", "clientOrderId": f"{prefix}-old-1"}
+    leftover = {"algoId": 871, "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+                "triggerPrice": "88.00", "clientAlgoId": f"{prefix}-old-1"}
     client = FakeClient(open_orders=[leftover], fail_cancel="network")
     m, client = await _flat_manager(client)
     with Capture():
         await trading.reconcile_protective_stop_on_startup(client, m)
     assert m._stale_protective_stops_possible is True, "an unconfirmed cancel keeps the gate shut"
-    assert 871 in m._orphan_protective_stop_ids
+    assert 871 in m._orphan_protective_algo_ids
     # Repeated sweeps while the cancel keeps failing must NOT unblock.
     for _ in range(3):
         m._last_orphan_sweep_ts = 0.0
         with Capture():
             await m._sweep_orphan_protective_stops()
         assert m._stale_protective_stops_possible is True
-        assert 871 in m._orphan_protective_stop_ids
+        assert 871 in m._orphan_protective_algo_ids
     print("entry gate stays shut across repeated sweeps while the leftover cancel keeps failing")
     print("PASS\n")
 
@@ -1002,9 +1054,9 @@ async def test_f8_never_adopts_stale_stop_for_a_new_position():
     stays -> a position opens -> reconciliation must CANCEL the leftover,
     never adopt it as this position's protection."""
     prefix = trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX
-    stale = {"orderId": 880, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
-             "stopPrice": "50.00",  # priced for a totally different trade
-             "clientOrderId": f"{prefix}-previous-1"}
+    stale = {"algoId": 880, "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+             "triggerPrice": "50.00",  # priced for a totally different trade
+             "clientAlgoId": f"{prefix}-previous-1"}
     client = FakeClient(open_orders=[stale], fail_open_orders=True)
     m, client = await _flat_manager(client)
     with Capture():
@@ -1027,13 +1079,13 @@ async def test_f8_never_adopts_stale_stop_for_a_new_position():
         await trading.reconcile_protective_stop_on_startup(client, m)
     out = cap.text
     assert "refusing to ADOPT" in out, out
-    assert m.position.protective_stop_order_id != 880, (
+    assert m.position.protective_stop_algo_id != 880, (
         "the stale stop (priced 50.00 for a previous trade) must NEVER be adopted"
     )
     assert 880 in client.cancel_calls, "the stale stop must be cancelled"
     # A fresh, correctly-priced stop was placed for THIS position instead.
     assert len(client.placed_orders) == 1
-    fresh_stop = float(client.placed_orders[0]["stopPrice"])
+    fresh_stop = float(client.placed_orders[0]["triggerPrice"])
     assert 99.0 < fresh_stop < 100.0, (
         f"the replacement stop must be priced for THIS position (~99.94), got {fresh_stop}"
     )
@@ -1049,17 +1101,17 @@ async def test_f8_tracked_own_stop_is_still_kept_when_flag_set():
     prefix = trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX
     m, client = await make_manager()
     await m._place_or_replace_protective_stop(reason="entry filled")
-    own_id = m.position.protective_stop_order_id
-    own_cid = m.position.protective_stop_client_order_id
-    stale = {"orderId": 881, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
-             "stopPrice": "50.00", "clientOrderId": f"{prefix}-previous-1"}
-    own = {"orderId": own_id, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
-           "stopPrice": f"{m.position.protective_stop_price}", "clientOrderId": own_cid}
+    own_id = m.position.protective_stop_algo_id
+    own_cid = m.position.protective_stop_client_algo_id
+    stale = {"algoId": 881, "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+             "triggerPrice": "50.00", "clientAlgoId": f"{prefix}-previous-1"}
+    own = {"algoId": own_id, "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+           "triggerPrice": f"{m.position.protective_stop_price}", "clientAlgoId": own_cid}
     client._open_orders = [stale, own]
     m._stale_protective_stops_possible = True
     with Capture():
         await trading.reconcile_protective_stop_on_startup(client, m)
-    assert m.position.protective_stop_order_id == own_id, (
+    assert m.position.protective_stop_algo_id == own_id, (
         "the position's own tracked stop must be kept, not cancelled"
     )
     assert own_id not in client.cancel_calls, "must not cancel our own live protection"
@@ -1073,7 +1125,7 @@ async def test_f8_open_position_management_never_blocked_by_entry_gate():
     managed (risk-reducing exits unaffected) while stale cleanup is pending."""
     m, client = await make_manager(avg_entry=100.0, qty=1.0)
     m._stale_protective_stops_possible = True
-    m._orphan_protective_stop_ids.add(999)
+    m._orphan_protective_algo_ids.add(999)
     m._position_fees_accum = 0.05
     m._position_fees_reliable = True
     with Capture() as cap:

@@ -76,7 +76,25 @@ class FakeClient:
         self.placed_orders.append(kwargs)
         oid = self._next_id
         self._next_id += 1
-        return {"orderId": oid}
+        return {"orderId": oid, "algoId": oid}
+
+    # --- Algo (conditional) endpoints: the protective stop lives here now.
+    async def place_algo_order(self, **kwargs):
+        return await self.place_order(**kwargs)
+
+    async def cancel_algo_order(self, algo_id=None, client_algo_id=None):
+        return await self.cancel_order(None, algo_id if algo_id is not None else client_algo_id)
+
+    async def get_open_algo_orders(self, symbol=None):
+        return await self.get_open_orders(symbol)
+
+    async def get_algo_order(self, algo_id=None, client_algo_id=None):
+        for o in self._open_orders:
+            if (algo_id is not None and o.get("algoId") == algo_id) or (
+                client_algo_id is not None and o.get("clientAlgoId") == client_algo_id):
+                return o
+        return {"algoId": algo_id, "clientAlgoId": client_algo_id, "algoStatus": "NEW",
+                "actualOrderId": ""}
 
     async def cancel_order(self, symbol, order_id):
         self.cancelled_order_ids.append(order_id)
@@ -198,13 +216,16 @@ async def test_place_protective_stop_long():
     order = client.placed_orders[0]
     assert order["side"] == "SELL", "closing a LONG must SELL"
     assert order["type"] == "STOP_MARKET"
+    assert order["algoType"] == "CONDITIONAL"
     assert order["closePosition"] == "true", "must close the ENTIRE position, never a fixed reduceOnly qty"
     assert "quantity" not in order, "closePosition=true orders must not also specify a quantity"
-    assert m.position.protective_stop_order_id is not None
+    assert "reduceOnly" not in order, "closePosition=true must not be combined with reduceOnly"
+    assert "stopPrice" not in order, "the Algo API uses triggerPrice, not stopPrice"
+    assert m.position.protective_stop_algo_id is not None
     assert m.position.protective_stop_price is not None
     assert m.position.protection_pending is False
     print(f"LONG protective stop placed: {order['side']} {order['type']} closePosition=true "
-          f"stopPrice={order['stopPrice']} workingType={order['workingType']}")
+          f"triggerPrice={order['triggerPrice']} workingType={order['workingType']}")
     print("PASS\n")
 
 
@@ -216,14 +237,14 @@ async def test_place_protective_stop_short():
     assert order["side"] == "BUY", "closing a SHORT must BUY"
     assert order["closePosition"] == "true"
     print(f"SHORT protective stop placed: {order['side']} {order['type']} closePosition=true "
-          f"stopPrice={order['stopPrice']}")
+          f"triggerPrice={order['triggerPrice']}")
     print("PASS\n")
 
 
 async def test_replace_cancels_old_before_placing_new():
     m, client = await make_manager(side="LONG", avg_entry=100.0, qty=1.0)
     await m._place_or_replace_protective_stop(reason="initial entry filled")
-    first_id = m.position.protective_stop_order_id
+    first_id = m.position.protective_stop_algo_id
     assert first_id is not None
     # Simulate a DCA that shifts the position's economics (bigger qty ->
     # different stop price) and trigger a replace.
@@ -232,7 +253,7 @@ async def test_replace_cancels_old_before_placing_new():
     await m._place_or_replace_protective_stop(reason="DCA #1 filled")
     assert client.cancelled_order_ids == [first_id], "must cancel exactly the previously-tracked order before placing the new one"
     assert len(client.placed_orders) == 2
-    second_id = m.position.protective_stop_order_id
+    second_id = m.position.protective_stop_algo_id
     assert second_id is not None and second_id != first_id
     print(f"replace: cancelled stale orderId={first_id} before placing new orderId={second_id} "
           f"(cancel-then-replace sequence)")
@@ -246,7 +267,7 @@ async def test_disabled_by_flag_places_nothing():
         m, client = await make_manager(side="LONG", avg_entry=100.0, qty=1.0)
         await m._place_or_replace_protective_stop(reason="initial entry filled")
         assert len(client.placed_orders) == 0
-        assert m.position.protective_stop_order_id is None
+        assert m.position.protective_stop_algo_id is None
     finally:
         trading.PROTECTIVE_STOP_ENABLED = original
     print("PROTECTIVE_STOP_ENABLED=false places nothing (feature fully disabled)")
@@ -262,7 +283,7 @@ async def test_placement_failure_enters_protection_pending():
     assert "*** HIGH SEVERITY ***" in out, out
     assert m.position.protection_pending is True
     assert m.position.protection_pending_reason is not None
-    assert m.position.protective_stop_order_id is None
+    assert m.position.protective_stop_algo_id is None
     print("a failed placement enters PROTECTION_PENDING with a high-severity log instead of "
           "crashing or continuing silently unprotected")
     print("PASS\n")
@@ -311,11 +332,11 @@ async def test_protection_pending_blocks_new_dca_not_other_exits():
 async def test_cancel_clears_local_state():
     m, client = await make_manager(side="LONG", avg_entry=100.0, qty=1.0)
     await m._place_or_replace_protective_stop(reason="initial entry filled")
-    order_id = m.position.protective_stop_order_id
+    order_id = m.position.protective_stop_algo_id
     assert order_id is not None
     await m._cancel_protective_stop(reason="position closed")
     assert client.cancelled_order_ids == [order_id]
-    assert m.position.protective_stop_order_id is None
+    assert m.position.protective_stop_algo_id is None
     assert m.position.protective_stop_price is None
     print(f"cancel clears local tracking fields regardless of REST outcome (orderId={order_id})")
     print("PASS\n")
@@ -323,7 +344,7 @@ async def test_cancel_clears_local_state():
 
 async def test_cancel_noop_when_nothing_tracked():
     m, client = await make_manager(side="LONG", avg_entry=100.0, qty=1.0)
-    assert m.position.protective_stop_order_id is None
+    assert m.position.protective_stop_algo_id is None
     await m._cancel_protective_stop(reason="nothing to cancel")
     assert client.cancelled_order_ids == [], "must not call cancel_order when nothing is tracked"
     print("cancel is a no-op (no REST call) when no protective stop is currently tracked")
@@ -335,16 +356,16 @@ async def test_cancel_noop_when_nothing_tracked():
 # ============================================================================
 async def test_reconcile_adopts_single_matching_order():
     open_orders = [
-        {"orderId": 555, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
-         "stopPrice": "94.50", "clientOrderId": f"{trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX}-a-1"},
+        {"algoId": 555, "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+         "triggerPrice": "94.50", "clientAlgoId": f"{trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX}-a-1"},
     ]
     client = FakeClient(open_orders=open_orders)
     m, client = await make_manager(side="LONG", avg_entry=100.0, qty=1.0, client=client)
     with Capture() as cap:
         await trading.reconcile_protective_stop_on_startup(client, m)
     out = cap.text
-    assert "adopted existing orderId=555" in out, out
-    assert m.position.protective_stop_order_id == 555
+    assert "adopted existing algoId=555" in out, out
+    assert m.position.protective_stop_algo_id == 555
     assert m.position.protective_stop_price == 94.50
     assert m.position.protection_pending is False
     assert len(client.placed_orders) == 0, "must not place a redundant new stop when one already exists"
@@ -354,10 +375,10 @@ async def test_reconcile_adopts_single_matching_order():
 
 async def test_reconcile_dedupes_multiple_matching_orders():
     open_orders = [
-        {"orderId": 601, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
-         "stopPrice": "94.00", "clientOrderId": f"{trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX}-b-1"},
-        {"orderId": 602, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
-         "stopPrice": "94.10", "clientOrderId": f"{trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX}-b-2"},
+        {"algoId": 601, "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+         "triggerPrice": "94.00", "clientAlgoId": f"{trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX}-b-1"},
+        {"algoId": 602, "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+         "triggerPrice": "94.10", "clientAlgoId": f"{trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX}-b-2"},
     ]
     client = FakeClient(open_orders=open_orders)
     m, client = await make_manager(side="LONG", avg_entry=100.0, qty=1.0, client=client)
@@ -365,8 +386,8 @@ async def test_reconcile_dedupes_multiple_matching_orders():
         await trading.reconcile_protective_stop_on_startup(client, m)
     out = cap.text
     assert "found 2 resting protective stop" in out, out
-    assert m.position.protective_stop_order_id in (601, 602)
-    kept = m.position.protective_stop_order_id
+    assert m.position.protective_stop_algo_id in (601, 602)
+    kept = m.position.protective_stop_algo_id
     other = 602 if kept == 601 else 601
     assert client.cancelled_order_ids == [other], "must cancel every extra so at most one remains"
     print(f"startup reconciliation adopted orderId={kept} and cancelled the duplicate orderId={other}")
@@ -381,7 +402,7 @@ async def test_reconcile_places_fresh_when_none_found():
     out = cap.text
     assert "UNPROTECTED" in out, out
     assert len(client.placed_orders) == 1, "must place a fresh protective stop when none was found"
-    assert m.position.protective_stop_order_id is not None
+    assert m.position.protective_stop_algo_id is not None
     print("startup reconciliation placed a fresh protective stop for a genuinely unprotected OPEN position")
     print("PASS\n")
 
@@ -402,13 +423,13 @@ async def test_reconcile_enters_protection_pending_on_fetch_failure():
 
 async def test_reconcile_noop_when_not_open():
     client = FakeClient(open_orders=[
-        {"orderId": 1, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
-         "stopPrice": "94.0", "clientOrderId": f"{trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX}-c-1"},
+        {"algoId": 1, "orderType": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+         "triggerPrice": "94.0", "clientAlgoId": f"{trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX}-c-1"},
     ])
     m, client = await make_manager(side="LONG", avg_entry=100.0, qty=1.0, client=client)
     m.position.status = "FLAT"
     await trading.reconcile_protective_stop_on_startup(client, m)
-    assert m.position.protective_stop_order_id is None
+    assert m.position.protective_stop_algo_id is None
     assert len(client.placed_orders) == 0
     print("reconciliation is a no-op when the position is not OPEN")
     print("PASS\n")
