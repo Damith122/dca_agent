@@ -362,6 +362,88 @@ class RestClient:
             "GET", "/fapi/v1/openOrders", {"symbol": symbol}, signed=True
         )
 
+    # --- Algo (conditional) order endpoints ---------------------------------
+    # 2026-08 Binance Algo-Service migration (root cause of the live -4120
+    # failures): Binance moved USD-M CONDITIONAL order types (STOP_MARKET,
+    # TAKE_PROFIT_MARKET, TRAILING_STOP_MARKET, ...) off /fapi/v1/order onto a
+    # dedicated Algo Service. Sending type=STOP_MARKET to /fapi/v1/order now
+    # returns:
+    #     HTTP 400 {"code": -4120, "msg": "Order type not supported for this
+    #               endpoint. Please use the Algo Order API endpoints instead."}
+    # These four methods are the Algo equivalents, used ONLY by the
+    # exchange-native protective stop in trading.py. Ordinary MARKET entries,
+    # DCA additions and reduceOnly closes deliberately keep using
+    # place_order()/cancel_order()/get_order()/get_open_orders() above -
+    # MARKET is not a conditional type and is unaffected by the migration.
+    #
+    # Field-name differences that matter (verified against the docs):
+    #   triggerPrice   (NOT stopPrice)
+    #   clientAlgoId   (NOT newClientOrderId)
+    #   algoId         (NOT orderId) - the response identifier
+    #   orderType      (NOT type)    - the type field in RESPONSES
+    #   actualOrderId  - "" until the algo triggers, then the child order's id
+    # Docs: https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/New-Algo-Order
+    async def place_algo_order(self, **kwargs) -> dict:
+        """Signed POST /fapi/v1/algoOrder - places a conditional (algo)
+        order. Caller supplies Binance's exact field names, e.g.:
+            symbol, side, algoType="CONDITIONAL", type="STOP_MARKET",
+            triggerPrice, closePosition="true", workingType, clientAlgoId
+        Never send `quantity` or `reduceOnly` together with
+        closePosition="true" - Binance rejects that combination."""
+        return await self._request("POST", "/fapi/v1/algoOrder", kwargs, signed=True)
+
+    async def get_algo_order(
+        self, algo_id: Optional[int] = None, client_algo_id: Optional[str] = None
+    ) -> dict:
+        """Signed GET /fapi/v1/algoOrder - query ONE algo order's real
+        current state. Exactly one of algo_id / client_algo_id must be
+        given (Binance requires one; sending neither is an error). This is
+        the authoritative fallback whenever an ALGO_UPDATE websocket event
+        is missed or ambiguous - notably FINISHED, which per Binance's own
+        docs can mean either filled OR canceled, so it must never be
+        treated as a fill without checking `algoStatus`/`actualOrderId`
+        here first.
+        Docs: https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/Query-Algo-Order
+        """
+        if algo_id is None and client_algo_id is None:
+            raise ValueError("get_algo_order requires algo_id or client_algo_id")
+        params: dict = {}
+        if algo_id is not None:
+            params["algoId"] = algo_id
+        else:
+            params["clientAlgoId"] = client_algo_id
+        return await self._request("GET", "/fapi/v1/algoOrder", params, signed=True)
+
+    async def cancel_algo_order(
+        self, algo_id: Optional[int] = None, client_algo_id: Optional[str] = None
+    ) -> dict:
+        """Signed DELETE /fapi/v1/algoOrder - cancel ONE algo order by
+        algoId or clientAlgoId (exactly one required). Note Binance does
+        NOT take `symbol` here - the algo id alone identifies the order.
+        Docs: https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/Query-Algo-Order
+        """
+        if algo_id is None and client_algo_id is None:
+            raise ValueError("cancel_algo_order requires algo_id or client_algo_id")
+        params: dict = {}
+        if algo_id is not None:
+            params["algoId"] = algo_id
+        else:
+            params["clientAlgoId"] = client_algo_id
+        return await self._request("DELETE", "/fapi/v1/algoOrder", params, signed=True)
+
+    async def get_open_algo_orders(self, symbol: Optional[str] = None) -> list:
+        """Signed GET /fapi/v1/openAlgoOrders - every currently-open algo
+        order (optionally filtered to one symbol; omitting symbol returns
+        all symbols and costs far more request weight, so trading.py always
+        passes one). Used by protective-stop reconciliation to discover,
+        adopt, de-duplicate and clean up bot-owned conditional stops.
+        Docs: https://developers.binance.com/docs/derivatives/usds-margined-futures/trade/rest-api/Current-All-Algo-Open-Orders
+        """
+        params: dict = {}
+        if symbol is not None:
+            params["symbol"] = symbol
+        return await self._request("GET", "/fapi/v1/openAlgoOrders", params, signed=True)
+
     async def get_order(self, symbol: str, order_id: int) -> dict:
         """Signed GET /fapi/v1/order - query a single order's current
         status by orderId. REST fallback used when a fill's WebSocket
