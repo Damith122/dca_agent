@@ -22,6 +22,17 @@
  three tiny, generic helpers - defined identically to dca2.py's versions.
  They are formatting/math utilities, not part of the Brain's behavior, and
  are not exported for use elsewhere.
+
+ 2026-08 STRATEGY UPGRADE - LiquidityFlowGuard (additive; BrainV2 and
+ RunningNormalizer below are untouched, still byte-for-byte the original
+ dca2.py code): a small, pure, stateless evaluator for the orderbook
+ imbalance / aggregated-trade-flow entry conditions. It lives here because
+ it is strategy/signal logic that sits directly alongside the Brain's own
+ directional output, and because keeping it dependency-free (config only -
+ no numpy, no sklearn, no websocket/exchange imports) makes it trivially
+ unit-testable in isolation. EntryEngineV2 in trading.py applies it AFTER
+ the existing technical scoring, both as a hard veto and as the extra two
+ legs of a three-way multi-factor confirmation. See the class banner below.
 ================================================================================
 """
 
@@ -34,7 +45,17 @@ from typing import Optional
 import numpy as np
 from sklearn.linear_model import SGDRegressor, SGDClassifier
 
-from config import N_FEATURES_V2, BRAIN2_WARMUP_UPDATES, BRAIN_HEAD_MIN_SAMPLES
+from config import (
+    N_FEATURES_V2,
+    BRAIN2_WARMUP_UPDATES,
+    BRAIN_HEAD_MIN_SAMPLES,
+    # --- 2026-08 Liquidity & Flow Guard (appended config) ---------------
+    ENABLE_ORDERBOOK_GUARD,
+    ORDERBOOK_IMBALANCE_THRESHOLD,
+    ORDERBOOK_SUPPORT_MIN,
+    AGG_TRADE_DELTA_MIN,
+    ORDERBOOK_GUARD_REQUIRES_DATA,
+)
 
 # ----------------------------------------------------------------------------
 # Private helpers (identical copies of dca2.py's color()/YELLOW/clamp() -
@@ -55,6 +76,181 @@ GREEN, RED, YELLOW, CYAN, GRAY, BOLD, MAGENTA, BLUE = "32", "31", "33", "36", "9
 
 def clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
+
+
+# ============================================================================
+# LIQUIDITY & FLOW GUARD (2026-08 upgrade)
+# ============================================================================
+# Purely ADDITIVE strategy layer. It does not read, replace or weaken any
+# existing technical check: the EMA/RSI/ATR stack, MarketRegimeEngine, the
+# ENTRY_WEIGHTS composite score and its ENTRY_SCORE_THRESHOLD acceptance bar
+# all run first and are completely untouched. This guard is applied AFTER
+# them, in EntryEngineV2.evaluate() (trading.py), as:
+#
+#   (a) a HARD VETO - a blocked side can never reach should_enter=True no
+#       matter how high the technical score came in, exactly like the
+#       pre-existing regime / dead-market / counter-momentum hard blocks; and
+#   (b) the extra two factors of a MULTI-FACTOR CONFIRMATION requirement -
+#       a trade opens only when the TECHNICAL signal, the ORDERBOOK support
+#       and the 10s trade-FLOW delta all point the same way.
+#
+# The veto rules are exactly as specified:
+#     BLOCK LONG  if orderbook_imbalance < -THRESHOLD  OR  10s_delta < 0
+#     BLOCK SHORT if orderbook_imbalance > +THRESHOLD  OR  10s_delta > 0
+# with THRESHOLD defaulting to ORDERBOOK_IMBALANCE_THRESHOLD (0.20) and
+# tightened by the caller during the post-loss cool-off window (see
+# trading.py's cool-off handling - this class never reads wall-clock time,
+# it is a pure function of the numbers it is handed, which is what makes it
+# trivially testable).
+# ============================================================================
+
+
+class LiquidityFlowGuard:
+    """Pure, stateless evaluator for the orderbook/flow entry conditions.
+
+    Held as a plain object (rather than module functions) so a caller can
+    hand it per-decision thresholds - the post-loss cool-off does exactly
+    that - without any global mutation.
+    """
+
+    def __init__(
+        self,
+        enabled: bool = ENABLE_ORDERBOOK_GUARD,
+        imbalance_threshold: float = ORDERBOOK_IMBALANCE_THRESHOLD,
+        support_min: float = ORDERBOOK_SUPPORT_MIN,
+        delta_min: float = AGG_TRADE_DELTA_MIN,
+        require_data: bool = ORDERBOOK_GUARD_REQUIRES_DATA,
+    ):
+        self.enabled = enabled
+        self.imbalance_threshold = imbalance_threshold
+        self.support_min = support_min
+        self.delta_min = delta_min
+        self.require_data = require_data
+
+    def evaluate(
+        self,
+        side: Optional[str],
+        orderflow: Optional[dict],
+        imbalance_threshold: Optional[float] = None,
+        support_min: Optional[float] = None,
+        delta_min: Optional[float] = None,
+    ) -> dict:
+        """Decide whether `side` ("LONG"/"SHORT") may be opened right now.
+
+        `orderflow` is an OrderFlowTracker.snapshot() dict (see
+        websocket.py) - or None, which means this process has no orderflow
+        wiring at all (e.g. a focused unit test constructing EntryEngineV2
+        directly). None is treated as "guard not applicable" so every
+        pre-existing caller behaves exactly as it did before this upgrade.
+
+        Returns a dict with:
+            blocked          - True if this side must be vetoed
+            reason           - short machine-readable reason ("" if allowed)
+            book_support     - True if the book itself supports this side
+            flow_aligned     - True if the 10s trade delta supports this side
+            confirmed        - book_support AND flow_aligned (the two
+                               non-technical legs of multi-factor
+                               confirmation)
+            imbalance / trade_delta / threshold - the values actually used,
+                               so the caller can log an auditable decision.
+        """
+        thr = self.imbalance_threshold if imbalance_threshold is None else imbalance_threshold
+        sup = self.support_min if support_min is None else support_min
+        dmin = self.delta_min if delta_min is None else delta_min
+
+        result = {
+            "blocked": False,
+            "reason": "",
+            "book_support": False,
+            "flow_aligned": False,
+            "confirmed": False,
+            "active": False,
+            "imbalance": 0.0,
+            "trade_delta": 0.0,
+            "threshold": thr,
+            "support_min": sup,
+            "delta_min": dmin,
+            "data_available": False,
+        }
+
+        if not self.enabled or orderflow is None or side not in ("LONG", "SHORT"):
+            # Guard disabled, not wired, or nothing directional to judge -
+            # confirmation legs are reported as satisfied so the caller's
+            # multi-factor AND-chain degrades to the pre-upgrade behavior
+            # rather than blocking every trade.
+            result["book_support"] = True
+            result["flow_aligned"] = True
+            result["confirmed"] = True
+            return result
+
+        result["active"] = True
+        data_available = bool(orderflow.get("data_available"))
+        result["data_available"] = data_available
+        imbalance = float(orderflow.get("imbalance", 0.0) or 0.0)
+        trade_delta = float(orderflow.get("trade_delta", 0.0) or 0.0)
+        result["imbalance"] = imbalance
+        result["trade_delta"] = trade_delta
+
+        if not data_available:
+            # Fail-SAFE, not fail-open: a silently dead depth/trade feed
+            # must never be mistaken for a neutral, permissive book. With
+            # ORDERBOOK_GUARD_REQUIRES_DATA=false this degrades to the
+            # pre-upgrade behavior instead (documented escape hatch).
+            if self.require_data:
+                result["blocked"] = True
+                result["reason"] = "orderflow_data_unavailable"
+                return result
+            result["book_support"] = True
+            result["flow_aligned"] = True
+            result["confirmed"] = True
+            return result
+
+        if side == "LONG":
+            if imbalance < -thr:
+                result["blocked"] = True
+                result["reason"] = "orderbook_imbalance_against_long"
+                return result
+            if trade_delta < 0:
+                result["blocked"] = True
+                result["reason"] = "trade_delta_against_long"
+                return result
+            result["book_support"] = imbalance > sup
+            result["flow_aligned"] = trade_delta > dmin
+        else:  # SHORT
+            if imbalance > thr:
+                result["blocked"] = True
+                result["reason"] = "orderbook_imbalance_against_short"
+                return result
+            if trade_delta > 0:
+                result["blocked"] = True
+                result["reason"] = "trade_delta_against_short"
+                return result
+            result["book_support"] = imbalance < -sup
+            result["flow_aligned"] = trade_delta < -dmin
+
+        result["confirmed"] = result["book_support"] and result["flow_aligned"]
+        if not result["confirmed"]:
+            result["blocked"] = True
+            result["reason"] = (
+                "no_orderbook_support" if not result["book_support"] else "flow_delta_not_aligned"
+            )
+        return result
+
+    def supports_reversal(
+        self, side: Optional[str], orderflow: Optional[dict], support_min: float = 0.0,
+    ) -> bool:
+        """Does the resting book currently support a RECOVERY of an open
+        `side` position? Used by trading.py's Safe DCA rescue rule, which
+        may only add once and only when bids (for a LONG) / asks (for a
+        SHORT) are genuinely backing the reversal. Returns True when the
+        guard is disabled or no orderflow data is wired, so a deployment
+        that turns the guard off keeps the pre-upgrade DCA behavior."""
+        if not self.enabled or orderflow is None or side not in ("LONG", "SHORT"):
+            return True
+        if not orderflow.get("data_available"):
+            return not self.require_data
+        imbalance = float(orderflow.get("imbalance", 0.0) or 0.0)
+        return imbalance > support_min if side == "LONG" else imbalance < -support_min
 
 
 # ============================================================================
