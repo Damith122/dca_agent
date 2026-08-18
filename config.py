@@ -851,3 +851,209 @@ __all__ = [
     "WS_MARKET_BASE",
     "WS_USERDATA_BASE",
 ]
+
+
+# ============================================================================
+# 2026-08 HIGH-FREQUENCY ORDERFLOW UPGRADE - APPENDED CONFIGURATION
+# ============================================================================
+# Everything above this banner is untouched: not one existing variable was
+# deleted, renamed, or had its default changed by this upgrade, and the
+# original `__all__` list above is left exactly as it was (this section
+# appends to it at the bottom instead of rewriting it). Every value here is
+# environment-overridable with the same os.environ.get(...) pattern already
+# used throughout this file, so Railway needs no code change to retune any
+# of it.
+#
+# What this block configures (see websocket.py / brain.py / trading.py for
+# the code that consumes it):
+#   1. The high-frequency data layer - Binance Futures @depth20@100ms
+#      partial-book + @aggTrade streams, kept in bounded collections.deque
+#      ring buffers so RAM usage on a small Railway container is a fixed,
+#      known constant rather than something that grows with uptime.
+#   2. The entry Liquidity & Flow Guard - orderbook imbalance + aggregated
+#      trade-volume delta, used as a HARD veto and as the extra confirmation
+#      factors on top of the existing technical (EMA/RSI/ATR/regime/Brain)
+#      entry score.
+#   3. The strict 1:2 risk-to-reward envelope, post-only (maker) entries,
+#      the post-loss cool-off window, the orderflow-driven Smart Early Exit,
+#      and the 1-step Safe DCA rescue rule.
+# ============================================================================
+
+# --- 1. Orderbook / flow guard (the eight required toggles) ------------------
+ENABLE_ORDERBOOK_GUARD = os.environ.get("ENABLE_ORDERBOOK_GUARD", "true").lower() != "false"
+ORDERBOOK_IMBALANCE_THRESHOLD = float(os.environ.get("ORDERBOOK_IMBALANCE_THRESHOLD", "0.20"))
+AGG_TRADE_DELTA_WINDOW_SEC = int(os.environ.get("AGG_TRADE_DELTA_WINDOW_SEC", "10"))
+MAX_STOP_LOSS_USD = float(os.environ.get("MAX_STOP_LOSS_USD", "0.20"))
+TARGET_PROFIT_USD = float(os.environ.get("TARGET_PROFIT_USD", "0.40"))
+COOL_OFF_PERIOD_MINUTES = float(os.environ.get("COOL_OFF_PERIOD_MINUTES", "15"))
+USE_POST_ONLY_LIMIT = os.environ.get("USE_POST_ONLY_LIMIT", "true").lower() != "false"
+
+# MAX_DCA_STEPS: deliberately RE-BOUND here rather than edited in place
+# above, so the original definition (and its full historical comment about
+# why 3 -> 2 happened) is preserved verbatim for the record. The Safe DCA
+# rule of this upgrade re-engineers DCA as a single 1-step rescue order
+# targeting a fast break-even exit, so the hard cap is now 1. The env var
+# name is unchanged (MAX_DCA_STEPS), so an existing Railway deployment that
+# already pins it keeps its pinned value - only the DEFAULT moved 2 -> 1.
+# This assignment shadows the earlier one at import time; every consumer
+# (trading.py's DCA gates, sanitize_recovered_dca_step(), the DCA-state
+# snapshot clamps) reads this final value.
+MAX_DCA_STEPS = int(os.environ.get("MAX_DCA_STEPS", "1"))
+
+# --- 2. High-frequency market-data layer (websocket.py) ---------------------
+# Binance publishes partial book depth in fixed sizes (5/10/20) and at
+# 250ms/500ms/100ms speeds. We subscribe to the 20-level/100ms stream and
+# compute the imbalance over the top ORDERBOOK_DEPTH_LEVELS (10) of each
+# side, per the spec:
+#     (top10_bid_vol - top10_ask_vol) / (top10_bid_vol + top10_ask_vol)
+ORDERBOOK_STREAM_DEPTH = int(os.environ.get("ORDERBOOK_STREAM_DEPTH", "20"))
+ORDERBOOK_STREAM_SPEED_MS = int(os.environ.get("ORDERBOOK_STREAM_SPEED_MS", "100"))
+ORDERBOOK_DEPTH_LEVELS = int(os.environ.get("ORDERBOOK_DEPTH_LEVELS", "10"))
+# RAM safety on Railway: both rolling buffers are collections.deque with a
+# hard maxlen, so the orderflow layer's memory footprint is bounded and
+# constant no matter how long the process runs. 600 depth samples at 100ms
+# is a 60s rolling view; 4000 aggTrades comfortably covers the 10s delta
+# window even in a violent tape.
+ORDERBOOK_BUFFER_MAXLEN = int(os.environ.get("ORDERBOOK_BUFFER_MAXLEN", "600"))
+AGG_TRADE_BUFFER_MAXLEN = int(os.environ.get("AGG_TRADE_BUFFER_MAXLEN", "4000"))
+# A depth/trade reading older than this is treated as "no data" rather than
+# as a live signal - a silently dead stream must never look like a neutral
+# (0.0) orderbook.
+ORDERFLOW_STALE_SEC = float(os.environ.get("ORDERFLOW_STALE_SEC", "5.0"))
+# Dynamic auto-reconnect tuning for the market websockets (Railway network
+# drops): full jitter is applied to the existing exponential backoff so a
+# multi-stream reconnect storm never re-hits Binance in lockstep.
+WS_RECONNECT_JITTER_RATIO = float(os.environ.get("WS_RECONNECT_JITTER_RATIO", "0.5"))
+
+# --- 3. Entry Liquidity & Flow Guard (brain.py) ------------------------------
+# Multi-factor confirmation: a trade may only open when the TECHNICAL signal
+# (existing Brain/EMA/RSI/ATR/regime score), the ORDERBOOK support, and the
+# 10s trade-flow DELTA all agree. ORDERBOOK_SUPPORT_MIN is the minimum
+# same-side imbalance that counts as genuine book support (0.0 = book merely
+# not against us); AGG_TRADE_DELTA_MIN is the equivalent floor on the signed
+# 10s volume delta, in base-asset units.
+ORDERBOOK_SUPPORT_MIN = float(os.environ.get("ORDERBOOK_SUPPORT_MIN", "0.0"))
+AGG_TRADE_DELTA_MIN = float(os.environ.get("AGG_TRADE_DELTA_MIN", "0.0"))
+# When True (default), an unavailable/stale orderflow feed BLOCKS entries
+# instead of silently degrading to "no guard". Fail-safe, not fail-open.
+ORDERBOOK_GUARD_REQUIRES_DATA = (
+    os.environ.get("ORDERBOOK_GUARD_REQUIRES_DATA", "true").lower() != "false"
+)
+
+# --- 4. Strict 1:2 risk-to-reward envelope (trading.py) ---------------------
+# Sized for the documented account shape: $4 initial margin @ 20x leverage
+# on a ~$20 wallet (= $80 notional). SL is capped at $0.15-$0.20 fee-net and
+# TP targeted at $0.35-$0.40 fee-net, i.e. ~1:2. MAX_STOP_LOSS_USD /
+# TARGET_PROFIT_USD above are the outer (worst/best) bounds of those bands;
+# the MIN_* values below are the inner bounds, used so a winner can be
+# banked at $0.35 the moment orderflow turns instead of insisting on the
+# full $0.40.
+MIN_STOP_LOSS_USD = float(os.environ.get("MIN_STOP_LOSS_USD", "0.15"))
+MIN_TARGET_PROFIT_USD = float(os.environ.get("MIN_TARGET_PROFIT_USD", "0.35"))
+ENFORCE_RISK_REWARD_USD = (
+    os.environ.get("ENFORCE_RISK_REWARD_USD", "true").lower() != "false"
+)
+# Post-only (maker) entry execution. A GTX order that would cross the book
+# is rejected by Binance rather than paying taker fees; we re-price once,
+# and only then fall back to the original MARKET behavior (so the bot can
+# never be left unable to trade at all by a fast tape).
+POST_ONLY_LIMIT_OFFSET_TICKS = int(os.environ.get("POST_ONLY_LIMIT_OFFSET_TICKS", "0"))
+POST_ONLY_LIMIT_TIMEOUT_SEC = float(os.environ.get("POST_ONLY_LIMIT_TIMEOUT_SEC", "20"))
+POST_ONLY_MARKET_FALLBACK = (
+    os.environ.get("POST_ONLY_MARKET_FALLBACK", "true").lower() != "false"
+)
+
+# --- 5. Continuous 24/7 execution -------------------------------------------
+# The existing MAX_DAILY_LOSS_USDT / DAILY_PROFIT_TARGET_USDT variables and
+# their entry gates are PRESERVED exactly as they are. This toggle decides
+# whether those two gates still halt new entries for the remainder of a UTC
+# day. Default True = never shut the bot down on a daily profit/loss figure;
+# set CONTINUOUS_24_7_TRADING=false to restore the previous daily-halt
+# behavior with no code change.
+CONTINUOUS_24_7_TRADING = (
+    os.environ.get("CONTINUOUS_24_7_TRADING", "true").lower() != "false"
+)
+
+# --- 6. Dynamic post-loss cool-off window -----------------------------------
+# On ANY losing trade: no new entry for COOL_OFF_PERIOD_MINUTES, and for an
+# equally long window AFTER that, the entry orderbook guard is tightened -
+# the adverse-imbalance veto trips earlier (threshold reduced by
+# COOL_OFF_IMBALANCE_TIGHTEN) and genuine same-side book support of at least
+# COOL_OFF_SUPPORT_MIN is required. This is the anti-revenge-trading rule.
+COOL_OFF_IMBALANCE_TIGHTEN = float(os.environ.get("COOL_OFF_IMBALANCE_TIGHTEN", "0.10"))
+COOL_OFF_SUPPORT_MIN = float(os.environ.get("COOL_OFF_SUPPORT_MIN", "0.20"))
+
+# --- 7. Smart Orderflow Early Exit ------------------------------------------
+# If the orderbook imbalance flips violently AGAINST an open position before
+# the stop is reached, exit at a micro-loss instead of riding it to the full
+# SL. Fires only inside the $0.05-$0.10 fee-net micro-loss band.
+SMART_ORDERFLOW_EXIT_ENABLED = (
+    os.environ.get("SMART_ORDERFLOW_EXIT_ENABLED", "true").lower() != "false"
+)
+SMART_ORDERFLOW_EXIT_IMBALANCE = float(
+    os.environ.get("SMART_ORDERFLOW_EXIT_IMBALANCE", "0.35")
+)
+SMART_ORDERFLOW_EXIT_MIN_LOSS_USD = float(
+    os.environ.get("SMART_ORDERFLOW_EXIT_MIN_LOSS_USD", "0.05")
+)
+SMART_ORDERFLOW_EXIT_MAX_LOSS_USD = float(
+    os.environ.get("SMART_ORDERFLOW_EXIT_MAX_LOSS_USD", "0.10")
+)
+SMART_ORDERFLOW_EXIT_MIN_HOLD_SEC = float(
+    os.environ.get("SMART_ORDERFLOW_EXIT_MIN_HOLD_SEC", "10")
+)
+
+# --- 8. Safe DCA: single-step rescue order, break-even target ---------------
+# The one permitted DCA add is only submitted when the book itself supports
+# the reversal (bids for a LONG rescue, asks for a SHORT rescue). Once that
+# rescue has filled, the position stops chasing the full TP and targets a
+# fast break-even exit instead.
+DCA_REQUIRE_ORDERBOOK_SUPPORT = (
+    os.environ.get("DCA_REQUIRE_ORDERBOOK_SUPPORT", "true").lower() != "false"
+)
+DCA_RESCUE_SUPPORT_MIN = float(os.environ.get("DCA_RESCUE_SUPPORT_MIN", "0.10"))
+DCA_RESCUE_BREAKEVEN_ENABLED = (
+    os.environ.get("DCA_RESCUE_BREAKEVEN_ENABLED", "true").lower() != "false"
+)
+DCA_RESCUE_BREAKEVEN_MIN_NET_USD = float(
+    os.environ.get("DCA_RESCUE_BREAKEVEN_MIN_NET_USD", "0.02")
+)
+
+
+__all__ = __all__ + [
+    "ENABLE_ORDERBOOK_GUARD",
+    "ORDERBOOK_IMBALANCE_THRESHOLD",
+    "AGG_TRADE_DELTA_WINDOW_SEC",
+    "MAX_STOP_LOSS_USD",
+    "TARGET_PROFIT_USD",
+    "COOL_OFF_PERIOD_MINUTES",
+    "USE_POST_ONLY_LIMIT",
+    "ORDERBOOK_STREAM_DEPTH",
+    "ORDERBOOK_STREAM_SPEED_MS",
+    "ORDERBOOK_DEPTH_LEVELS",
+    "ORDERBOOK_BUFFER_MAXLEN",
+    "AGG_TRADE_BUFFER_MAXLEN",
+    "ORDERFLOW_STALE_SEC",
+    "WS_RECONNECT_JITTER_RATIO",
+    "ORDERBOOK_SUPPORT_MIN",
+    "AGG_TRADE_DELTA_MIN",
+    "ORDERBOOK_GUARD_REQUIRES_DATA",
+    "MIN_STOP_LOSS_USD",
+    "MIN_TARGET_PROFIT_USD",
+    "ENFORCE_RISK_REWARD_USD",
+    "POST_ONLY_LIMIT_OFFSET_TICKS",
+    "POST_ONLY_LIMIT_TIMEOUT_SEC",
+    "POST_ONLY_MARKET_FALLBACK",
+    "CONTINUOUS_24_7_TRADING",
+    "COOL_OFF_IMBALANCE_TIGHTEN",
+    "COOL_OFF_SUPPORT_MIN",
+    "SMART_ORDERFLOW_EXIT_ENABLED",
+    "SMART_ORDERFLOW_EXIT_IMBALANCE",
+    "SMART_ORDERFLOW_EXIT_MIN_LOSS_USD",
+    "SMART_ORDERFLOW_EXIT_MAX_LOSS_USD",
+    "SMART_ORDERFLOW_EXIT_MIN_HOLD_SEC",
+    "DCA_REQUIRE_ORDERBOOK_SUPPORT",
+    "DCA_RESCUE_SUPPORT_MIN",
+    "DCA_RESCUE_BREAKEVEN_ENABLED",
+    "DCA_RESCUE_BREAKEVEN_MIN_NET_USD",
+]
