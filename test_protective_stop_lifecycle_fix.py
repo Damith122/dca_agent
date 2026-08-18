@@ -721,6 +721,373 @@ async def test_f6_concurrent_expiry_does_not_stampede():
     print("PASS\n")
 
 
+# ============================================================================
+# F7: leftover bot-owned protective stops must not survive a restart while
+# FLAT (reconcile_protective_stop_on_startup used to return early unless the
+# position was OPEN, so a closePosition=true stop from a previous process
+# could rest indefinitely and later trigger against a BRAND-NEW position at a
+# stop price computed for a completely different trade).
+# ============================================================================
+async def _flat_manager(client):
+    m, client = await make_manager(client=client)
+    m.position = trading.PositionState(last_close_time=time.time())  # genuinely FLAT
+    client.position = m.position
+    return m, client
+
+
+async def test_f7_flat_startup_cancels_leftover_bot_owned_stops():
+    prefix = trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX
+    orders = [
+        {"orderId": 811, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+         "stopPrice": "99.40", "clientOrderId": f"{prefix}-1-1"},
+        {"orderId": 812, "type": "STOP_MARKET", "side": "BUY", "closePosition": "true",
+         "stopPrice": "101.20", "clientOrderId": f"{prefix}-2-1"},
+    ]
+    client = FakeClient(open_orders=orders)
+    m, client = await _flat_manager(client)
+    assert m.position.status == "FLAT"
+    with Capture() as cap:
+        await trading.reconcile_protective_stop_on_startup(client, m)
+    out = cap.text
+    assert "while FLAT" in out, out
+    assert sorted(client.cancel_calls) == [811, 812], (
+        f"every leftover bot-owned stop must be cancelled regardless of side, got {client.cancel_calls}"
+    )
+    assert len(client.placed_orders) == 0, "nothing may be placed while flat"
+    print("FLAT startup cancelled both leftover bot-owned stops (SELL and BUY) - none can survive "
+          "to trigger against a future position")
+    print("PASS\n")
+
+
+async def test_f7_flat_startup_never_touches_foreign_orders():
+    prefix = trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX
+    orders = [
+        {"orderId": 900, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+         "stopPrice": "50.00", "clientOrderId": "manual-user-stop"},
+        {"orderId": 901, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+         "stopPrice": "51.00", "clientOrderId": None},
+        {"orderId": 902, "type": "LIMIT", "side": "SELL", "closePosition": "false",
+         "clientOrderId": f"{prefix}-x-1"},  # bot-owned but NOT a protective stop
+        {"orderId": 903, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+         "stopPrice": "52.00", "clientOrderId": f"{prefix}-keep-1"},
+    ]
+    client = FakeClient(open_orders=orders)
+    m, client = await _flat_manager(client)
+    with Capture():
+        await trading.reconcile_protective_stop_on_startup(client, m)
+    assert client.cancel_calls == [903], (
+        f"only the bot-owned protective stop may be cancelled, got {client.cancel_calls}"
+    )
+    print("FLAT startup cancelled only orderId=903 (bot-owned protective stop); left the manual "
+          "stop, the null-clientOrderId stop, and a bot-owned non-protective LIMIT untouched")
+    print("PASS\n")
+
+
+async def test_f7_flat_startup_retains_failed_cancel_for_retry():
+    prefix = trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX
+    orders = [{"orderId": 850, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+               "stopPrice": "99.40", "clientOrderId": f"{prefix}-1-1"}]
+    client = FakeClient(open_orders=orders, fail_cancel="network")
+    m, client = await _flat_manager(client)
+    with Capture() as cap:
+        await trading.reconcile_protective_stop_on_startup(client, m)
+    assert "handed to the orphan sweep" in cap.text, cap.text
+    assert 850 in m._orphan_protective_stop_ids, (
+        "a failed leftover cancel must be retained for retry, not silently passed"
+    )
+    # And the sweep resolves it once cancellation works again.
+    client._fail_cancel = None
+    m._last_orphan_sweep_ts = 0.0
+    with Capture():
+        await m._sweep_orphan_protective_stops()
+    assert 850 not in m._orphan_protective_stop_ids
+    print("failed leftover cancel retained in the orphan registry and resolved by the sweep "
+          "(no silent pass)")
+    print("PASS\n")
+
+
+async def test_f7_flat_startup_already_gone_is_not_retried():
+    prefix = trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX
+    orders = [{"orderId": 860, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+               "stopPrice": "99.40", "clientOrderId": f"{prefix}-1-1"}]
+    client = FakeClient(open_orders=orders, fail_cancel="unknown_order")  # -2011
+    m, client = await _flat_manager(client)
+    with Capture() as cap:
+        await trading.reconcile_protective_stop_on_startup(client, m)
+    assert "already gone" in cap.text
+    assert 860 not in m._orphan_protective_stop_ids, "-2011 proves it is gone; no retry needed"
+    print("-2011 on a leftover cancel is treated as proof it is gone - not queued for retry")
+    print("PASS\n")
+
+
+async def test_f7_strict_prefix_matching():
+    prefix = trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX
+    m, _ = await make_manager()
+    # Bare-prefix lookalikes belonging to someone else must NOT match.
+    assert m._is_own_protective_stop({"clientOrderId": f"{prefix}-1-1"}) is True
+    assert m._is_own_protective_stop({"clientOrderId": f"{prefix}XYZ-1"}) is False
+    assert m._is_own_protective_stop({"clientOrderId": f"{prefix}hedge-1"}) is False
+    assert m._is_own_protective_stop({"clientOrderId": prefix}) is False
+    assert m._is_own_protective_stop({"clientOrderId": None}) is False
+    assert m._is_own_protective_stop({}) is False
+    # And a real generated id always matches its own predicate.
+    generated = m._new_protective_stop_client_order_id()
+    assert m._is_own_protective_stop({"clientOrderId": generated}) is True
+    print(f"strict '{prefix}-' matching: '{prefix}XYZ-1'/'{prefix}hedge-1'/'{prefix}' rejected, "
+          f"generated id '{generated}' accepted")
+    print("PASS\n")
+
+
+async def test_f7_failed_reconciliation_blocks_blind_placement():
+    client = FakeClient(fail_open_orders=True)
+    m, client = await make_manager(client=client)
+    with Capture() as cap:
+        await trading.reconcile_protective_stop_on_startup(client, m)
+    out = cap.text
+    assert "NOT placing a new one blind" in out, out
+    assert m._protective_stop_reconcile_blocked is True
+    assert len(client.placed_orders) == 0, "must not place while enumeration failed"
+    assert m.position.protection_pending is True
+    # Even a direct placement request must be refused while blocked.
+    with Capture() as cap2:
+        await m._place_or_replace_protective_stop(reason="entry filled")
+    assert len(client.placed_orders) == 0, (
+        "placement must stay blocked until reconciliation succeeds - otherwise a stop this "
+        "process could not see would be duplicated"
+    )
+    assert m.position.protective_stop_order_id is None
+    print("open-orders enumeration failure blocks ALL protective-stop placement (no blind stacking)")
+    print("PASS\n")
+
+
+async def test_f7_sweep_retries_reconciliation_then_places():
+    client = FakeClient(fail_open_orders=True)
+    m, client = await make_manager(client=client)
+    with Capture():
+        await trading.reconcile_protective_stop_on_startup(client, m)
+    assert m._protective_stop_reconcile_blocked is True
+    # Enumeration starts working, and reports no resting stop.
+    client._fail_open_orders = False
+    client._open_orders = []
+    m.position.protection_last_retry_ts = 0.0
+    with Capture() as cap:
+        await m._protective_stop_sweep()   # retries reconciliation, which places
+    out = cap.text
+    assert "retrying open-order reconciliation" in out, out
+    assert m._protective_stop_reconcile_blocked is False
+    assert len(client.placed_orders) == 1, "once enumeration succeeds, a stop may be placed"
+    assert m.position.protection_pending is False
+    print("sweep retried reconciliation, unblocked, and armed the protective stop")
+    print("PASS\n")
+
+
+async def test_f7_flat_startup_noop_when_no_owned_orders():
+    client = FakeClient(open_orders=[])
+    m, client = await _flat_manager(client)
+    with Capture() as cap:
+        await trading.reconcile_protective_stop_on_startup(client, m)
+    assert client.cancel_calls == []
+    assert client.placed_orders == []
+    assert "while FLAT" not in cap.text
+    print("FLAT startup with no leftovers is a clean no-op")
+    print("PASS\n")
+
+
+# ============================================================================
+# F8: the FLAT-startup-fetch-failure -> new-position-adopts-stale-stop chain.
+# Previously: a FLAT startup whose get_open_orders() failed left the leftover
+# unknown AND unretried (the per-tick protective sweep returns early unless a
+# position is open). A new position could then open, and reconciliation would
+# ADOPT the old stale stop as if it protected the new trade - at a stop price
+# computed for a completely different position.
+# ============================================================================
+async def test_f8_flat_fetch_failure_sets_stale_flag_and_blocks_entries():
+    client = FakeClient(fail_open_orders=True)
+    m, client = await _flat_manager(client)
+    with Capture() as cap:
+        await trading.reconcile_protective_stop_on_startup(client, m)
+    out = cap.text
+    assert "BLOCKING new entries" in out, out
+    assert m._protective_stop_reconcile_blocked is True
+    assert m._stale_protective_stops_possible is True, (
+        "an enumeration failure while FLAT must assume a leftover may exist"
+    )
+    print("FLAT enumeration failure sets both the reconcile block and the stale-leftover flag")
+    print("PASS\n")
+
+
+async def test_f8_entry_gate_blocks_while_stale_unresolved():
+    """The entry gate must refuse a new entry while stale cleanup is
+    unresolved, for each of the three independent conditions."""
+    # Each condition is made genuinely UNRESOLVABLE for the duration of the
+    # tick - otherwise the sweep (which runs first, from on_price_tick) would
+    # legitimately self-heal it and the gate would correctly let the entry
+    # through. That self-healing is verified separately below.
+    cases = (
+        ("reconcile_blocked", FakeClient(fail_open_orders=True),
+         lambda mm: setattr(mm, "_protective_stop_reconcile_blocked", True)),
+        ("stale_possible", FakeClient(fail_open_orders=True),
+         lambda mm: setattr(mm, "_stale_protective_stops_possible", True)),
+        ("orphans_remaining", FakeClient(fail_cancel="network"),
+         lambda mm: mm._orphan_protective_stop_ids.add(777)),
+    )
+    for label, client, setup in cases:
+        m, client = await _flat_manager(client)
+        m.last_trade_action_ts = 0.0  # trade cooldown not in the way
+        setup(m)
+        with Capture() as cap:
+            await m.on_price_tick()
+        out = cap.text
+        assert "[entry-skip] stale protective-stop cleanup unresolved" in out, f"{label}: {out}"
+        assert m.position.status == "FLAT", f"{label}: no entry may be opened"
+        assert client.placed_orders == [], f"{label}: no order may be placed"
+        print(f"  entry blocked by {label}")
+    print("PASS\n")
+
+
+async def test_f8_flat_sweep_retries_reconciliation_and_cancels_leftover():
+    """The whole point: while FLAT, the sweep must keep retrying until the
+    leftover is found and cancelled - so the entry gate can re-open."""
+    prefix = trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX
+    leftover = {"orderId": 870, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+                "stopPrice": "88.00", "clientOrderId": f"{prefix}-old-1"}
+    client = FakeClient(open_orders=[leftover], fail_open_orders=True)
+    m, client = await _flat_manager(client)
+    with Capture():
+        await trading.reconcile_protective_stop_on_startup(client, m)
+    assert m._stale_protective_stops_possible is True
+    # REST recovers. The FLAT sweep (driven from on_price_tick) must retry.
+    client._fail_open_orders = False
+    m._last_orphan_sweep_ts = 0.0
+    with Capture() as cap:
+        await m._sweep_orphan_protective_stops()
+    out = cap.text
+    assert "retrying open-order reconciliation" in out, out
+    assert 870 in client.cancel_calls, "the leftover must be cancelled once discovered"
+    assert m._stale_protective_stops_possible is False, "entry gate must re-open once proven clean"
+    assert m._protective_stop_reconcile_blocked is False
+    # And now an entry is permitted again by this gate.
+    m.last_trade_action_ts = 0.0
+    with Capture() as cap2:
+        await m.on_price_tick()
+    assert "[entry-skip] stale protective-stop cleanup unresolved" not in cap2.text
+    print("FLAT sweep retried reconciliation, cancelled leftover orderId=870, and re-opened the "
+          "entry gate")
+    print("PASS\n")
+
+
+async def test_f8_flat_sweep_keeps_blocking_while_cancel_keeps_failing():
+    prefix = trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX
+    leftover = {"orderId": 871, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+                "stopPrice": "88.00", "clientOrderId": f"{prefix}-old-1"}
+    client = FakeClient(open_orders=[leftover], fail_cancel="network")
+    m, client = await _flat_manager(client)
+    with Capture():
+        await trading.reconcile_protective_stop_on_startup(client, m)
+    assert m._stale_protective_stops_possible is True, "an unconfirmed cancel keeps the gate shut"
+    assert 871 in m._orphan_protective_stop_ids
+    # Repeated sweeps while the cancel keeps failing must NOT unblock.
+    for _ in range(3):
+        m._last_orphan_sweep_ts = 0.0
+        with Capture():
+            await m._sweep_orphan_protective_stops()
+        assert m._stale_protective_stops_possible is True
+        assert 871 in m._orphan_protective_stop_ids
+    print("entry gate stays shut across repeated sweeps while the leftover cancel keeps failing")
+    print("PASS\n")
+
+
+async def test_f8_never_adopts_stale_stop_for_a_new_position():
+    """The exact reported chain, end to end: FLAT fetch failure -> leftover
+    stays -> a position opens -> reconciliation must CANCEL the leftover,
+    never adopt it as this position's protection."""
+    prefix = trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX
+    stale = {"orderId": 880, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+             "stopPrice": "50.00",  # priced for a totally different trade
+             "clientOrderId": f"{prefix}-previous-1"}
+    client = FakeClient(open_orders=[stale], fail_open_orders=True)
+    m, client = await _flat_manager(client)
+    with Capture():
+        await trading.reconcile_protective_stop_on_startup(client, m)
+    assert m._stale_protective_stops_possible is True
+
+    # A new position now exists (entry would have been blocked, but simulate
+    # the worst case where one is already open when REST recovers).
+    m.position = trading.PositionState(
+        side="LONG", status="OPEN", entries=[(100.0, 1.0)], avg_entry_price=100.0,
+        total_qty=1.0, original_qty=1.0, opened_at=time.time() - 60,
+    )
+    client.position = m.position
+    m._position_fees_accum = 0.05
+    m._position_fees_reliable = True
+    m.current_price = m.best_bid_price = m.best_ask_price = 100.0
+    client._fail_open_orders = False
+
+    with Capture() as cap:
+        await trading.reconcile_protective_stop_on_startup(client, m)
+    out = cap.text
+    assert "refusing to ADOPT" in out, out
+    assert m.position.protective_stop_order_id != 880, (
+        "the stale stop (priced 50.00 for a previous trade) must NEVER be adopted"
+    )
+    assert 880 in client.cancel_calls, "the stale stop must be cancelled"
+    # A fresh, correctly-priced stop was placed for THIS position instead.
+    assert len(client.placed_orders) == 1
+    fresh_stop = float(client.placed_orders[0]["stopPrice"])
+    assert 99.0 < fresh_stop < 100.0, (
+        f"the replacement stop must be priced for THIS position (~99.94), got {fresh_stop}"
+    )
+    assert m._stale_protective_stops_possible is False
+    print(f"stale stop 880 (stopPrice=50.00) cancelled, never adopted; fresh stop placed at "
+          f"{fresh_stop:.2f} for the actual position")
+    print("PASS\n")
+
+
+async def test_f8_tracked_own_stop_is_still_kept_when_flag_set():
+    """Guard against over-correction: the position's OWN already-tracked stop
+    must survive reconciliation even while the stale flag is set."""
+    prefix = trading.PROTECTIVE_STOP_CLIENT_ID_PREFIX
+    m, client = await make_manager()
+    await m._place_or_replace_protective_stop(reason="entry filled")
+    own_id = m.position.protective_stop_order_id
+    own_cid = m.position.protective_stop_client_order_id
+    stale = {"orderId": 881, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+             "stopPrice": "50.00", "clientOrderId": f"{prefix}-previous-1"}
+    own = {"orderId": own_id, "type": "STOP_MARKET", "side": "SELL", "closePosition": "true",
+           "stopPrice": f"{m.position.protective_stop_price}", "clientOrderId": own_cid}
+    client._open_orders = [stale, own]
+    m._stale_protective_stops_possible = True
+    with Capture():
+        await trading.reconcile_protective_stop_on_startup(client, m)
+    assert m.position.protective_stop_order_id == own_id, (
+        "the position's own tracked stop must be kept, not cancelled"
+    )
+    assert own_id not in client.cancel_calls, "must not cancel our own live protection"
+    assert 881 in client.cancel_calls, "the stale one must still be cancelled"
+    print(f"own tracked stop {own_id} kept; only the stale {881} cancelled")
+    print("PASS\n")
+
+
+async def test_f8_open_position_management_never_blocked_by_entry_gate():
+    """The gate is entry-only: an already-open position must keep being
+    managed (risk-reducing exits unaffected) while stale cleanup is pending."""
+    m, client = await make_manager(avg_entry=100.0, qty=1.0)
+    m._stale_protective_stops_possible = True
+    m._orphan_protective_stop_ids.add(999)
+    m._position_fees_accum = 0.05
+    m._position_fees_reliable = True
+    with Capture() as cap:
+        m.current_price = m.best_bid_price = m.best_ask_price = 99.80  # deep enough for the budget
+        m.prev_price = 99.80
+        await m._manage_open_position()
+    out = cap.text
+    assert "[trade-loss-budget] TRIGGERED" in out, out
+    assert m.position.status == "CLOSING", "risk-reducing exits must still work"
+    print("open-position management (per-trade loss budget close) still runs while the stale-leftover "
+          "entry gate is engaged")
+    print("PASS\n")
+
+
 async def run_all():
     print("--- F2: protective-stop fill routing ---")
     await test_f2_protective_stop_fill_is_registered_and_routed()
@@ -753,6 +1120,23 @@ async def run_all():
     await test_f6_close_resumes_immediately_when_cooldown_clears()
     await test_f6_request_layer_is_the_central_choke_point()
     await test_f6_concurrent_expiry_does_not_stampede()
+    print("--- F7: leftover stops must not survive a FLAT restart ---")
+    await test_f7_flat_startup_cancels_leftover_bot_owned_stops()
+    await test_f7_flat_startup_never_touches_foreign_orders()
+    await test_f7_flat_startup_retains_failed_cancel_for_retry()
+    await test_f7_flat_startup_already_gone_is_not_retried()
+    await test_f7_strict_prefix_matching()
+    await test_f7_failed_reconciliation_blocks_blind_placement()
+    await test_f7_sweep_retries_reconciliation_then_places()
+    await test_f7_flat_startup_noop_when_no_owned_orders()
+    print("--- F8: stale leftover must never be inherited by a new position ---")
+    await test_f8_flat_fetch_failure_sets_stale_flag_and_blocks_entries()
+    await test_f8_entry_gate_blocks_while_stale_unresolved()
+    await test_f8_flat_sweep_retries_reconciliation_and_cancels_leftover()
+    await test_f8_flat_sweep_keeps_blocking_while_cancel_keeps_failing()
+    await test_f8_never_adopts_stale_stop_for_a_new_position()
+    await test_f8_tracked_own_stop_is_still_kept_when_flag_set()
+    await test_f8_open_position_management_never_blocked_by_entry_gate()
     print("ALL PROTECTIVE STOP LIFECYCLE TESTS PASSED")
 
 

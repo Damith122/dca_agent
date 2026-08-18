@@ -1902,6 +1902,25 @@ class MartingaleManager:
         # either accepts the cancel or proves the order is gone.
         self._orphan_protective_stop_ids: set = set()
         self._last_orphan_sweep_ts: float = 0.0
+        # 2026-08 startup-reconciliation safety: True whenever this process
+        # has NOT successfully enumerated Binance's open orders for this
+        # symbol. While True, _place_or_replace_protective_stop() refuses to
+        # place a new stop - placing one blind could stack a second
+        # closePosition=true STOP_MARKET on top of one this process simply
+        # could not see. Cleared the moment a get_open_orders() call
+        # succeeds; the per-tick sweep retries reconciliation until then.
+        self._protective_stop_reconcile_blocked: bool = False
+        # 2026-08 stale-leftover safety: True whenever a bot-owned protective
+        # stop from a PREVIOUS position may still be resting on Binance and
+        # has not been confirmed cancelled - i.e. a FLAT cleanup could not be
+        # completed (open orders could not be enumerated, or a cancel
+        # failed). While True: no NEW entry is opened (a stale
+        # closePosition=true stop would otherwise trigger against the new
+        # position at a price computed for a completely different trade), and
+        # reconciliation refuses to ADOPT any discovered owned stop - it can
+        # only be a leftover, so it is cancelled instead. Cleared only once a
+        # successful enumeration proves every stale owned stop is gone.
+        self._stale_protective_stops_possible: bool = False
         # 2026-08 hard DCA safety invariant: transient scratch field set by
         # initialize_sync() (via _resolve_pending_order_via_rest()) when a
         # pending order's REST resolution comes back ambiguous/failed
@@ -3579,7 +3598,19 @@ class MartingaleManager:
         while a REST cooldown is armed, so it can never become a retry storm.
         An id is dropped only when the cancel succeeds or Binance answers
         -2011 (proving it no longer exists)."""
-        if not self._orphan_protective_stop_ids or DRY_RUN:
+        if DRY_RUN:
+            return
+        # 2026-08 stale-leftover safety: this sweep now also drives
+        # RECONCILIATION retries, not just orphan cancels, and it is the only
+        # thing that runs while FLAT (_protective_stop_sweep() returns early
+        # unless a position is open). Without this, a FLAT-startup
+        # enumeration failure could never be retried, and the stale leftover
+        # it failed to find would still be resting when the next position
+        # opened.
+        needs_reconcile_retry = (
+            self._protective_stop_reconcile_blocked or self._stale_protective_stops_possible
+        )
+        if not self._orphan_protective_stop_ids and not needs_reconcile_retry:
             return
         now = time.time()
         if now - self._last_orphan_sweep_ts < PROTECTIVE_STOP_RETRY_SEC:
@@ -3613,6 +3644,19 @@ class MartingaleManager:
                     f"{now_str()} [protective-stop] orphan sweep: cancel orderId={order_id} error "
                     f"({e}) - will retry.", YELLOW,
                 ))
+
+        # Retry reconciliation itself (this is what runs while FLAT). A
+        # successful enumeration is the only thing that can clear
+        # _protective_stop_reconcile_blocked / _stale_protective_stops_possible
+        # and therefore re-open the entry gate.
+        if needs_reconcile_retry:
+            print(color(
+                f"{now_str()} [protective-stop] retrying open-order reconciliation to resolve "
+                f"stale protective stops (reconcile_blocked="
+                f"{self._protective_stop_reconcile_blocked}, stale_possible="
+                f"{self._stale_protective_stops_possible}).", YELLOW,
+            ))
+            await reconcile_protective_stop_on_startup(self.client, self)
 
     async def on_price_tick(self) -> None:
         await self._sweep_orphan_protective_stops()
@@ -3663,6 +3707,36 @@ class MartingaleManager:
                         f"{now_str()} [entry-skip] position_sync_ready=False - local state has not yet "
                         f"been reconciled against an authoritative Binance position-risk fetch. "
                         f"No new entry will be opened until initialize_sync() confirms readiness.", YELLOW,
+                    ))
+                return
+
+            # 2026-08 stale-leftover entry gate (isolated to entry gating
+            # only - exit/DCA/risk management for an already-open position is
+            # untouched, identical in structure to the position_sync_ready
+            # gate directly above). A bot-owned closePosition=true
+            # STOP_MARKET left resting by a previous position would trigger
+            # against a BRAND-NEW position at a stop price computed for a
+            # completely different trade - closing it immediately and at the
+            # wrong level. So no new entry is opened while either
+            #   (a) open orders could not be enumerated at all, or
+            #   (b) a known stale owned stop has not been confirmed cancelled.
+            # Both are self-healing: the protective-stop sweep retries
+            # enumeration and cancellation every PROTECTIVE_STOP_RETRY_SEC
+            # (including while FLAT), and this gate clears the moment every
+            # stale owned stop is proven gone.
+            if (
+                self._protective_stop_reconcile_blocked
+                or self._stale_protective_stops_possible
+                or self._orphan_protective_stop_ids
+            ):
+                if self._should_log_protection_pending():
+                    print(color(
+                        f"{now_str()} [entry-skip] stale protective-stop cleanup unresolved "
+                        f"(reconcile_blocked={self._protective_stop_reconcile_blocked}, "
+                        f"stale_possible={self._stale_protective_stops_possible}, "
+                        f"orphans={sorted(self._orphan_protective_stop_ids)}) - a leftover "
+                        f"closePosition=true stop could trigger against a new position at the wrong "
+                        f"price. No new entry until every stale owned stop is confirmed gone.", YELLOW,
                     ))
                 return
 
@@ -4417,9 +4491,19 @@ class MartingaleManager:
         protective stop THIS bot placed, proven by its clientOrderId prefix.
         Everything else - including a user's own manually-placed STOP_MARKET
         on the same symbol/side - returns False and must never be adopted,
-        replaced, or cancelled by this bot."""
+        replaced, or cancelled by this bot.
+
+        2026-08 strict-ownership hardening: matches on
+        PROTECTIVE_STOP_CLIENT_ID_PREFIX + "-" (the exact separator
+        _new_protective_stop_client_order_id() always emits), not the bare
+        prefix. A bare-prefix match would also claim an unrelated order whose
+        id merely STARTS with the same letters (e.g. prefix "bv2ps" matching
+        a third-party "bv2psXYZ" or "bv2pshedge-1"), which this bot must
+        never cancel."""
         client_id = order.get("clientOrderId") or ""
-        return isinstance(client_id, str) and client_id.startswith(PROTECTIVE_STOP_CLIENT_ID_PREFIX)
+        return isinstance(client_id, str) and client_id.startswith(
+            f"{PROTECTIVE_STOP_CLIENT_ID_PREFIX}-"
+        )
 
     async def _cancel_protective_stop(self, reason: str) -> bool:
         """Cancels the currently-tracked protective stop order and reports
@@ -4556,6 +4640,27 @@ class MartingaleManager:
 
         stop_price = self._compute_protective_stop_price()
         if stop_price is None:
+            return
+
+        # 2026-08 startup-reconciliation safety: never place a protective
+        # stop while this process has not been able to enumerate Binance's
+        # open orders. A bot-owned stop could already be resting from a
+        # previous process (that is exactly what startup reconciliation
+        # exists to find), and placing blind would leave TWO
+        # closePosition=true STOP_MARKETs on the same position. Stay
+        # PROTECTION_PENDING (DCA blocked, client-side exits fully active)
+        # and let the sweep retry reconciliation first.
+        if self._protective_stop_reconcile_blocked:
+            self._mark_protection_pending(
+                f"open-order reconciliation has not succeeded yet - not placing a protective stop "
+                f"blind ({reason})"
+            )
+            if self._should_log_protection_pending():
+                print(color(
+                    f"{now_str()} [protective-stop] placement withheld - open orders could not be "
+                    f"enumerated, so a previously-placed bot-owned stop may still be resting; "
+                    f"retrying reconciliation before placing anything ({reason}).", YELLOW,
+                ))
             return
 
         # 2026-08 cooldown-scope fix (review finding 6): a placement attempt
@@ -4714,6 +4819,20 @@ class MartingaleManager:
             return
 
         if not p.protection_pending:
+            return
+
+        # (1b) reconciliation retry: while open orders could not be
+        # enumerated, placement is deliberately blocked (a bot-owned stop may
+        # be resting unseen). Retry the enumeration first - it is what
+        # unblocks everything else.
+        if self._protective_stop_reconcile_blocked:
+            if now - p.protection_last_retry_ts >= PROTECTIVE_STOP_RETRY_SEC:
+                p.protection_last_retry_ts = now
+                print(color(
+                    f"{now_str()} [protective-stop] retrying open-order reconciliation before any "
+                    f"placement (blocked since enumeration failed).", YELLOW,
+                ))
+                await reconcile_protective_stop_on_startup(self.client, self)
             return
 
         # (2) arm retry
@@ -7999,31 +8118,132 @@ async def reconcile_protective_stop_on_startup(client: RestClient, manager: Mart
     if DRY_RUN or not PROTECTIVE_STOP_ENABLED or MAX_TRADE_NET_LOSS_USDT <= 0:
         return
     p = manager.position
-    if p.status != "OPEN" or not p.avg_entry_price or p.total_qty <= 0 or p.side not in ("LONG", "SHORT"):
-        return
+    position_is_open = (
+        p.status == "OPEN" and p.avg_entry_price and p.total_qty > 0 and p.side in ("LONG", "SHORT")
+    )
 
     try:
         open_orders = await client.get_open_orders(manager.symbol)
     except Exception as e:  # noqa: BLE001 - a reconciliation fetch must never crash startup
+        # 2026-08 startup-reconciliation safety: block placement until a
+        # fetch actually succeeds, so nothing is ever placed on top of a
+        # stop this process could not see.
+        manager._protective_stop_reconcile_blocked = True
+        # 2026-08 stale-leftover safety: an enumeration failure means we
+        # cannot rule out a bot-owned stop left resting by a previous
+        # position. Assume the worst until proven otherwise - this blocks new
+        # entries so a stale stop can never be inherited by a new trade.
+        manager._stale_protective_stops_possible = True
         print(color(
             f"{now_str()} [protective-stop] *** HIGH SEVERITY *** startup reconciliation could not "
-            f"fetch open orders for {manager.symbol}: {e} - cannot confirm a protective stop is "
-            f"resting; leaving PROTECTION_PENDING (new DCA blocked; client-side risk exits remain "
-            f"active). Will be retried on the next entry/DCA fill.", RED,
+            f"fetch open orders for {manager.symbol}: {e} - cannot confirm whether a bot-owned "
+            f"protective stop is resting; NOT placing a new one blind and BLOCKING new entries "
+            f"until this is resolved. "
+            f"{'Position left PROTECTION_PENDING (new DCA blocked; client-side risk exits remain active). ' if position_is_open else ''}"
+            f"Reconciliation is retried by the protective-stop sweep.", RED,
         ))
-        p.protection_pending = True
-        p.protection_pending_reason = f"startup open-orders fetch failed: {e}"
+        if position_is_open:
+            manager._mark_protection_pending(f"startup open-orders fetch failed: {e}")
         return
 
-    close_side = "SELL" if p.side == "LONG" else "BUY"
+    # A successful enumeration is the only thing that unblocks placement.
+    manager._protective_stop_reconcile_blocked = False
+
     # 2026-08 protective-stop ownership fix (review finding 4): matching on
     # type/side/closePosition ALONE would also match a STOP_MARKET the user
     # placed manually, or one belonging to another system trading the same
     # account/symbol - and this function both ADOPTS and CANCELS what it
-    # matches. Ownership is now proven by the bot-assigned clientOrderId
-    # prefix (PROTECTIVE_STOP_CLIENT_ID_PREFIX), which nothing else can
+    # matches. Ownership is proven by the bot-assigned clientOrderId prefix
+    # (PROTECTIVE_STOP_CLIENT_ID_PREFIX + "-"), which nothing else can
     # accidentally carry. Foreign orders are counted for the log line and
     # then left completely untouched.
+    #
+    # 2026-08 FLAT-startup fix: this whole block used to be unreachable
+    # unless the position was OPEN, so a bot-owned protective stop left
+    # resting on Binance (process killed between the exchange closing the
+    # position and this bot cancelling the stop) SURVIVED the restart. Being
+    # closePosition=true it would then sit there and, once a brand-new
+    # position was opened, trigger against THAT position at a stop price
+    # computed for a completely different trade. When flat, every bot-owned
+    # protective stop is therefore cancelled outright (no side filter -
+    # side is only meaningful relative to an open position, and a leftover
+    # stop on either side is equally dangerous). Foreign orders are still
+    # never touched.
+    if not position_is_open:
+        owned_flat = [
+            o for o in open_orders
+            if o.get("type") == "STOP_MARKET"
+            and str(o.get("closePosition")).lower() == "true"
+            and manager._is_own_protective_stop(o)
+        ]
+        if not owned_flat:
+            # Enumeration succeeded and there is nothing bot-owned resting:
+            # this is the ONLY proof that no stale leftover exists. Combined
+            # with an empty orphan set, it re-opens the entry gate.
+            if not manager._orphan_protective_stop_ids:
+                if manager._stale_protective_stops_possible:
+                    print(color(
+                        f"{now_str()} [protective-stop] reconciliation confirms no bot-owned "
+                        f"protective stop is resting on {manager.symbol} while FLAT - stale-leftover "
+                        f"entry block cleared.", GREEN,
+                    ))
+                manager._stale_protective_stops_possible = False
+            return
+        print(color(
+            f"{now_str()} [protective-stop] startup reconciliation found {len(owned_flat)} "
+            f"bot-owned protective stop(s) resting on {manager.symbol} while FLAT - these are "
+            f"leftovers from a previous position and would trigger against a future position; "
+            f"cancelling all of them. New entries are blocked until they are confirmed gone.",
+            YELLOW,
+        ))
+        # Any known leftover keeps the entry gate shut until proven gone.
+        manager._stale_protective_stops_possible = True
+        unresolved = False
+        for o in owned_flat:
+            order_id = o.get("orderId")
+            if order_id is None:
+                continue
+            try:
+                await client.cancel_order(manager.symbol, order_id)
+                manager._orphan_protective_stop_ids.discard(order_id)
+                print(color(
+                    f"{now_str()} [protective-stop] cancelled leftover orderId={order_id} "
+                    f"clientOrderId={o.get('clientOrderId')} (flat at startup).", GRAY,
+                ))
+            except BinanceApiError as e:
+                if e.code == -2011:  # Binance proves it is already gone
+                    manager._orphan_protective_stop_ids.discard(order_id)
+                    print(color(
+                        f"{now_str()} [protective-stop] leftover orderId={order_id} already gone.",
+                        GRAY,
+                    ))
+                else:
+                    # 2026-08: retain + retry instead of silently passing -
+                    # an uncancelled leftover is exactly the hazard here.
+                    manager._orphan_protective_stop_ids.add(order_id)
+                    unresolved = True
+                    print(color(
+                        f"{now_str()} [protective-stop] cancel of leftover orderId={order_id} "
+                        f"FAILED ({e}) - handed to the orphan sweep for retry; entries stay "
+                        f"blocked.", YELLOW,
+                    ))
+            except Exception as e:  # noqa: BLE001 - must never crash startup
+                manager._orphan_protective_stop_ids.add(order_id)
+                unresolved = True
+                print(color(
+                    f"{now_str()} [protective-stop] cancel of leftover orderId={order_id} errored "
+                    f"({e}) - handed to the orphan sweep for retry; entries stay blocked.", YELLOW,
+                ))
+        # Only unblock once EVERY stale owned stop is confirmed gone.
+        if not unresolved and not manager._orphan_protective_stop_ids:
+            manager._stale_protective_stops_possible = False
+            print(color(
+                f"{now_str()} [protective-stop] all leftover protective stops confirmed cancelled - "
+                f"stale-leftover entry block cleared.", GREEN,
+            ))
+        return
+
+    close_side = "SELL" if p.side == "LONG" else "BUY"
     candidates = [
         o for o in open_orders
         if o.get("type") == "STOP_MARKET"
@@ -8036,9 +8256,63 @@ async def reconcile_protective_stop_on_startup(client: RestClient, manager: Mart
         print(color(
             f"{now_str()} [protective-stop] startup reconciliation ignored {len(foreign)} "
             f"STOP_MARKET order(s) on {manager.symbol} not owned by this bot (clientOrderId does "
-            f"not start with '{PROTECTIVE_STOP_CLIENT_ID_PREFIX}') - they are left untouched.",
+            f"not start with '{PROTECTIVE_STOP_CLIENT_ID_PREFIX}-') - they are left untouched.",
             GRAY,
         ))
+
+    # 2026-08 stale-leftover safety: while a FLAT cleanup is unresolved, a
+    # bot-owned stop found here CANNOT be assumed to belong to this position -
+    # it is far more likely the leftover we already know we failed to cancel,
+    # carrying a stop price computed for a completely different trade.
+    # Adopting it would silently hand this position the wrong protection. Only
+    # an order this process itself placed and is already tracking (same
+    # orderId) is trustworthy; everything else owned is cancelled as stale.
+    if manager._stale_protective_stops_possible and matching:
+        trusted = [o for o in matching if o.get("orderId") == p.protective_stop_order_id
+                   and p.protective_stop_order_id is not None]
+        stale = [o for o in matching if o not in trusted]
+        if stale:
+            print(color(
+                f"{now_str()} [protective-stop] refusing to ADOPT {len(stale)} bot-owned stop(s) "
+                f"discovered while stale-leftover cleanup is unresolved - they cannot be proven to "
+                f"belong to this position (their stop price was computed for a different trade); "
+                f"cancelling them instead.", YELLOW,
+            ))
+        unresolved = False
+        for o in stale:
+            stale_id = o.get("orderId")
+            if stale_id is None:
+                continue
+            try:
+                await client.cancel_order(manager.symbol, stale_id)
+                manager._orphan_protective_stop_ids.discard(stale_id)
+                print(color(
+                    f"{now_str()} [protective-stop] cancelled stale orderId={stale_id} "
+                    f"clientOrderId={o.get('clientOrderId')}.", GRAY,
+                ))
+            except BinanceApiError as e:
+                if e.code == -2011:
+                    manager._orphan_protective_stop_ids.discard(stale_id)
+                else:
+                    manager._orphan_protective_stop_ids.add(stale_id)
+                    unresolved = True
+                    print(color(
+                        f"{now_str()} [protective-stop] cancel of stale orderId={stale_id} FAILED "
+                        f"({e}) - handed to the orphan sweep for retry.", YELLOW,
+                    ))
+            except Exception as e:  # noqa: BLE001 - must never crash reconciliation
+                manager._orphan_protective_stop_ids.add(stale_id)
+                unresolved = True
+                print(color(
+                    f"{now_str()} [protective-stop] cancel of stale orderId={stale_id} errored "
+                    f"({e}) - handed to the orphan sweep for retry.", YELLOW,
+                ))
+        if not unresolved and not manager._orphan_protective_stop_ids:
+            manager._stale_protective_stops_possible = False
+        # Fall through with ONLY the trusted (already-tracked) order, if any.
+        # If none remains, the "no stop found" path below places a fresh one
+        # sized for THIS position - which is the correct protection.
+        matching = trusted
 
     if matching:
         chosen = next(
@@ -8065,10 +8339,29 @@ async def reconcile_protective_stop_on_startup(client: RestClient, manager: Mart
             ))
             for o in matching:
                 if o.get("orderId") != p.protective_stop_order_id:
+                    dup_id = o.get("orderId")
+                    if dup_id is None:
+                        continue
                     try:
-                        await client.cancel_order(manager.symbol, o["orderId"])
-                    except Exception:  # noqa: BLE001 - best-effort cleanup only
-                        pass
+                        await client.cancel_order(manager.symbol, dup_id)
+                    except BinanceApiError as e:
+                        if e.code != -2011:  # -2011 proves it is already gone
+                            # 2026-08: retain + retry instead of the previous
+                            # silent `pass`. A duplicate closePosition=true
+                            # stop left resting can close the position at the
+                            # wrong price, so it must not be forgotten.
+                            manager._orphan_protective_stop_ids.add(dup_id)
+                            print(color(
+                                f"{now_str()} [protective-stop] cancel of duplicate orderId="
+                                f"{dup_id} FAILED ({e}) - handed to the orphan sweep for retry.",
+                                YELLOW,
+                            ))
+                    except Exception as e:  # noqa: BLE001 - must never crash startup
+                        manager._orphan_protective_stop_ids.add(dup_id)
+                        print(color(
+                            f"{now_str()} [protective-stop] cancel of duplicate orderId={dup_id} "
+                            f"errored ({e}) - handed to the orphan sweep for retry.", YELLOW,
+                        ))
         else:
             print(color(
                 f"{now_str()} [protective-stop] startup reconciliation adopted existing "
