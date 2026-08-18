@@ -1,97 +1,236 @@
 #!/usr/bin/env python3
 """
 ================================================================================
- Websocket code - moved out of dca2.py
+ Martingale DCA Scalper - Binance USD-M Futures (Testnet / Demo)
+ Railway.app 24/7 deployment build
+ --- BRAIN V2: Probability/Confidence engine, regime detection, ATR-based
+     DCA, dynamic sizing, multi-signal Smart Exit, partial TP, trade
+     logging + offline dataset, composite reward learning, performance
+     stats export. ---
+================================================================================
 
- This file contains ONLY what was relocated out of dca2.py: the "MARKET DATA
- WEBSOCKET" section (market_data_consumer), the "USER DATA WEBSOCKET" section
- (userdata_consumer), and listen_key_keepalive (the REST keepalive ping that
- keeps userdata_consumer's listenKey alive - it has no websocket connection
- of its own, but it exists solely to service the user-data websocket, so it
- travels with it rather than staying behind as an orphaned one-off in
- dca2.py). All reconnect/backoff logic, watchdog timers, and error handling
- are byte-for-byte identical to the original - nothing was fixed or tuned.
+RUNNING 24/7 ON A REMOTE HOST (Railway or similar) - READ THIS
+----------------------------------------------------------
+A cloud host WILL restart this process sometimes - deploys, host
+maintenance, OOM, transient crashes. Two things were added specifically
+for that reality, beyond what a laptop-only bot needs:
 
- One structural note on the move (not a logic change): userdata_consumer
- calls initialize_sync(...) on every reconnect. initialize_sync stays in
- dca2.py (it's position-reconciliation/trading logic - PositionState,
- MartingaleManager.position, filters - not websocket code), so importing it
- here would create a circular import (dca2.py imports userdata_consumer from
- this file). Instead, this module declares `initialize_sync = None` as a
- placeholder; dca2.py injects the real function onto this module
- (`websocket.initialize_sync = initialize_sync`) immediately after import,
- before any of these coroutines are ever scheduled. Python resolves a
- function's free variables against its OWN module's globals at call time
- (not at definition time), so `await initialize_sync(...)` inside
- userdata_consumer below is unchanged and correctly reaches dca2.py's real
- function - no signature changes were needed anywhere.
+  - `reconcile_position_on_startup()` queries Binance's OWN position-risk
+    endpoint before the bot ever assumes it is flat. If a real position is
+    already open (e.g. the process restarted mid-trade), the bot rebuilds
+    its in-memory PositionState from that instead of blindly opening a
+    second, unrelated position on top of it.
+  - The bottom-level `run_forever()` supervisor catches any exception that
+    escapes `main()` (other than the deliberate `SystemExit` safety gates)
+    and restarts with backoff, logging what happened, instead of letting
+    one unhandled exception silently kill the whole container.
 
- Also self-contained otherwise: only stdlib + aiohttp + websockets, plus
- config.py (constants) and exchange.py (RestClient/BinanceApiError).
+Also: the online-learning brain and DCA step counters live in memory only
+(brain weights ARE persisted to brain_v2.pkl / GitHub - see BRAIN V2
+PERSISTENCE below - but candle/feature buffers are not, so there's a short
+re-warmup period for regime/ATR context after every restart).
 
- 2026-08 HIGH-FREQUENCY ORDERFLOW UPGRADE (additive - nothing existing was
- removed or retuned):
-   - The market feed now also subscribes to Binance Futures'
-     @depth<N>@100ms partial-book stream alongside the pre-existing
-     @bookTicker and @aggTrade streams (see market_data_consumer for the
-     per-route placement and why depth gets its own Live connection).
-   - OrderFlowTracker (below) maintains bounded collections.deque ring
-     buffers of that data and derives two live signals: the Orderbook
-     Imbalance Index over the top ORDERBOOK_DEPTH_LEVELS levels, and the
-     rolling AGG_TRADE_DELTA_WINDOW_SEC aggregated trade-volume delta.
-     Both buffers have a hard maxlen, so this layer's RAM footprint is a
-     fixed constant - the key requirement for a small Railway container.
-   - Every reconnect loop in this file now waits a FULL-JITTERED share of
-     its existing exponential backoff (_reconnect_delay), so the now
-     several independent sockets recover from a Railway network drop
-     without retrying in lockstep. The backoff growth curve and its
-     MAX_BACKOFF_SEC ceiling are unchanged.
-   - trading.py's MartingaleManager owns one OrderFlowTracker instance and
-     receives depth frames through its on_depth_update() method, mirroring
-     how it already receives bookTicker/aggTrade.
+SAFETY DEFAULTS (unchanged)
+----------------------------------------------------------
+  - TESTNET ONLY by default. Mainnet requires BOTH `USE_TESTNET=false` AND
+    `I_UNDERSTAND_THIS_IS_REAL_MONEY=yes` set explicitly, or the bot
+    refuses to start.
+  - DRY_RUN=true by default - orders are logged, never sent, until you
+    flip `DRY_RUN=false` yourself.
+  - LEVERAGE is clamped to MAX_ALLOWED_LEVERAGE (50) regardless of config.
+
+REQUIRED SETUP
+----------------------------------------------------------
+1. Binance Futures TESTNET API keys: https://testnet.binancefuture.com/
+2. Environment variables (set these in Railway's Variables tab, NOT in code):
+       BINANCE_API_KEY=...
+       BINANCE_API_SECRET=...
+       DRY_RUN=true
+       USE_TESTNET=true
+3. pip install -r requirements.txt
+4. python dca2.py
+
+WHAT'S NEW IN THIS BUILD (Brain V2)
+----------------------------------------------------------
+  Feature Builder    -> Brain V2 -> Confidence Engine -> Market Regime
+  Engine -> Risk Engine -> Entry Engine V2 -> Position Manager ->
+  Smart Exit V2 -> Trade Logger -> Training Dataset -> Online Learning
+
+  - Brain V2 no longer just predicts direction. It runs several small
+    online models in parallel and turns them into: tp_hit_probability,
+    success_probability, trend_confidence, noise_probability, risk_score,
+    confidence_score, hold_probability, exit_probability.
+  - A real (tick-built) 1-minute candle series now backs ATR, EMA stack,
+    volume delta, candle-shape and regime features - not just raw tick
+    price history.
+  - Market Regime Engine classifies STRONG_TREND / WEAK_TREND / SIDEWAYS /
+    HIGH_VOL / LOW_VOL and the rest of the stack adapts to it.
+  - Entry Engine V2 computes a single composite Entry Score from brain
+    confidence + trend confidence + volume confirmation + volatility +
+    momentum + regime + risk, and only trades above a configurable
+    threshold (ENTRY_SCORE_THRESHOLD) - fewer, higher quality trades.
+  - Smart Exit V2 requires several conditions to agree (confidence drop,
+    trend weakening, momentum reversal, volume confirmation, ATR move,
+    min-hold, regime) instead of a single flipped prediction.
+  - DCA spacing is now ATR-adaptive (bounded by DCA_MIN/MAX_DISTANCE_PCT)
+    instead of one fixed percentage.
+  - Position size scales with brain confidence / risk score / regime /
+    volatility, within SIZE_MIN_MULT..SIZE_MAX_MULT of the base size.
+  - Partial take-profit + breakeven-stop + optional ATR trailing stop on
+    the runner.
+  - Every closed trade is appended to a permanent JSONL + CSV dataset
+    (entry/exit features, MFE/MAE, confidence, regime, DCA count, exit
+    reason, fees, etc.) for future offline retraining.
+  - A composite reward (net pnl after fees, drawdown, efficiency vs MFE,
+    early-exit penalty) is what the brain actually learns from - not raw
+    PnL alone.
+  - Rolling performance statistics (win rate, profit factor, expectancy,
+    by-regime and by-side breakdowns, ...) are computed continuously and
+    exported to JSON/CSV.
+
+Everything from the previous build that already worked is preserved:
+Binance API integration, signed REST client, order execution, DRY_RUN /
+testnet / leverage safety gates, position recovery & reconciliation,
+Railway resilience (retry-with-backoff startup, run_forever supervisor),
+cooldown + min-hold guardrails, fee-aware profit gating, liquidation
+sanity checking, listenKey keepalive, and the self-healing sync loop.
 ================================================================================
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import csv
+import hashlib
+import hmac
 import json
+import math
+import os
+import pickle
 import random
 import sys
 import time
+import traceback
+import urllib.parse
 from collections import deque
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
-from typing import Deque, List, Optional, Sequence, Tuple
+from decimal import Decimal, ROUND_DOWN
+from typing import Deque, Dict, List, Optional, Tuple
 
 import aiohttp
+import numpy as np
 import websockets
+from sklearn.linear_model import SGDRegressor, SGDClassifier
+from websockets.exceptions import ConnectionClosed
+
+# ============================================================================
+# CONFIG (moved to config.py - imported here unchanged)
+# ============================================================================
 
 from config import (
-    WS_MARKET_BASE,
-    WS_USERDATA_BASE,
     SYMBOL,
     USE_TESTNET,
+    DRY_RUN,
+    I_UNDERSTAND_THIS_IS_REAL_MONEY,
+    LIVE_TRADING_CONFIRMATION,
+    API_KEY,
+    API_SECRET,
+    LEVERAGE,
+    MAX_ALLOWED_LEVERAGE,
+    MARGIN_TYPE,
+    INITIAL_ENTRY_USDT,
+    DCA_MULTIPLIER,
+    MAX_DCA_STEPS,
+    DCA_TRIGGER_PCT,
+    TAKE_PROFIT_PCT,
+    HARD_STOP_PCT,
+    DYNAMIC_TP_ENABLED,
+    TAKE_PROFIT_MAX_PCT,
+    TP_VOL_LOW,
+    TP_VOL_HIGH,
+    SIGNAL_LOOKBACK_TICKS,
+    SIGNAL_DEADBAND_PCT,
+    TRADE_COOLDOWN_SEC,
+    MIN_HOLD_SEC_BEFORE_EXIT,
+    MAX_DAILY_LOSS_USDT,
+    DAILY_PROFIT_TARGET_USDT,
+    TAKER_FEE_RATE,
+    MIN_NET_PROFIT_USDT,
+    LIQUIDATION_SANITY_MIN_RATIO,
+    LIQUIDATION_SANITY_MAX_RATIO,
+    LIQUIDATION_WARNING_BUFFER_PCT,
+    SYNC_PENDING_GRACE_SEC,
+    CANDLE_INTERVAL_SEC,
+    CANDLE_HISTORY,
+    ATR_PERIOD,
+    EMA_FAST,
+    EMA_MED,
+    EMA_SLOW,
+    ROLLING_RETURN_WINDOWS,
+    REGIME_ATR_HIGH_MULT,
+    REGIME_ATR_LOW_MULT,
+    REGIME_TREND_SLOPE_STRONG,
+    REGIME_TREND_SLOPE_WEAK,
+    REGIME_LOOKBACK_CANDLES,
+    N_FEATURES_V2,
+    BRAIN2_WARMUP_UPDATES,
+    LABEL_HORIZON_TICKS,
+    FEATURE_SHORT_LOOKBACK,
+    RECENT_TRADE_WINDOW,
+    TP_HIT_LOOKAHEAD_CANDLES,
+    ENTRY_SCORE_THRESHOLD,
+    ENTRY_WEIGHTS,
+    SMART_EXIT_ENABLED,
+    SMART_EXIT_MAX_LOSS_PCT,
+    SMART_EXIT_CONFIRM_TICKS,
+    SMART_EXIT_MIN_AGREE,
+    SMART_EXIT_CONFIDENCE_DROP,
+    SMART_EXIT_ATR_MOVE_MULT,
+    DCA_ATR_MULTIPLIER,
+    DCA_MIN_DISTANCE_PCT,
+    DCA_MAX_DISTANCE_PCT,
+    SIZE_MIN_MULT,
+    SIZE_MAX_MULT,
+    PARTIAL_TP_ENABLED,
+    PARTIAL_TP_FRACTION,
+    PARTIAL_TP_TRIGGER_RATIO,
+    BREAKEVEN_AFTER_PARTIAL,
+    TRAILING_STOP_ENABLED,
+    TRAILING_STOP_ATR_MULT,
+    TRADE_LOG_JSON_PATH,
+    TRADE_LOG_CSV_PATH,
+    STATS_JSON_PATH,
+    STATS_CSV_PATH,
+    STATS_EXPORT_INTERVAL_SEC,
+    FUNDING_OI_POLL_SEC,
+    BRAIN_LOCAL_PATH,
+    GITHUB_TOKEN,
+    GITHUB_REPO,
+    GITHUB_BRAIN_PATH,
+    GITHUB_BRANCH,
+    DCA_STATE_PATH,
+    GITHUB_DCA_STATE_PATH,
+    BRAIN_AUTO_PUSH_INTERVAL_SEC,
+    LISTEN_KEY_KEEPALIVE_SEC,
+    BALANCE_REFRESH_SEC,
+    POSITION_RISK_POLL_SEC,
+    MAX_BACKOFF_SEC,
     IDLE_DATA_TIMEOUT_SEC,
     USER_WS_IDLE_FALLBACK_SEC,
-    MAX_BACKOFF_SEC,
-    LISTEN_KEY_KEEPALIVE_SEC,
-    # --- 2026-08 high-frequency orderflow upgrade (appended config) -----
-    ORDERBOOK_STREAM_DEPTH,
-    ORDERBOOK_STREAM_SPEED_MS,
-    ORDERBOOK_DEPTH_LEVELS,
-    ORDERBOOK_BUFFER_MAXLEN,
-    AGG_TRADE_BUFFER_MAXLEN,
-    AGG_TRADE_DELTA_WINDOW_SEC,
-    ORDERFLOW_STALE_SEC,
-    WS_RECONNECT_JITTER_RATIO,
+    STARTUP_RETRY_ATTEMPTS,
+    STARTUP_RETRY_BASE_DELAY_SEC,
+    SUPERVISOR_RESTART_DELAY_SEC,
+    REST_BASE,
+    WS_MARKET_BASE,
+    WS_USERDATA_BASE,
 )
-from exchange import RestClient, BinanceApiError
 
-# ----------------------------------------------------------------------------
-# Private helpers (identical copies of dca2.py's now_str()/color()/color
-# constants - duplicated only to avoid a circular import; see module
-# docstring above).
-# ----------------------------------------------------------------------------
+
+# ============================================================================
+# UTIL
+# ============================================================================
 
 
 def now_str() -> str:
@@ -110,570 +249,721 @@ def color(text: str, code: str) -> str:
 GREEN, RED, YELLOW, CYAN, GRAY, BOLD, MAGENTA, BLUE = "32", "31", "33", "36", "90", "1", "35", "34"
 
 
-# initialize_sync is injected by dca2.py right after it imports from this
-# module - see module docstring above. Left as None until then.
-initialize_sync = None
+# round_step / clamp / safe_div / ema_series moved to indicators.py - imported below.
+from indicators import round_step, clamp, safe_div, ema_series
 
 
-# ============================================================================
-# HIGH-FREQUENCY ORDERFLOW DATA LAYER (2026-08 upgrade)
-# ============================================================================
-# Everything below this banner is ADDITIVE. The pre-existing bookTicker /
-# aggTrade handling, the reconnect/backoff/watchdog loop shape, and the
-# user-data stream are all preserved - this only adds a second, richer
-# source of microstructure state on top of them.
-#
-# Two derived signals are maintained, exactly as specified:
-#
-#   1. Orderbook Imbalance Index, from the @depth<N>@100ms partial-book
-#      stream:
-#          (top10_bid_vol - top10_ask_vol) / (top10_bid_vol + top10_ask_vol)
-#      Range [-1, +1]. Positive = bids dominate (buy-side pressure),
-#      negative = asks dominate (sell-side pressure).
-#
-#   2. Aggregated Trade Volume Delta over a rolling
-#      AGG_TRADE_DELTA_WINDOW_SEC (10s) window, from @aggTrade:
-#          market_buy_volume - market_sell_volume
-#      Binance marks each aggTrade with "m" (isBuyerMaker). m == True means
-#      the BUYER was the maker, i.e. the aggressor SOLD into the bid -> that
-#      quantity counts as market-SELL volume. m == False is the mirror case
-#      and counts as market-BUY volume. (This is the same convention the
-#      pre-existing CandleAggregator.on_trade() already uses in trading.py,
-#      kept identical here so the two never disagree.)
-#
-# RAM SAFETY (the Railway constraint): both buffers are collections.deque
-# instances with a hard `maxlen`. A deque at maxlen discards from the
-# opposite end on every append, so the memory this layer can ever occupy is
-# a fixed constant - ORDERBOOK_BUFFER_MAXLEN tuples + AGG_TRADE_BUFFER_MAXLEN
-# tuples - regardless of process uptime or market activity. Nothing here
-# grows without bound, and nothing is written to disk.
-# ============================================================================
+async def retry_with_backoff(coro_fn, *args, attempts: int = STARTUP_RETRY_ATTEMPTS,
+                              base_delay: float = STARTUP_RETRY_BASE_DELAY_SEC, label: str = "operation"):
+    """Retries a one-shot async setup call with exponential backoff. Used for
+    the REST calls that run ONCE before the self-reconnecting websocket loops
+    take over - those calls have no other retry path of their own, so a single
+    transient network blip during container startup would otherwise kill the
+    whole process before it ever gets going.
 
-
-class OrderFlowTracker:
-    """In-memory rolling microstructure state for ONE symbol.
-
-    Deliberately synchronous, allocation-light and exception-free: it is
-    called from the websocket read loop on every single depth/trade message
-    (up to ~10 depth updates/second plus every aggregated trade), so a slow
-    or throwing implementation here would stall the socket itself. Every
-    public reader returns a safe neutral value rather than raising when no
-    data has arrived yet or the feed has gone stale.
-    """
-
-    def __init__(
-        self,
-        depth_levels: int = ORDERBOOK_DEPTH_LEVELS,
-        window_sec: float = AGG_TRADE_DELTA_WINDOW_SEC,
-        depth_maxlen: int = ORDERBOOK_BUFFER_MAXLEN,
-        trade_maxlen: int = AGG_TRADE_BUFFER_MAXLEN,
-        stale_sec: float = ORDERFLOW_STALE_SEC,
-    ) -> None:
-        self.depth_levels = max(int(depth_levels), 1)
-        self.window_sec = max(float(window_sec), 1.0)
-        self.stale_sec = max(float(stale_sec), 0.5)
-
-        # Bounded ring buffers - see the RAM SAFETY note above.
-        # _depth_buf entries: (ts, imbalance, bid_vol, ask_vol)
-        self._depth_buf: Deque[Tuple[float, float, float, float]] = deque(maxlen=int(depth_maxlen))
-        # _trade_buf entries: (ts, signed_qty)  [+ = market buy, - = market sell]
-        self._trade_buf: Deque[Tuple[float, float]] = deque(maxlen=int(trade_maxlen))
-
-        self.last_imbalance: float = 0.0
-        self.last_bid_volume: float = 0.0
-        self.last_ask_volume: float = 0.0
-        self.last_depth_ts: float = 0.0
-        self.last_trade_ts: float = 0.0
-        self.depth_updates: int = 0
-        self.trade_updates: int = 0
-
-    # -- ingestion (called from the websocket read loop) ---------------------
-
-    @staticmethod
-    def _side_volume(levels: Optional[Sequence], depth_levels: int) -> float:
-        """Sum the quantity column of the top `depth_levels` price levels.
-
-        Binance sends each level as a two-element ["price", "qty"] array of
-        STRINGS. A malformed/short level is skipped rather than raising -
-        one bad frame must never kill the market socket."""
-        if not levels:
-            return 0.0
-        total = 0.0
-        for level in list(levels)[:depth_levels]:
-            try:
-                total += float(level[1])
-            except (TypeError, ValueError, IndexError):
-                continue
-        return total
-
-    def on_depth(
-        self, bids: Optional[Sequence], asks: Optional[Sequence], ts: Optional[float] = None,
-    ) -> float:
-        """Ingest one partial-book snapshot and return the fresh imbalance.
-
-        Returns the previous imbalance unchanged when the frame carries no
-        usable volume on either side (an empty book side is not evidence of
-        a real -1/+1 imbalance)."""
-        now = time.time() if ts is None else ts
-        bid_vol = self._side_volume(bids, self.depth_levels)
-        ask_vol = self._side_volume(asks, self.depth_levels)
-        total = bid_vol + ask_vol
-        if total <= 0:
-            return self.last_imbalance
-        imbalance = (bid_vol - ask_vol) / total
-        # Numerically this is already in [-1, 1]; clamped anyway so a freak
-        # float artifact can never leak out of the data layer.
-        if imbalance > 1.0:
-            imbalance = 1.0
-        elif imbalance < -1.0:
-            imbalance = -1.0
-
-        self.last_imbalance = imbalance
-        self.last_bid_volume = bid_vol
-        self.last_ask_volume = ask_vol
-        self.last_depth_ts = now
-        self.depth_updates += 1
-        self._depth_buf.append((now, imbalance, bid_vol, ask_vol))
-        return imbalance
-
-    def on_agg_trade(self, qty: float, is_buyer_maker: bool, ts: Optional[float] = None) -> None:
-        """Ingest one aggregated trade. See the buyer-maker convention note
-        in this module's ORDERFLOW banner above."""
+    2026-08 HTTP 418/429 cooldown-survival fix (this function only - the
+    exponential-backoff retry behavior for every OTHER kind of failure,
+    including the final SystemExit after `attempts` genuine failures, is
+    completely unchanged): an HTTP 418 (IP ban) or 429 (rate limit) is not
+    a normal transient failure - retrying it on the usual exponential
+    schedule only digs the ban deeper, and a long ban (Binance 418 bans
+    escalate well past the handful of minutes this retry loop's own
+    backoff would cover) previously exhausted all `attempts` and raised
+    SystemExit, which the outer run_forever() supervisor would then
+    restart from scratch - losing the in-memory cooldown and immediately
+    contacting Binance again on the new process, worsening the ban. Now:
+    a 418/429 (detected via BinanceApiError.status, the same exception
+    type/attribute every existing caller already uses) makes this loop
+    wait out the SAME shared RestClient cooldown _arm_cooldown() already
+    armed (see exchange.py) - however long that takes - and then retries
+    WITHOUT consuming one of the `attempts` budget, so the process stays
+    alive and simply waits instead of restart-looping."""
+    last_exc = None
+    attempt = 1
+    while attempt <= attempts:
         try:
-            quantity = float(qty)
-        except (TypeError, ValueError):
-            return
-        if quantity <= 0:
-            return
-        now = time.time() if ts is None else ts
-        self.last_trade_ts = now
-        self.trade_updates += 1
-        # is_buyer_maker True  -> aggressor was the SELLER -> market sell
-        # is_buyer_maker False -> aggressor was the BUYER  -> market buy
-        self._trade_buf.append((now, -quantity if is_buyer_maker else quantity))
-
-    # -- readers -------------------------------------------------------------
-
-    def depth_is_fresh(self, now: Optional[float] = None) -> bool:
-        if self.last_depth_ts <= 0:
-            return False
-        ref = time.time() if now is None else now
-        return (ref - self.last_depth_ts) <= self.stale_sec
-
-    def trades_are_fresh(self, now: Optional[float] = None) -> bool:
-        if self.last_trade_ts <= 0:
-            return False
-        ref = time.time() if now is None else now
-        return (ref - self.last_trade_ts) <= max(self.stale_sec, self.window_sec)
-
-    def imbalance(self, now: Optional[float] = None) -> float:
-        """Latest Orderbook Imbalance Index, or 0.0 (neutral) if the depth
-        feed has gone stale. Callers that must distinguish "genuinely
-        balanced book" from "no data" use depth_is_fresh()/snapshot()."""
-        return self.last_imbalance if self.depth_is_fresh(now) else 0.0
-
-    def average_imbalance(self, seconds: float = 1.0, now: Optional[float] = None) -> float:
-        """Mean imbalance across the last `seconds` of depth samples - a
-        smoothed reading for decisions that should not hinge on a single
-        100ms frame. Falls back to the latest value when the window holds
-        no samples."""
-        ref = time.time() if now is None else now
-        cutoff = ref - max(seconds, 0.0)
-        values = [imb for (ts, imb, _b, _a) in self._depth_buf if ts >= cutoff]
-        if not values:
-            return self.imbalance(ref)
-        return sum(values) / len(values)
-
-    def _prune_trades(self, now: float) -> None:
-        """Drop trades that have fallen out of the rolling delta window.
-
-        Memory hygiene only, NOT the correctness mechanism: deque.popleft()
-        is O(1) and the live feed appends in timestamp order, so this keeps
-        the working set well under the deque's own maxlen ceiling on a fast
-        tape. It deliberately stops at the first in-window entry rather than
-        scanning the whole buffer - every reader below applies its own
-        explicit cutoff filter, so an out-of-order timestamp (a replayed or
-        back-dated trade) can never be counted just because it happened to
-        land behind a newer one and escape this loop."""
-        cutoff = now - self.window_sec
-        buf = self._trade_buf
-        while buf and buf[0][0] < cutoff:
-            buf.popleft()
-
-    def trade_delta(self, window_sec: Optional[float] = None, now: Optional[float] = None) -> float:
-        """Signed aggregated trade volume delta (market buys - market sells)
-        over the rolling window. 0.0 when no trade has printed in it.
-
-        The cutoff is applied explicitly here (never inferred from the
-        buffer's order) so the window is exact regardless of arrival order -
-        see _prune_trades' note."""
-        ref = time.time() if now is None else now
-        self._prune_trades(ref)
-        span = self.window_sec if window_sec is None else max(float(window_sec), 0.0)
-        cutoff = ref - span
-        return sum(q for (ts, q) in self._trade_buf if ts >= cutoff)
-
-    def trade_volumes(self, now: Optional[float] = None) -> Tuple[float, float]:
-        """(market_buy_volume, market_sell_volume) over the rolling window."""
-        ref = time.time() if now is None else now
-        self._prune_trades(ref)
-        cutoff = ref - self.window_sec
-        buy = sum(q for (ts, q) in self._trade_buf if ts >= cutoff and q > 0)
-        sell = -sum(q for (ts, q) in self._trade_buf if ts >= cutoff and q < 0)
-        return buy, sell
-
-    def snapshot(self, now: Optional[float] = None) -> dict:
-        """One flat dict of everything the strategy/risk layers consume.
-
-        `data_available` is the single field callers should gate on: it is
-        True only when BOTH the depth feed and the trade feed have produced
-        a reading recently enough to be trusted. A dead stream therefore
-        reads as "no data" (which the entry guard treats as a block), never
-        as a neutral, permissive 0.0."""
-        ref = time.time() if now is None else now
-        depth_fresh = self.depth_is_fresh(ref)
-        trades_fresh = self.trades_are_fresh(ref)
-        buy_vol, sell_vol = self.trade_volumes(ref)
-        return {
-            "imbalance": self.last_imbalance if depth_fresh else 0.0,
-            "imbalance_avg_1s": self.average_imbalance(1.0, ref) if depth_fresh else 0.0,
-            "bid_volume": self.last_bid_volume,
-            "ask_volume": self.last_ask_volume,
-            "trade_delta": self.trade_delta(now=ref),
-            "buy_volume": buy_vol,
-            "sell_volume": sell_vol,
-            "depth_fresh": depth_fresh,
-            "trades_fresh": trades_fresh,
-            "data_available": depth_fresh and trades_fresh,
-            "depth_age_sec": (ref - self.last_depth_ts) if self.last_depth_ts else None,
-            "trade_age_sec": (ref - self.last_trade_ts) if self.last_trade_ts else None,
-            "depth_updates": self.depth_updates,
-            "trade_updates": self.trade_updates,
-            "window_sec": self.window_sec,
-            "depth_levels": self.depth_levels,
-        }
-
-
-def depth_stream_name(symbol: str = SYMBOL) -> str:
-    """`btcusdt@depth20@100ms` - Binance's partial book depth stream at the
-    configured level count and update speed."""
-    return f"{symbol.lower()}@depth{ORDERBOOK_STREAM_DEPTH}@{ORDERBOOK_STREAM_SPEED_MS}ms"
-
-
-def _reconnect_delay(backoff: float) -> float:
-    """Full-jitter backoff for the market/user reconnect loops.
-
-    The exponential ceiling (MAX_BACKOFF_SEC) is unchanged - this only
-    randomizes WITHIN the current backoff so the now-three independent
-    market connections, which typically drop together when a Railway
-    container loses its network, do not all retry on the same tick and
-    hammer Binance in lockstep after every blip."""
-    ratio = min(max(WS_RECONNECT_JITTER_RATIO, 0.0), 1.0)
-    if ratio <= 0:
-        return backoff
-    return backoff * (1.0 - ratio) + random.random() * backoff * ratio
+            return await coro_fn(*args)
+        except BinanceApiError as e:
+            if e.status in (418, 429):
+                client = getattr(coro_fn, "__self__", None)
+                if not isinstance(client, RestClient):
+                    client = next((a for a in args if isinstance(a, RestClient)), None)
+                if client is not None:
+                    remaining = client.cooldown_remaining()
+                    if remaining > 0:
+                        expiry_utc = client.cooldown_expiry_utc_str()
+                        print(color(
+                            f"[startup] {label} hit HTTP {e.status} (rate limit/IP ban) - waiting for "
+                            f"the shared cooldown to clear ({expiry_utc}, {remaining:.0f}s) before "
+                            f"retrying. This wait does NOT count against the {attempts}-attempt budget "
+                            f"and will not exit the process.", RED,
+                        ))
+                        await asyncio.sleep(remaining + random.uniform(0.1, 3.0))
+                        print(color(f"[startup] {label} resuming after cooldown.", GREEN))
+                        continue  # retry now, same `attempt` count - not consumed
+            last_exc = e
+            delay = base_delay * (2 ** (attempt - 1))
+            print(color(
+                f"[startup] {label} failed (attempt {attempt}/{attempts}): {e}. "
+                f"Retrying in {delay:.1f}s ...", YELLOW
+            ))
+            if attempt < attempts:
+                await asyncio.sleep(delay)
+            attempt += 1
+        except Exception as e:  # noqa: BLE001 - deliberately broad, this is a retry wrapper
+            last_exc = e
+            delay = base_delay * (2 ** (attempt - 1))
+            print(color(
+                f"[startup] {label} failed (attempt {attempt}/{attempts}): {e}. "
+                f"Retrying in {delay:.1f}s ...", YELLOW
+            ))
+            if attempt < attempts:
+                await asyncio.sleep(delay)
+            attempt += 1
+    raise SystemExit(f"[startup] {label} failed after {attempts} attempts: {last_exc}")
 
 
 # ============================================================================
-# MARKET DATA WEBSOCKET (bookTicker for price/spread/book-imbalance,
-# aggTrade for buy/sell volume delta)
-#
-# 2026-08 WS route-migration fix: Binance permanently decommissioned the
-# legacy combined-stream URL (wss://fstream.binance.com/stream?streams=...)
-# for LIVE on 2026-04-23, splitting traffic into three dedicated base
-# paths - /public (high-frequency public data, incl. bookTicker),
-# /market (regular market data, incl. aggTrade), and /private (user-data/
-# listenKey streams). An unrouted connection (the old bare host) now only
-# ever receives /public data - so on Live, the pre-fix code above silently
-# kept receiving bookTicker (still /public) while aggTrade (now /market)
-# went dark. That alone would not explain the DCA/resync bug (aggTrade only
-# feeds an informational buy/sell-volume signal, not order-fill state), but
-# it is a real, independently confirmed data-loss bug fixed here as part of
-# the same migration. See module docstring / Binance's own migration notice:
-# https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/websocket-market-streams/Important-WebSocket-Change-Notice
-#
-# Testnet (stream.binancefuture.com) is NOT covered by that notice, so its
-# combined-stream behavior is left completely untouched below - only the
-# Live host now splits into two independent connections, one per route
-# category, each with its own identical reconnect/backoff/watchdog logic
-# (byte-for-byte the same loop shape as the original single connection,
-# just parameterized per stream instead of duplicated by hand).
+# SAFETY GATE CHECKS
 # ============================================================================
 
 
-def _handles(stream_suffix: str, kind: str) -> bool:
-    """Whether a connection opened for `stream_suffix` should process a
-    message of type `kind`.
-
-    Preserves the original three-value contract exactly - "bookTicker",
-    "aggTrade" and "both" behave as they always did - and only adds "depth"
-    as a fourth routed category. "both" (the Testnet combined connection)
-    means every category, as it always has."""
-    return stream_suffix == "both" or stream_suffix == kind
-
-
-async def _run_single_market_stream(
-    manager: MartingaleManager, url: str, label: str, stream_suffix: str,
-) -> None:
-    """One reconnecting websocket connection for exactly one market stream
-    category (either the legacy combined connection, or - post migration -
-    one of the two Live /public / /market connections). Reconnect/backoff/
-    watchdog shape is unchanged from the original single-connection
-    version; only parameterized by URL/label so it can be reused for each
-    routed connection without duplicating the loop by hand."""
-    backoff = 1.0
-    while True:
-        try:
-            print(color(f"[market-ws:{label}] connecting to {url} ...", GRAY))
-            async with websockets.connect(
-                url, ping_interval=15, ping_timeout=10, max_queue=2048
-            ) as ws:
-                print(color(f"[market-ws:{label}] connected.", GREEN))
-                backoff = 1.0
-                last_msg_time = time.time()
-
-                async def watchdog(ws_ref) -> None:
-                    while True:
-                        await asyncio.sleep(5)
-                        if time.time() - last_msg_time > IDLE_DATA_TIMEOUT_SEC:
-                            print(color(f"[market-ws:{label}] idle timeout, forcing reconnect ...", RED))
-                            await ws_ref.close()
-                            return
-
-                wd_task = asyncio.create_task(watchdog(ws))
-                try:
-                    async for raw in ws:
-                        last_msg_time = time.time()
-                        try:
-                            msg = json.loads(raw)
-                            stream = msg.get("stream", "")
-                            data = msg.get("data", {})
-                            if stream.endswith("@bookTicker") and _handles(stream_suffix, "bookTicker"):
-                                bid = float(data.get("b", 0) or 0)
-                                ask = float(data.get("a", 0) or 0)
-                                bid_qty = float(data.get("B", 0) or 0)
-                                ask_qty = float(data.get("A", 0) or 0)
-                                if bid and ask:
-                                    manager.on_book_ticker(bid, ask, bid_qty, ask_qty)
-                                    await manager.on_price_tick()
-                            elif stream.endswith("@aggTrade") and _handles(stream_suffix, "aggTrade"):
-                                qty = float(data.get("q", 0) or 0)
-                                is_buyer_maker = bool(data.get("m", False))
-                                if qty > 0:
-                                    manager.on_agg_trade(qty, is_buyer_maker)
-                            elif "@depth" in stream and _handles(stream_suffix, "depth"):
-                                # 2026-08 high-frequency orderflow upgrade.
-                                # Binance USD-M partial book depth frames use
-                                # the short keys "b"/"a" (each a list of
-                                # ["price", "qty"] string pairs). The long
-                                # "bids"/"asks" spelling is accepted too so a
-                                # payload-shape difference between the Live and
-                                # Testnet hosts can never silently blind this
-                                # feed. Never awaits: depth arrives every 100ms
-                                # and must not drive the (much heavier)
-                                # on_price_tick() decision cycle - bookTicker
-                                # remains the sole tick driver, exactly as
-                                # before this upgrade.
-                                bids = data.get("b")
-                                if bids is None:
-                                    bids = data.get("bids")
-                                asks = data.get("a")
-                                if asks is None:
-                                    asks = data.get("asks")
-                                if bids is not None or asks is not None:
-                                    manager.on_depth_update(bids, asks)
-                        except Exception as e:  # noqa: BLE001 - one bad tick must not kill the socket
-                            print(color(f"[market-ws:{label}] error processing message, skipping: {e}", RED))
-                finally:
-                    wd_task.cancel()
-        except Exception as e:  # noqa: BLE001 - this IS the reconnect boundary; anything
-            # that escapes the websocket context should trigger backoff+retry, not a crash.
-            print(color(f"[market-ws:{label}] disconnected ({e}), retrying in {backoff:.1f}s ...", RED))
-        # 2026-08 dynamic auto-reconnection: the exponential ceiling below is
-        # unchanged; only the wait is now full-jittered (see _reconnect_delay)
-        # so the independent market connections do not resynchronize into a
-        # lockstep retry storm after a Railway network drop takes them all
-        # down at the same instant.
-        await asyncio.sleep(_reconnect_delay(backoff))
-        backoff = min(backoff * 2, MAX_BACKOFF_SEC)
-
-
-async def market_data_consumer(manager: MartingaleManager) -> None:
-    """Entry point unchanged (still a single coroutine scheduled once from
-    dca2.py's asyncio.gather()) - internally routes to either the original
-    legacy combined connection (Testnet, unaffected by the migration) or
-    independent routed connections (Live: /public for the high-frequency
-    bookTicker and partial-book depth feeds, /market for aggTrade), each
-    reconnecting/backing off independently so one stream category dropping
-    never silently starves the others.
-
-    2026-08 high-frequency orderflow upgrade: the @depth<N>@100ms partial
-    book stream is added alongside the pre-existing bookTicker/aggTrade
-    streams. It is given its OWN Live connection rather than being folded
-    into the existing bookTicker one, for two reasons:
-      - it is by far the highest-message-rate stream here (10 frames/sec,
-        each carrying 2x20 price levels), so isolating it means a depth
-        backlog can never delay a bookTicker tick - and bookTicker is what
-        drives the actual trading decision cycle (on_price_tick);
-      - it keeps each existing connection's URL, label and reconnect
-        lifecycle byte-for-byte what it was, so the migration-era routing
-        behavior this file already fixed is not disturbed at all.
-    Depth is a /public (high-frequency) category stream, same as
-    bookTicker. Testnet keeps its single legacy combined connection and
-    simply carries the extra stream in the same subscription list - with
-    aggTrade kept last so the combined URL's existing shape is unchanged
-    apart from the added stream."""
-    depth_stream = depth_stream_name(SYMBOL)
-    if USE_TESTNET:
-        book_stream = (
-            f"{SYMBOL.lower()}@bookTicker/{depth_stream}/{SYMBOL.lower()}@aggTrade"
+def enforce_safety_gates() -> None:
+    if not API_KEY or not API_SECRET:
+        raise SystemExit(
+            "Missing BINANCE_API_KEY / BINANCE_API_SECRET environment variables. "
+            "Set them in Railway's Variables tab (never hardcode them in this "
+            "file, especially once it's pushed to GitHub). Generate TESTNET "
+            "keys at https://testnet.binancefuture.com/ if you don't have them."
         )
-        url = f"{WS_MARKET_BASE}/stream?streams={book_stream}"
-        await _run_single_market_stream(manager, url, label="testnet-combined", stream_suffix="both")
+
+    if not USE_TESTNET and not I_UNDERSTAND_THIS_IS_REAL_MONEY:
+        raise SystemExit(
+            "REFUSING TO START: USE_TESTNET=false (mainnet) but "
+            "I_UNDERSTAND_THIS_IS_REAL_MONEY is not set to 'yes'. "
+            "This is a deliberate safety gate."
+        )
+
+    # 2026-08 Live Trading Safety Guard: a second, independent gate -
+    # both this AND I_UNDERSTAND_THIS_IS_REAL_MONEY above must be set
+    # before mainnet trading is allowed to start. Deliberately checked
+    # separately (not merged into the check above) so it prints its own
+    # explicit message and can be reasoned about/audited independently.
+    if not USE_TESTNET and not LIVE_TRADING_CONFIRMATION:
+        print(color(
+            "[LIVE SAFETY]\n"
+            "Mainnet trading blocked.\n"
+            "Set LIVE_TRADING_CONFIRMATION=true to enable live orders.",
+            RED,
+        ))
+        raise SystemExit(
+            "REFUSING TO START: USE_TESTNET=false (mainnet) but "
+            "LIVE_TRADING_CONFIRMATION is not set to 'true'. "
+            "This is a deliberate safety gate, separate from "
+            "I_UNDERSTAND_THIS_IS_REAL_MONEY, to prevent accidental "
+            "real-money execution."
+        )
+
+    global LEVERAGE
+    if LEVERAGE > MAX_ALLOWED_LEVERAGE:
+        print(color(
+            f"[safety] Requested LEVERAGE={LEVERAGE} exceeds MAX_ALLOWED_LEVERAGE="
+            f"{MAX_ALLOWED_LEVERAGE}. Clamping to {MAX_ALLOWED_LEVERAGE}.", YELLOW
+        ))
+        LEVERAGE = MAX_ALLOWED_LEVERAGE
+
+    if MAX_DCA_STEPS > 5:
+        raise SystemExit("MAX_DCA_STEPS > 5 is not supported by this script's safety design.")
+
+
+# ============================================================================
+# REST CLIENT (signed requests, HMAC-SHA256) - moved to exchange.py, imported
+# below. SYMBOL FILTERS moved with it (fetch_symbol_filters calls
+# client.get_exchange_info(), so it travels with the REST client).
+# ============================================================================
+
+from exchange import BinanceApiError, RestClient, SymbolFilters, fetch_symbol_filters
+
+
+# ============================================================================
+# TRADING EXECUTION - moved to trading.py, imported below. Candle,
+# CandleAggregator, RegimeReading, MarketRegimeEngine, FeatureBuilderV2,
+# RiskEngine, ConfidenceReading, ConfidenceEngine, EntryDecision,
+# EntryEngineV2, RewardCalculator, TradeLogger, PerformanceStats,
+# PositionState, MartingaleManager, and initialize_sync all moved together -
+# see trading.py's module docstring for why they couldn't be split apart.
+# ============================================================================
+
+from trading import (
+    Candle,
+    CandleAggregator,
+    RegimeReading,
+    MarketRegimeEngine,
+    FeatureBuilderV2,
+    RiskEngine,
+    ConfidenceReading,
+    ConfidenceEngine,
+    EntryDecision,
+    EntryEngineV2,
+    RewardCalculator,
+    TradeLogger,
+    PerformanceStats,
+    PositionState,
+    MartingaleManager,
+    sanitize_recovered_dca_step,
+    initialize_sync,
+    reconcile_protective_stop_on_startup,
+    BrainV2,
+)
+
+
+
+
+# ============================================================================
+# MARKET DATA WEBSOCKET / USER DATA WEBSOCKET - moved to websocket.py,
+# imported below. initialize_sync is injected onto the websocket module so
+# userdata_consumer's reconnect-time call to it keeps working unchanged -
+# see websocket.py's module docstring for why.
+# ============================================================================
+
+from websocket import market_data_consumer, userdata_consumer, listen_key_keepalive
+import websocket as _websocket_module
+_websocket_module.initialize_sync = initialize_sync
+
+
+# ============================================================================
+# PERSISTENT DCA STATE RECOVERY
+# ============================================================================
+# Startup-only helper: restores a persisted DCA/position state snapshot
+# (local disk first, then GitHub via the SAME shared github_sync client
+# already used for brain.pkl / the CSV logs / the trade-sync cursor - see
+# DCA_STATE_PATH / GITHUB_DCA_STATE_PATH in config.py) so an in-progress
+# DCA position isn't silently forgotten across an ephemeral restart before
+# initialize_sync() ever runs its own exchange-vs-local reconciliation.
+#
+# This does NOT change any trading/DCA/entry/exit logic - it only rebuilds
+# manager.position from whatever was last persisted (if anything), the same
+# way manager.position already starts as a fresh PositionState() by
+# default. initialize_sync() (unchanged, in trading.py) still runs
+# immediately afterward and is still the sole authority that reconciles
+# this rebuilt local state against what Binance actually reports.
+# Fails soft everywhere - any missing/corrupt/incompatible snapshot simply
+# leaves manager.position as its current (flat) default.
+
+
+async def load_dca_state(manager: MartingaleManager) -> None:
+    if DRY_RUN:
+        return  # nothing real to recover DRY_RUN state against
+
+    data: Optional[dict] = None
+    try:
+        if os.path.exists(DCA_STATE_PATH):
+            with open(DCA_STATE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+    except Exception as e:  # noqa: BLE001 - corrupt/missing local file must not block startup
+        print(color(f"[dca-state] could not read local {DCA_STATE_PATH}: {e}", YELLOW))
+        data = None
+
+    if data is None:
+        try:
+            raw = await manager.github_sync.download(path=GITHUB_DCA_STATE_PATH)
+            if raw:
+                data = json.loads(raw.decode("utf-8"))
+        except Exception as e:  # noqa: BLE001 - restore must never block startup
+            print(color(f"[dca-state] could not check GitHub for DCA state: {e}", YELLOW))
+            data = None
+
+    if not data:
+        print(color(
+            "[dca-state] no local or remote DCA state snapshot found - starting flat.", GRAY
+        ))
         return
 
-    public_url = f"{WS_MARKET_BASE}/public/stream?streams={SYMBOL.lower()}@bookTicker"
-    depth_url = f"{WS_MARKET_BASE}/public/stream?streams={depth_stream}"
-    market_url = f"{WS_MARKET_BASE}/market/stream?streams={SYMBOL.lower()}@aggTrade"
-    await asyncio.gather(
-        _run_single_market_stream(manager, public_url, label="public/bookTicker", stream_suffix="bookTicker"),
-        _run_single_market_stream(manager, depth_url, label="public/depth", stream_suffix="depth"),
-        _run_single_market_stream(manager, market_url, label="market/aggTrade", stream_suffix="aggTrade"),
-    )
+    try:
+        valid_fields = {f.name for f in fields(PositionState)}
+        # entry_features is an Optional[np.ndarray] on PositionState - not
+        # something this JSON-based snapshot format carries; leave it at
+        # its dataclass default (None) rather than guessing a reconstruction.
+        #
+        # 2026-08 snapshot key-name fix (this remap only - every other
+        # field in the snapshot already matches its PositionState name
+        # exactly and is untouched): _dca_state_snapshot() (trading.py)
+        # writes "qty" for PositionState.total_qty and "dca_history" for
+        # PositionState.entries. Neither name matches a PositionState
+        # field, so the old `k in valid_fields` filter below silently
+        # dropped both - every restored OPEN snapshot got total_qty=0.0
+        # and entries=[] (the PositionState() defaults) while side/
+        # avg_entry_price/dca_step/opened_at all restored correctly,
+        # producing an OPEN position with real economics but zero
+        # quantity (see the Live incident this fix addresses: qty=0.000000
+        # net=+0.0000, Max Hold read that as "no meaningful loss"). Remap
+        # explicitly before filtering, and derive original_qty from the
+        # same qty value when the snapshot doesn't carry a separate
+        # original_qty (older/current snapshot format never has - only a
+        # possible FUTURE snapshot format might, so an existing
+        # original_qty key is still honored if present, for forward
+        # compatibility).
+        remapped = dict(data)
+        if "qty" in remapped:
+            remapped.setdefault("total_qty", remapped["qty"])
+            remapped.setdefault("original_qty", remapped["qty"])
+        if "dca_history" in remapped:
+            remapped.setdefault("entries", remapped["dca_history"])
+
+        kwargs = {k: v for k, v in remapped.items() if k in valid_fields and k != "entry_features"}
+        if isinstance(kwargs.get("entries"), list):
+            kwargs["entries"] = [tuple(e) for e in kwargs["entries"]]
+
+        candidate = PositionState(**kwargs)
+
+        candidate.dca_step, recovered_step_safety_reason = sanitize_recovered_dca_step(
+            candidate.dca_step
+        )
+        if recovered_step_safety_reason is not None:
+            candidate.dca_blocked = True
+            candidate.dca_block_reason = recovered_step_safety_reason
+
+        if candidate.status == "FLAT" and (
+            candidate.side is not None
+            or candidate.total_qty != 0
+            or candidate.avg_entry_price not in (None, 0)
+            or candidate.dca_step != 0
+            or candidate.entries
+        ):
+            print(color(
+                "[dca-state] REJECTED snapshot claiming FLAT with non-flat economics - "
+                "starting from a clean FLAT state.", RED,
+            ))
+            return
+
+        # 2026-08 invalid-OPEN-snapshot validation (this block only): an
+        # OPEN/DCA_PENDING/CLOSING snapshot is only trusted if its core
+        # economics are actually self-consistent - valid side, positive
+        # average entry, positive quantity, and (when entries/dca_history
+        # was present in the raw snapshot at all) a non-empty, qty-
+        # consistent fill history. A snapshot that fails this check is
+        # exactly the shape of the pre-fix qty=0 bug (or any other
+        # corruption) reappearing under a different cause - falling back
+        # to a fresh FLAT PositionState() is always safe (initialize_sync()
+        # runs immediately after this and is the sole authority that can
+        # rebuild a genuinely-open position from the exchange itself),
+        # whereas trusting a broken OPEN snapshot is not.
+        if candidate.status in ("OPEN", "DCA_PENDING", "CLOSING"):
+            entries_sum = sum(qty for _, qty in candidate.entries) if candidate.entries else 0.0
+            qty_tolerance = max(manager.filters.step_size, 1e-9) * 2
+            entries_consistent = (
+                not candidate.entries
+                or (
+                    all(float(price) > 0 and float(qty) > 0 for price, qty in candidate.entries)
+                    and abs(entries_sum - candidate.total_qty) <= qty_tolerance
+                )
+            )
+            valid_open = (
+                candidate.side in ("LONG", "SHORT")
+                and candidate.avg_entry_price is not None
+                and candidate.avg_entry_price > 0
+                and candidate.total_qty > 0
+                and entries_consistent
+            )
+            if not valid_open:
+                print(color(
+                    f"[dca-state] REJECTED snapshot claiming status={candidate.status} with invalid "
+                    f"economics (side={candidate.side}, avg_entry={candidate.avg_entry_price}, "
+                    f"total_qty={candidate.total_qty}, entries={len(candidate.entries)}) - "
+                    f"starting flat instead of restoring an unmanageable position. "
+                    f"initialize_sync() will rebuild from the exchange if a position genuinely exists.",
+                    RED,
+                ))
+                return
+
+        manager.position = candidate
+        print(color(
+            f"[dca-state] restored DCA state snapshot (status={manager.position.status}, "
+            f"side={manager.position.side}, dca_step={manager.position.dca_step}, "
+            f"total_qty={manager.position.total_qty}).", MAGENTA,
+        ))
+    except Exception as e:  # noqa: BLE001 - corrupted/incompatible snapshot must not crash startup
+        print(color(f"[dca-state] failed to apply DCA state snapshot ({e}), starting flat.", YELLOW))
 
 
-# ============================================================================
-# USER DATA WEBSOCKET
-# ============================================================================
-
-
-async def userdata_consumer(client: RestClient, manager: MartingaleManager) -> None:
-    backoff = 1.0
+async def balance_refresher(client: RestClient, manager: MartingaleManager) -> None:
     while True:
         # 2026-08 HTTP 418/429 cooldown-survival fix (this check only -
-        # everything else in this reconnect loop is unchanged): skip this
-        # reconnect attempt entirely and silently while the shared REST
-        # cooldown (armed by RestClient._request() on a 418/429 - see
-        # exchange.py) is active, instead of calling create_listen_key()
-        # (which would just raise locally anyway) and logging a fresh
-        # "[user-ws] disconnected (...), retrying in Xs" error every
-        # reconnect attempt. wait_out_cooldown_silently() sleeps out the
-        # cooldown (plus jitter, so this loop doesn't resume on the exact
-        # same tick as every other poller) and logs the one-time resume
-        # line itself - nothing else needs to log here. `continue` re-enters
-        # the loop, which re-checks the cooldown before ever calling
-        # create_listen_key() again.
+        # the actual balance refresh below is unchanged): skip this
+        # iteration's REST call entirely and silently while the shared
+        # cooldown is active, instead of calling get_balance() (which
+        # would just raise locally anyway - see RestClient._request())
+        # and logging an error every BALANCE_REFRESH_SEC. wait_out_cooldown_silently()
+        # sleeps until the cooldown clears (plus jitter, to avoid every
+        # poller resuming on the same tick) and logs the one-time resume
+        # line itself - nothing else needs to log here.
         if client.is_cooldown_active():
             await client.wait_out_cooldown_silently()
             continue
         try:
-            listen_key = await client.create_listen_key()
-            # 2026-08 WS route-migration fix: the legacy raw path
-            # (wss://fstream.binance.com/ws/<listenKey>) was permanently
-            # decommissioned for LIVE user-data streams on 2026-04-23 -
-            # private channels stop pushing data on an unrouted connection
-            # even though the TCP/WebSocket handshake itself still
-            # succeeds (see module docstring). That is the confirmed
-            # primary root cause of the missed-fill/over-DCA bug this
-            # patch fixes: the process looked "connected" while
-            # ORDER_TRADE_UPDATE/ACCOUNT_UPDATE simply never arrived.
-            # Routed through /private with an explicit events= subscription
-            # on Live; Testnet (not covered by that migration notice) keeps
-            # the exact original URL/behavior, unchanged.
-            if USE_TESTNET:
-                url = f"{WS_USERDATA_BASE}/ws/{listen_key}"
-            else:
-                # 2026-08 Algo-Service migration: ALGO_UPDATE carries the
-                # lifecycle of conditional (algo) orders - the exchange-native
-                # protective stop now lives there, so it MUST be subscribed
-                # alongside the existing two events or the stop's
-                # NEW/TRIGGERED/FINISHED transitions would never arrive.
-                url = (
-                    f"{WS_USERDATA_BASE}/private/ws?listenKey={listen_key}"
-                    f"&events=ORDER_TRADE_UPDATE/ACCOUNT_UPDATE/ALGO_UPDATE"
-                )
-            # Never log the full URL (it embeds the listenKey) - keep the
-            # existing generic "connecting ..." message exactly as before.
-            print(color("[user-ws] connecting ...", GRAY))
-            async with websockets.connect(url, ping_interval=15, ping_timeout=10) as ws:
-                print(color("[user-ws] connected - listening for order fills.", GREEN))
-                backoff = 1.0
-                last_msg_time = time.time()
-
-                await initialize_sync(client, manager, context="user-ws reconnect")
-
-                async def watchdog(ws_ref) -> None:
-                    while True:
-                        await asyncio.sleep(30)
-                        if time.time() - last_msg_time > USER_WS_IDLE_FALLBACK_SEC:
-                            print(color(
-                                "[user-ws] no messages AND no pong for an extended "
-                                "period, forcing reconnect as a last resort ...", RED
-                            ))
-                            await ws_ref.close()
-                            return
-
-                wd_task = asyncio.create_task(watchdog(ws))
-                try:
-                    async for raw in ws:
-                        last_msg_time = time.time()
-                        try:
-                            event = json.loads(raw)
-                            etype = event.get("e")
-                            if etype == "ORDER_TRADE_UPDATE":
-                                # A successful websocket handshake is not proof
-                                # that the private stream is delivering fills.
-                                # Emit one credential-free receipt marker for
-                                # completed orders so a controlled Live check can
-                                # distinguish the real user-stream path from a
-                                # later REST reconciliation.  Never include the
-                                # listenKey or the API key in this diagnostic.
-                                order = event.get("o", {})
-                                if str(order.get("X", "")).upper() == "FILLED":
-                                    print(color(
-                                        f"{now_str()} [user-ws] ORDER_TRADE_UPDATE received "
-                                        f"order_id={order.get('i')} status=FILLED",
-                                        CYAN,
-                                    ))
-                                await manager.handle_order_update(event)
-                            elif etype == "ALGO_UPDATE":
-                                # 2026-08 Algo-Service migration: lifecycle of
-                                # the exchange-native protective stop. One
-                                # credential-free receipt marker (no listenKey,
-                                # no API key), then the same conservative
-                                # handler the REST recovery path uses.
-                                print(color(
-                                    f"{now_str()} [user-ws] ALGO_UPDATE received", CYAN,
-                                ))
-                                await manager.handle_algo_update(event)
-                            elif etype == "ACCOUNT_UPDATE":
-                                for b in event.get("a", {}).get("B", []):
-                                    if b.get("a") == "USDT":
-                                        manager.available_balance = float(b.get("cw") or b.get("wb") or 0)
-                        except Exception as e:  # noqa: BLE001 - one bad message must not kill the socket
-                            print(color(f"[user-ws] error processing message, skipping: {e}", RED))
-                finally:
-                    wd_task.cancel()
-        except Exception as e:  # noqa: BLE001 - reconnect boundary.
-            print(color(f"[user-ws] disconnected ({e}), retrying in {backoff:.1f}s ...", RED))
-        # 2026-08 dynamic auto-reconnection: same full-jitter treatment as
-        # the market streams above (ceiling and growth curve unchanged).
-        await asyncio.sleep(_reconnect_delay(backoff))
-        backoff = min(backoff * 2, MAX_BACKOFF_SEC)
-
-
-async def listen_key_keepalive(client: RestClient) -> None:
-    while True:
-        await asyncio.sleep(LISTEN_KEY_KEEPALIVE_SEC)
-        # 2026-08 HTTP 418/429 cooldown-survival fix - same pattern as the
-        # REST pollers in dca2.py: skip silently and wait out the shared
-        # cooldown instead of calling through (which would just raise
-        # locally anyway) and logging an error every LISTEN_KEY_KEEPALIVE_SEC.
-        if client.is_cooldown_active():
-            await client.wait_out_cooldown_silently()
-            continue
-        try:
-            await client.keepalive_listen_key()
-            print(color(f"{now_str()} [user-ws] listenKey keepalive sent.", GRAY))
+            balances = await client.get_balance()
+            usdt = next((b for b in balances if b["asset"] == "USDT"), None)
+            if usdt:
+                real_balance = float(usdt["availableBalance"])
+                manager.available_balance = min(real_balance, 50.0)
         except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-            print(color(f"[user-ws] listenKey keepalive failed: {e}", RED))
+            print(color(f"[balance] refresh failed: {e}", RED))
+        await asyncio.sleep(BALANCE_REFRESH_SEC)
+
+
+async def funding_oi_poller(client: RestClient, manager: MartingaleManager) -> None:
+    """Best-effort funding rate + open interest refresh. Both are optional
+    feature inputs - any failure just leaves the last known value (or None)
+    in place and never interrupts trading."""
+    while True:
+        # 2026-08 HTTP 418/429 cooldown-survival fix - same pattern as
+        # balance_refresher() above.
+        if client.is_cooldown_active():
+            await client.wait_out_cooldown_silently()
+            continue
+        try:
+            premium = await client.get_premium_index(SYMBOL)
+            manager.funding_rate = float(premium.get("lastFundingRate", 0) or 0)
+        except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+            print(color(f"[funding] premiumIndex poll failed (continuing without it): {e}", YELLOW))
+        try:
+            oi = await client.get_open_interest(SYMBOL)
+            manager.open_interest = float(oi.get("openInterest", 0) or 0)
+        except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+            print(color(f"[funding] openInterest poll failed (continuing without it): {e}", YELLOW))
+        await asyncio.sleep(FUNDING_OI_POLL_SEC)
+
+
+async def position_risk_poller(client: RestClient, manager: MartingaleManager) -> None:
+    """Polls Binance's OWN authoritative liquidation price, sanity-checks it
+    against mark price, and re-syncs local state on every cycle. Unchanged
+    from the previous build."""
+    while True:
+        if DRY_RUN:
+            await asyncio.sleep(POSITION_RISK_POLL_SEC)
+            continue
+        # 2026-08 HTTP 418/429 cooldown-survival fix - same pattern as
+        # balance_refresher() above. Deliberately does NOT call
+        # initialize_sync() either while skipping - it would just hit the
+        # same cooldown-blocked get_position_risk() path if rows were None,
+        # and this poller always supplies its own freshly-fetched `rows`.
+        if client.is_cooldown_active():
+            await client.wait_out_cooldown_silently()
+            continue
+        try:
+            rows = await client.get_position_risk(SYMBOL)
+            row = next((r for r in rows if float(r.get("positionAmt", 0)) != 0), None)
+            if row:
+                mark_price = float(row.get("markPrice", 0) or 0)
+                raw_liq = float(row.get("liquidationPrice", 0) or 0)
+
+                plausible = (
+                    mark_price > 0
+                    and raw_liq > 0
+                    and LIQUIDATION_SANITY_MIN_RATIO <= (raw_liq / mark_price) <= LIQUIDATION_SANITY_MAX_RATIO
+                )
+
+                if plausible:
+                    manager.liquidation_price = raw_liq
+                    print(color(
+                        f"{now_str()} [risk] LIQUIDATION PRICE: {manager.liquidation_price:.2f}  "
+                        f"(mark={mark_price:.2f}, positionAmt={row.get('positionAmt')})", MAGENTA
+                    ))
+                    distance_pct = (
+                        abs(mark_price - manager.liquidation_price) / mark_price if mark_price else 1.0
+                    )
+                    if distance_pct <= LIQUIDATION_WARNING_BUFFER_PCT and manager.position.status == "OPEN":
+                        print(color(
+                            f"{now_str()} [risk] mark price is within "
+                            f"{distance_pct*100:.2f}% of liquidation ({manager.liquidation_price:.2f}) - "
+                            f"triggering emergency close before the exchange forces it.", RED,
+                        ))
+                        await manager.close_position(
+                            f"liquidation buffer breached: mark {mark_price:.2f} within "
+                            f"{distance_pct*100:.2f}% of liq {manager.liquidation_price:.2f}",
+                            emergency=True, exit_reason_tag="liquidation_buffer",
+                        )
+                else:
+                    manager.liquidation_price = None
+                    if raw_liq > 0 and mark_price > 0:
+                        print(color(
+                            f"{now_str()} [risk] ignoring implausible liquidationPrice="
+                            f"{raw_liq:.2f} vs mark={mark_price:.2f} (outside "
+                            f"{LIQUIDATION_SANITY_MIN_RATIO}x-{LIQUIDATION_SANITY_MAX_RATIO}x band) - "
+                            f"likely a Cross-margin/testnet over-collateralization artifact, not a real risk reading.",
+                            YELLOW,
+                        ))
+            else:
+                manager.liquidation_price = None
+            await initialize_sync(client, manager, context="periodic poll", rows=rows)
+        except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+            print(color(f"[risk] position risk poll failed: {e}", RED))
+        await asyncio.sleep(POSITION_RISK_POLL_SEC)
+
+
+async def brain_sync_loop(manager: MartingaleManager, interval_sec: int = BRAIN_AUTO_PUSH_INTERVAL_SEC) -> None:
+    while True:
+        await asyncio.sleep(interval_sec)
+        if manager._brain_dirty:
+            await manager.persist_brain(reason="periodic interval")
+
+
+async def stats_export_loop(manager: MartingaleManager, interval_sec: int = STATS_EXPORT_INTERVAL_SEC) -> None:
+    """Periodically (re)computes performance statistics from the permanent
+    trade log and exports them to JSON/CSV - independent of trade activity,
+    so a quiet stretch still gets a fresh (unchanged-count) export."""
+    while True:
+        await asyncio.sleep(interval_sec)
+        try:
+            manager.perf_stats.export()
+        except Exception as e:  # noqa: BLE001 - stats must never crash the trading loop
+            print(color(f"[stats] export loop error: {e}", YELLOW))
+            continue
+        try:
+            await manager.sync_performance_stats_to_github()
+        except Exception as e:  # noqa: BLE001 - GitHub sync must never crash the trading loop
+            print(color(f"[csv-sync] performance_stats.csv sync error: {e}", YELLOW))
+
+
+async def status_loop(manager: MartingaleManager, interval_sec: int = 20) -> None:
+    while True:
+        await asyncio.sleep(interval_sec)
+        p = manager.position
+        liq = f"{manager.liquidation_price:.2f}" if manager.liquidation_price else "n/a"
+        brain_state = "READY" if manager.brain.is_ready() else (
+            f"WARMUP {manager.brain.update_count}/{BRAIN2_WARMUP_UPDATES}"
+        )
+        conf = manager.last_confidence
+        regime = manager.last_regime
+        sync_state = (
+            f"{time.time() - manager.last_brain_sync_ts:.0f}s ago"
+            if manager.last_brain_sync_ts else "never"
+        )
+        print(color(
+            f"{now_str()} [status] price={manager.current_price}  status={p.status}  "
+            f"side={p.side}  dca_step={p.dca_step}/{MAX_DCA_STEPS}  "
+            f"avg_entry={p.avg_entry_price}  qty={p.total_qty}  "
+            f"liq_price={liq}  balance={manager.available_balance:.2f} USDT  "
+            f"trades={manager.trade_count}  session_pnl={manager.realized_pnl_total:+.4f}  "
+            f"regime={regime.regime}  atr%={regime.atr_pct*100:.3f}  "
+            f"brain=[{brain_state}]  confidence={conf.confidence_score:.2f}  "
+            f"success_p={conf.success_probability:.2f}  tp_hit_p={conf.tp_hit_probability:.2f}  "
+            f"risk={conf.risk_score:.2f}  "
+            f"github_sync=[{'on' if manager.github_sync.enabled else 'off'}, last_push={sync_state}]",
+            BOLD,
+        ))
+
+
+# ============================================================================
+# ENTRYPOINT
+# ============================================================================
+
+
+async def main() -> None:
+    enforce_safety_gates()
+
+    print(color("=" * 78, CYAN))
+    print(color(" Martingale DCA Scalper - Binance USD-M Futures  [Brain V2]", BOLD))
+    print(color(f" Symbol: {SYMBOL}   Testnet: {USE_TESTNET}   Dry-run: {DRY_RUN}", GRAY))
+    if USE_TESTNET:
+        print(color(
+            " *** TESTNET market data is thin/illiquid - bid/ask (and therefore "
+            "momentum/ATR/candle formation) can stay flat for extended real-world "
+            "stretches. That is expected testnet behavior, not a pipeline bug. "
+            "Set USE_TESTNET=false for live mainnet market data. ***", YELLOW,
+        ))
+    print(color(
+        f" Leverage: {LEVERAGE}x (cap {MAX_ALLOWED_LEVERAGE}x)   Margin: {MARGIN_TYPE}   "
+        f"Initial entry: ${INITIAL_ENTRY_USDT}   DCA x{DCA_MULTIPLIER}   Max steps: {MAX_DCA_STEPS}",
+        GRAY,
+    ))
+    print(color(
+        f" DCA trigger (floor): -{DCA_TRIGGER_PCT*100:.2f}%   Take-profit (floor): +{TAKE_PROFIT_PCT*100:.2f}%   "
+        f"Hard stop: -{HARD_STOP_PCT*100:.2f}%   Entry score threshold: {ENTRY_SCORE_THRESHOLD:.2f}", GRAY,
+    ))
+    print(color(
+        f" ATR-DCA mult={DCA_ATR_MULTIPLIER}  DCA range=[{DCA_MIN_DISTANCE_PCT*100:.2f}%, {DCA_MAX_DISTANCE_PCT*100:.2f}%]  "
+        f"Size mult range=[{SIZE_MIN_MULT}, {SIZE_MAX_MULT}]  Partial TP={PARTIAL_TP_ENABLED} "
+        f"({PARTIAL_TP_FRACTION*100:.0f}% @ {PARTIAL_TP_TRIGGER_RATIO*100:.0f}% of TP)  "
+        f"Trailing stop={TRAILING_STOP_ENABLED}", GRAY,
+    ))
+    print(color(
+        f" Daily fee-net locks (UTC): profit=+${DAILY_PROFIT_TARGET_USDT:.2f}  "
+        f"loss=-${MAX_DAILY_LOSS_USDT:.2f}  (new entries only)", GRAY,
+    ))
+    if DRY_RUN:
+        print(color(" *** DRY RUN MODE - no real orders will be sent ***", YELLOW))
+    if not USE_TESTNET:
+        print(color(" *** LIVE MAINNET MODE - REAL MONEY AT RISK ***", RED))
+
+    print(color("=" * 78, CYAN))
+
+    client = RestClient(API_KEY, API_SECRET, REST_BASE)
+    manager: Optional[MartingaleManager] = None
+
+    try:
+        await retry_with_backoff(client.start, label="REST client startup / time sync")
+
+        filters = await retry_with_backoff(
+            fetch_symbol_filters, client, SYMBOL, label="fetch_symbol_filters"
+        )
+        print(color(
+            f"[setup] {SYMBOL} filters: tick={filters.tick_size} step={filters.step_size} "
+            f"minQty={filters.min_qty} minNotional={filters.min_notional}", GRAY
+        ))
+
+        # Cross 40x / DCA sizing sanity check: confirm every one of the 5
+        # martingale steps clears the exchange's minimum notional up front.
+        # Step 0 (the initial entry) is ALWAYS exactly INITIAL_ENTRY_USDT -
+        # it is never confidence/risk/regime-scaled - so it's checked as-is.
+        # DCA steps 1-5 CAN be scaled down by confidence sizing at runtime
+        # (see confidence_size_multiplier / notional_for_step), so those are
+        # checked at their worst case (SIZE_MIN_MULT) to make sure a
+        # low-confidence DCA add can never silently fall below min_notional.
+        for step in range(MAX_DCA_STEPS + 1):
+            margin = INITIAL_ENTRY_USDT if step == 0 else INITIAL_ENTRY_USDT * (DCA_MULTIPLIER ** step)
+            if step > 0:
+                margin *= SIZE_MIN_MULT  # worst case (smallest allowed) DCA add size
+            step_notional = margin * LEVERAGE
+            ok = step_notional >= filters.min_notional
+            label = "INITIAL" if step == 0 else f"DCA #{step} (min size)"
+            print(color(
+                f"[setup]   {label}: margin=${margin:.2f} notional=${step_notional:.2f} "
+                f"{'OK' if ok else 'BELOW MIN_NOTIONAL - will be skipped at runtime!'}",
+                GRAY if ok else RED,
+            ))
+
+        if not DRY_RUN:
+            await retry_with_backoff(client.set_leverage, SYMBOL, LEVERAGE, label="set_leverage")
+            await retry_with_backoff(client.set_margin_type, SYMBOL, MARGIN_TYPE, label="set_margin_type")
+            print(color(f"[setup] leverage set to {LEVERAGE}x, margin type {MARGIN_TYPE}", GRAY))
+        else:
+            print(color(
+                f"[setup] [DRY RUN] would set leverage={LEVERAGE}x, marginType={MARGIN_TYPE}", GRAY
+            ))
+
+        manager = MartingaleManager(client, SYMBOL, filters, LEVERAGE)
+
+        if not DRY_RUN:
+            balances = await retry_with_backoff(client.get_balance, label="get_balance")
+            usdt = next((b for b in balances if b["asset"] == "USDT"), None)
+            manager.available_balance = float(usdt["availableBalance"]) if usdt else 0.0
+        else:
+            manager.available_balance = 500.0
+        print(color(f"[setup] available balance: {manager.available_balance:.2f} USDT", GRAY))
+
+        book = await retry_with_backoff(client.get_book_ticker, SYMBOL, label="get_book_ticker")
+        bid, ask = float(book["bidPrice"]), float(book["askPrice"])
+        manager.on_book_ticker(bid, ask, float(book.get("bidQty", 0) or 0), float(book.get("askQty", 0) or 0))
+        print(color(f"[setup] current price: {manager.current_price:.2f}", GRAY))
+
+        try:
+            premium = await client.get_premium_index(SYMBOL)
+            manager.funding_rate = float(premium.get("lastFundingRate", 0) or 0)
+            print(color(f"[setup] current funding rate: {manager.funding_rate:.6f}", GRAY))
+        except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+            print(color(f"[setup] could not fetch initial funding rate (continuing without it): {e}", YELLOW))
+
+        # Persistent Adaptive Learning: local brain snapshot -> GitHub -> fresh model.
+        await manager.load_or_init_brain()
+        # Same GitHub session as the brain - restores trades_log.jsonl /
+        # trades_log.csv / performance_stats.csv so trade history and
+        # analytics survive an ephemeral restart exactly like brain.pkl does.
+        await manager.restore_csv_logs_from_github()
+        # 2026-08 restart-safe accounting fix: rebuilds trade_count /
+        # realized_pnl_total / daily_realized_pnl (and
+        # _daily_loss_tracker_date) from the trades_log JSONL just restored
+        # above - MUST run after restore_csv_logs_from_github() (so it
+        # reads restored history, not an empty fresh file) and before
+        # load_trade_sync_cursor()/reconcile_trade_history_from_exchange()
+        # ever gets a chance to run, so anything reconciliation goes on to
+        # recover afterward is simply added on top of this base (see that
+        # method's own docstring in trading.py for why this can never
+        # double-count). Pure bookkeeping restore only - does not touch
+        # DCA/position state, Brain V2, or any trading decision.
+        await manager.restore_runtime_accounting_from_history()
+        # Restores the trade-log reconciliation cursor (see
+        # reconcile_trade_history_from_exchange) the same way, so a Railway
+        # restart resumes catching up on Binance trade history from where
+        # it left off instead of re-scanning (or missing) anything.
+        await manager.load_trade_sync_cursor()
+        # Restores a persisted DCA/position state snapshot (local disk, then
+        # GitHub - see DCA_STATE_PATH / GITHUB_DCA_STATE_PATH) so an
+        # in-progress DCA position survives an ephemeral restart instead of
+        # starting flat. MUST run before initialize_sync() below, so that
+        # initialize_sync()'s own exchange-vs-local reconciliation (unchanged)
+        # has this rebuilt local state to compare against.
+        await load_dca_state(manager)
+
+        await initialize_sync(client, manager, context="startup")
+        # item 6: exchange-native protective stop reconciliation - MUST run
+        # after initialize_sync() (needs the authoritative post-reconcile
+        # side/qty/avg_entry_price) and before the long-running consumer
+        # loops start, so an OPEN position recovered above is never left
+        # believing it's protected without this process actually having
+        # confirmed that against Binance's own open orders.
+        await reconcile_protective_stop_on_startup(client, manager)
+
+        await asyncio.gather(
+            market_data_consumer(manager),
+            userdata_consumer(client, manager),
+            listen_key_keepalive(client),
+            balance_refresher(client, manager),
+            position_risk_poller(client, manager),
+            funding_oi_poller(client, manager),
+            status_loop(manager),
+            brain_sync_loop(manager),
+            stats_export_loop(manager),
+        )
+    finally:
+        if manager is not None:
+            try:
+                await manager.persist_brain(reason="shutdown")
+            except Exception as e:  # noqa: BLE001 - shutdown persistence is best-effort only
+                print(color(f"[brain] final persist on shutdown failed: {e}", YELLOW))
+            try:
+                manager.perf_stats.export()
+            except Exception:  # noqa: BLE001 - never block shutdown on stats export
+                pass
+            try:
+                await manager.sync_trade_log_to_github()
+            except Exception:  # noqa: BLE001 - never block shutdown on sync
+                pass
+            try:
+                await manager.sync_performance_stats_to_github()
+            except Exception:  # noqa: BLE001 - never block shutdown on sync
+                pass
+            try:
+                await manager.github_sync.close()
+            except Exception:  # noqa: BLE001 - never block shutdown on sync cleanup
+                pass
+        await client.close()
+
+
+async def run_forever() -> None:
+    """Outer supervisor for 24/7 cloud hosting. `main()` already reconnects
+    its own websockets forever - this layer exists only to catch whatever
+    exception manages to escape THAT and restart the whole bot instead of
+    letting the container exit and stay down. `SystemExit` from the
+    deliberate safety gates is NOT caught here - those are supposed to stop
+    the bot, not trigger an infinite restart loop."""
+    while True:
+        try:
+            await main()
+        except SystemExit as e:
+            print(color(f"[supervisor] stopping: {e}", RED))
+            raise
+        except Exception:  # noqa: BLE001 - top-level catch-all is intentional here
+            print(color("[supervisor] main() crashed with an unhandled exception:", RED))
+            traceback.print_exc()
+            print(color(
+                f"[supervisor] restarting in {SUPERVISOR_RESTART_DELAY_SEC}s ...", YELLOW
+            ))
+            await asyncio.sleep(SUPERVISOR_RESTART_DELAY_SEC)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(run_forever())
+    except (KeyboardInterrupt, SystemExit):
+        print(color("\n[shutdown] stopped.", YELLOW))
