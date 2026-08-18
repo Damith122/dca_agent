@@ -1306,6 +1306,17 @@ def trade_log_close_time_str(ts: Optional[float] = None) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+# 2026-08 Brain-contamination fix: exit reasons that are caused by local
+# infrastructure/API failure rather than by anything the entry signal got
+# right or wrong. Trades closed for these reasons are still recorded in full
+# (PnL, fees, CSV/JSONL, daily counters, trade_count) - only Brain TRAINING
+# and the recent-win-rate feature skip them, so an outage cannot teach the
+# entry model that a normal setup fails. See _on_close_filled().
+INFRASTRUCTURE_ONLY_EXIT_REASONS = frozenset({
+    "protection_unavailable",   # protective stop could not be armed (e.g. the
+                                # Binance Algo-Service migration -4120 outage)
+})
+
 TRADE_LOG_FIELDS = [
     "close_time", "symbol", "side", "entry_price", "exit_price", "qty",
     "invested_notional", "gross_pnl_usdt", "fees_usdt", "net_pnl_usdt",
@@ -1724,22 +1735,36 @@ class PositionState:
     trade_loss_budget_trigger_pnl: Optional[float] = None
 
     # -- exchange-native protective stop (item 6) ------------------------------
-    # A resting STOP_MARKET closePosition=true order on Binance itself,
-    # placed immediately after each confirmed entry/DCA fill so the
-    # position is protected even if this process cannot reach the REST API
-    # (see the HTTP 418 IP-ban incident this addresses). None whenever no
+    # A resting CONDITIONAL STOP_MARKET closePosition=true ALGO order on
+    # Binance itself, placed immediately after each confirmed entry/DCA fill
+    # so the position is protected even if this process cannot reach the REST
+    # API (see the HTTP 418 IP-ban incident this addresses). None whenever no
     # such order is currently believed to be resting on the exchange.
-    protective_stop_order_id: Optional[int] = None
+    #
+    # 2026-08 Algo-Service migration: this is an `algoId` from
+    # POST /fapi/v1/algoOrder, NOT an `orderId` from /fapi/v1/order. Binance
+    # rejects conditional types on the plain order endpoint with -4120, which
+    # is exactly what broke the three live validation trades.
+    protective_stop_algo_id: Optional[int] = None
     protective_stop_price: Optional[float] = None
     # 2026-08 protective-stop ownership fix (review finding 4): the
-    # newClientOrderId this bot assigned to the currently-tracked protective
-    # stop (always prefixed PROTECTIVE_STOP_CLIENT_ID_PREFIX). Reconciliation
-    # uses the PREFIX to decide ownership (never adopting/cancelling a manual
-    # or third-party stop) and this exact value to recognise THIS position's
-    # own order. Persisted so ownership survives a restart.
-    protective_stop_client_order_id: Optional[str] = None
+    # clientAlgoId this bot assigned to the currently-tracked protective stop
+    # (always prefixed PROTECTIVE_STOP_CLIENT_ID_PREFIX). Reconciliation uses
+    # the PREFIX to decide ownership (never adopting/cancelling a manual or
+    # third-party algo order) and this exact value to recognise THIS
+    # position's own order. Persisted so ownership survives a restart.
+    protective_stop_client_algo_id: Optional[str] = None
+    # 2026-08 Algo-Service migration: an algo order does NOT itself produce
+    # ORDER_TRADE_UPDATE. When it triggers, Binance creates a CHILD MARKET
+    # order and reports its id as `actualOrderId`; THAT child is what fills
+    # and emits ORDER_TRADE_UPDATE. Recorded here (and persisted) as soon as
+    # it is learned - from an ALGO_UPDATE TRIGGERING/TRIGGERED/FINISHED event
+    # or a REST query - and registered in _order_index under role
+    # "protective_stop" so the child fill routes through the SAME
+    # _on_close_filled() bookkeeping every other close uses, exactly once.
+    protective_stop_actual_order_id: Optional[int] = None
     # 2026-08 cancel-confirmation fix (review finding 5): set when a cancel
-    # attempt for protective_stop_order_id failed for an indeterminate reason
+    # attempt for protective_stop_algo_id failed for an indeterminate reason
     # (network/timeout/REST cooldown/unexpected API error). The order MAY
     # still be resting on Binance, so its id is deliberately NOT cleared -
     # the periodic sweep in _manage_open_position() retries the cancel until
@@ -1891,7 +1916,7 @@ class MartingaleManager:
 
         self._order_index: Dict[int, str] = {}
         # 2026-08 protective-stop ownership fix (review finding 4):
-        # monotonic per-process counter feeding _new_protective_stop_client_order_id().
+        # monotonic per-process counter feeding _new_protective_stop_client_algo_id().
         self._protective_stop_seq: int = 0
         # 2026-08 cancel-confirmation fix (review finding 5): protective-stop
         # order ids whose cancellation could NOT be confirmed at the moment
@@ -1900,7 +1925,7 @@ class MartingaleManager:
         # record. Swept (retried) from on_price_tick() - which runs every
         # tick regardless of whether a position is open - until Binance
         # either accepts the cancel or proves the order is gone.
-        self._orphan_protective_stop_ids: set = set()
+        self._orphan_protective_algo_ids: set = set()
         self._last_orphan_sweep_ts: float = 0.0
         # 2026-08 startup-reconciliation safety: True whenever this process
         # has NOT successfully enumerated Binance's open orders for this
@@ -2323,9 +2348,10 @@ class MartingaleManager:
             # entry/DCA fill resolves it. Restored under the same
             # side/qty/avg_entry_price/symbol match gate as every other
             # field here - a mismatched snapshot never carries this over.
-            "protective_stop_order_id": p.protective_stop_order_id,
+            "protective_stop_algo_id": p.protective_stop_algo_id,
             "protective_stop_price": p.protective_stop_price,
-            "protective_stop_client_order_id": p.protective_stop_client_order_id,
+            "protective_stop_client_algo_id": p.protective_stop_client_algo_id,
+            "protective_stop_actual_order_id": p.protective_stop_actual_order_id,
             "protective_stop_cancel_pending": p.protective_stop_cancel_pending,
             "protection_pending": p.protection_pending,
             "protection_pending_reason": p.protection_pending_reason,
@@ -2366,9 +2392,10 @@ class MartingaleManager:
             "position_fees_reliable": True,
             "dca_blocked": False,
             "dca_block_reason": None,
-            "protective_stop_order_id": None,
+            "protective_stop_algo_id": None,
             "protective_stop_price": None,
-            "protective_stop_client_order_id": None,
+            "protective_stop_client_algo_id": None,
+            "protective_stop_actual_order_id": None,
             "protective_stop_cancel_pending": False,
             "protection_pending": False,
             "protection_pending_reason": None,
@@ -3610,7 +3637,7 @@ class MartingaleManager:
         needs_reconcile_retry = (
             self._protective_stop_reconcile_blocked or self._stale_protective_stops_possible
         )
-        if not self._orphan_protective_stop_ids and not needs_reconcile_retry:
+        if not self._orphan_protective_algo_ids and not needs_reconcile_retry:
             return
         now = time.time()
         if now - self._last_orphan_sweep_ts < PROTECTIVE_STOP_RETRY_SEC:
@@ -3619,17 +3646,17 @@ class MartingaleManager:
         is_cooldown_active = getattr(self.client, "is_cooldown_active", None)
         if is_cooldown_active is not None and is_cooldown_active():
             return
-        for order_id in list(self._orphan_protective_stop_ids):
+        for order_id in list(self._orphan_protective_algo_ids):
             try:
-                await self.client.cancel_order(self.symbol, order_id)
-                self._orphan_protective_stop_ids.discard(order_id)
+                await self.client.cancel_algo_order(algo_id=order_id)
+                self._orphan_protective_algo_ids.discard(order_id)
                 print(color(
                     f"{now_str()} [protective-stop] orphan sweep cancelled stale orderId={order_id}.",
                     GREEN,
                 ))
             except BinanceApiError as e:
                 if e.code == -2011:  # proven gone
-                    self._orphan_protective_stop_ids.discard(order_id)
+                    self._orphan_protective_algo_ids.discard(order_id)
                     print(color(
                         f"{now_str()} [protective-stop] orphan sweep: orderId={order_id} confirmed "
                         f"already gone.", GRAY,
@@ -3727,14 +3754,14 @@ class MartingaleManager:
             if (
                 self._protective_stop_reconcile_blocked
                 or self._stale_protective_stops_possible
-                or self._orphan_protective_stop_ids
+                or self._orphan_protective_algo_ids
             ):
                 if self._should_log_protection_pending():
                     print(color(
                         f"{now_str()} [entry-skip] stale protective-stop cleanup unresolved "
                         f"(reconcile_blocked={self._protective_stop_reconcile_blocked}, "
                         f"stale_possible={self._stale_protective_stops_possible}, "
-                        f"orphans={sorted(self._orphan_protective_stop_ids)}) - a leftover "
+                        f"orphans={sorted(self._orphan_protective_algo_ids)}) - a leftover "
                         f"closePosition=true stop could trigger against a new position at the wrong "
                         f"price. No new entry until every stale owned stop is confirmed gone.", YELLOW,
                     ))
@@ -4347,7 +4374,7 @@ class MartingaleManager:
                     ))
                     # item 6: never leave a stale protective stop resting
                     # once the exchange itself already reports flat.
-                    if self.position.protective_stop_order_id is not None:
+                    if self.position.protective_stop_algo_id is not None:
                         confirmed_gone = await self._cancel_protective_stop(
                             reason="exchange already flat at close time"
                         )
@@ -4355,8 +4382,8 @@ class MartingaleManager:
                         # _on_close_filled() - the PositionState is replaced
                         # immediately below, so an unconfirmed cancel must be
                         # remembered at manager level or it is lost.
-                        if not confirmed_gone and self.position.protective_stop_order_id is not None:
-                            self._orphan_protective_stop_ids.add(self.position.protective_stop_order_id)
+                        if not confirmed_gone and self.position.protective_stop_algo_id is not None:
+                            self._orphan_protective_algo_ids.add(self.position.protective_stop_algo_id)
                     self.position = PositionState(last_close_time=time.time())
                     self.last_trade_action_ts = time.time()
                     asyncio.create_task(self.save_flat_dca_state(reason="exchange already flat at close time"))
@@ -4472,7 +4499,7 @@ class MartingaleManager:
         # comfortably absorbs a single tick - not special-cased further.
         return round_step(stop_price, self.filters.tick_size) if self.filters.tick_size else stop_price
 
-    def _new_protective_stop_client_order_id(self) -> str:
+    def _new_protective_stop_client_algo_id(self) -> str:
         """2026-08 protective-stop ownership fix (review finding 4):
         generates a unique, bot-owned clientOrderId for a protective stop.
         Always begins with PROTECTIVE_STOP_CLIENT_ID_PREFIX, which is the
@@ -4495,22 +4522,250 @@ class MartingaleManager:
 
         2026-08 strict-ownership hardening: matches on
         PROTECTIVE_STOP_CLIENT_ID_PREFIX + "-" (the exact separator
-        _new_protective_stop_client_order_id() always emits), not the bare
+        _new_protective_stop_client_algo_id() always emits), not the bare
         prefix. A bare-prefix match would also claim an unrelated order whose
         id merely STARTS with the same letters (e.g. prefix "bv2ps" matching
         a third-party "bv2psXYZ" or "bv2pshedge-1"), which this bot must
         never cancel."""
-        client_id = order.get("clientOrderId") or ""
+        # 2026-08 Algo-Service migration: algo orders carry `clientAlgoId`.
+        # `clientOrderId` is still accepted as a fallback so a legacy
+        # pre-migration STOP_MARKET left resting on the plain order endpoint
+        # is still recognised as ours and cleaned up rather than orphaned.
+        client_id = order.get("clientAlgoId") or order.get("clientOrderId") or ""
         return isinstance(client_id, str) and client_id.startswith(
             f"{PROTECTIVE_STOP_CLIENT_ID_PREFIX}-"
         )
+
+    async def _register_protective_child_order(
+        self, actual_order_id, context: str = "",
+    ) -> None:
+        """2026-08 Algo-Service migration. An algo order never emits
+        ORDER_TRADE_UPDATE itself. When it triggers, Binance creates a CHILD
+        MARKET order and reports its id as `actualOrderId` (empty string
+        until then); THAT child fills and emits ORDER_TRADE_UPDATE.
+
+        This registers the child in _order_index under role
+        "protective_stop", so its fill routes through the SAME
+        _on_close_filled() bookkeeping every other close uses. Registration
+        goes through _register_order_and_replay(), so a FILLED event that
+        arrived BEFORE we learned the child's id is replayed from the
+        unmatched-fill buffer rather than lost - the child can fill in
+        milliseconds, well before any ALGO_UPDATE or REST query tells us its
+        id, so that ordering is the common case, not an edge case.
+
+        Idempotent: re-registering an id already in _order_index is a no-op,
+        and once the fill is consumed _order_index.pop() prevents any
+        duplicate ALGO_UPDATE/REST recovery from double-processing it.
+        Accepts "" / None / unparseable values (an untriggered algo) and
+        does nothing.
+        """
+        if actual_order_id in (None, "", 0, "0"):
+            return
+        try:
+            child_id = int(actual_order_id)
+        except (TypeError, ValueError):
+            return
+        p = self.position
+        # 2026-08 idempotency guard: only ever wire up a child order while a
+        # position is actually open. Once the trade has been finalized the
+        # position is reset to FLAT, but a duplicate/late ALGO_UPDATE (e.g. a
+        # trailing FINISHED after the fill was already processed) would
+        # otherwise re-register the same child id - and
+        # _register_order_and_replay() would then replay a buffered duplicate
+        # FILLED event through _on_close_filled(), double-counting realized
+        # PnL, the trade log and the daily counters. The in-memory status is
+        # the authoritative, synchronous signal that this trade is done.
+        if p.status not in ("OPEN", "DCA_PENDING", "CLOSING") or p.total_qty <= 0:
+            return
+        if p.protective_stop_actual_order_id == child_id and child_id in self._order_index:
+            return  # already wired up
+        p.protective_stop_actual_order_id = child_id
+        if child_id in self._order_index:
+            return
+        print(color(
+            f"{now_str()} [protective-stop] algo TRIGGERED -> child order actualOrderId={child_id} "
+            f"registered for close bookkeeping ({context}).", CYAN,
+        ))
+        await self._register_order_and_replay(child_id, "protective_stop")
+
+    async def _resolve_protective_algo_via_rest(self, context: str) -> Optional[dict]:
+        """Authoritative REST lookup of the tracked protective algo order.
+        Used whenever an ALGO_UPDATE is missed, or arrives in a status that
+        cannot be trusted on its own - specifically FINISHED, which per
+        Binance's docs may mean either filled OR canceled. Returns the raw
+        algo order dict, or None if it could not be determined (caller must
+        treat None as 'unknown', never as 'gone')."""
+        p = self.position
+        if p.protective_stop_algo_id is None and not p.protective_stop_client_algo_id:
+            return None
+        is_cooldown_active = getattr(self.client, "is_cooldown_active", None)
+        if is_cooldown_active is not None and is_cooldown_active():
+            return None
+        try:
+            return await self.client.get_algo_order(
+                algo_id=p.protective_stop_algo_id,
+                client_algo_id=(
+                    p.protective_stop_client_algo_id if p.protective_stop_algo_id is None else None
+                ),
+            )
+        except Exception as e:  # noqa: BLE001 - a status query must never crash the trading loop
+            print(color(
+                f"{now_str()} [protective-stop] algo status query failed ({context}): {e} - "
+                f"treating protection status as UNKNOWN (conservative).", YELLOW,
+            ))
+            return None
+
+    async def handle_algo_update(self, event: dict) -> None:
+        """2026-08 Algo-Service migration: ALGO_UPDATE user-stream handler
+        for the exchange-native protective stop.
+
+        Envelope tolerance: the algo payload is read from whichever of the
+        documented/observed wrapper keys is present ("ao"/"a"/"o") falling
+        back to the top level, because this event's exact envelope key is the
+        one part of the migration that could not be verified against live
+        traffic while offline. Every field lookup below is by Binance's
+        documented NAME (algoId/clientAlgoId/algoStatus/actualOrderId), so an
+        envelope difference degrades to 'ignored, resolved later by REST'
+        rather than to a wrong action.
+
+        Every branch is conservative and idempotent:
+          NEW                     -> track (this is our stop, armed)
+          TRIGGERING / TRIGGERED  -> register actualOrderId child if present
+          CANCELED/EXPIRED/REJECTED -> proof it is gone; if the position is
+                                     still open, re-enter PROTECTION_PENDING
+                                     so the sweep re-arms it
+          FINISHED                -> NEVER treated as a fill on its own; a
+                                     REST query decides filled vs canceled
+        """
+        a = None
+        for key in ("ao", "a", "o"):
+            candidate = event.get(key)
+            if isinstance(candidate, dict) and (
+                "algoId" in candidate or "algoStatus" in candidate or "clientAlgoId" in candidate
+            ):
+                a = candidate
+                break
+        if a is None:
+            a = event if isinstance(event, dict) else {}
+
+        algo_id = a.get("algoId")
+        client_algo_id = a.get("clientAlgoId") or ""
+        status = str(a.get("algoStatus") or a.get("status") or "").upper()
+        actual_order_id = a.get("actualOrderId")
+        p = self.position
+
+        # Ownership: only ever act on OUR protective stop. A manual or
+        # third-party algo order on the same account must be ignored entirely.
+        owned_by_prefix = isinstance(client_algo_id, str) and client_algo_id.startswith(
+            f"{PROTECTIVE_STOP_CLIENT_ID_PREFIX}-"
+        )
+        matches_tracked = (
+            algo_id is not None and p.protective_stop_algo_id is not None
+            and str(algo_id) == str(p.protective_stop_algo_id)
+        ) or (
+            bool(client_algo_id) and client_algo_id == p.protective_stop_client_algo_id
+        )
+        if not owned_by_prefix and not matches_tracked:
+            return
+
+        print(color(
+            f"{now_str()} [algo-update] algoId={algo_id} clientAlgoId={client_algo_id} "
+            f"status={status or 'UNKNOWN'} actualOrderId={actual_order_id or '-'}", GRAY,
+        ))
+
+        if status == "NEW":
+            # Our stop is armed on the exchange. Adopt its ids if this
+            # process did not already have them (e.g. event raced the REST
+            # response), and clear PROTECTION_PENDING only for OUR order.
+            if matches_tracked or p.protective_stop_algo_id is None:
+                if algo_id is not None:
+                    try:
+                        p.protective_stop_algo_id = int(algo_id)
+                    except (TypeError, ValueError):
+                        pass
+                if client_algo_id:
+                    p.protective_stop_client_algo_id = client_algo_id
+                p.protective_stop_cancel_pending = False
+                if p.status in ("OPEN", "DCA_PENDING"):
+                    self._clear_protection_pending()
+            return
+
+        if status in ("TRIGGERING", "TRIGGERED"):
+            # The stop fired. The child MARKET order is what actually closes
+            # the position - wire it up so its fill is processed exactly once.
+            await self._register_protective_child_order(
+                actual_order_id, context=f"ALGO_UPDATE {status}",
+            )
+            if not actual_order_id:
+                # Triggered but the child id was not in this event - ask REST
+                # rather than waiting and risking an unrouted fill.
+                info = await self._resolve_protective_algo_via_rest(context=f"ALGO_UPDATE {status}")
+                if info:
+                    await self._register_protective_child_order(
+                        info.get("actualOrderId"), context="REST after TRIGGERED",
+                    )
+            return
+
+        if status in ("CANCELED", "EXPIRED", "REJECTED"):
+            # Proof the algo order is gone. Clear tracking, and if the
+            # position is still open it is now UNPROTECTED - re-enter
+            # PROTECTION_PENDING so the existing throttled sweep re-arms it
+            # (and the bounded fail-safe still applies).
+            if matches_tracked:
+                self._clear_protective_stop_tracking()
+                if p.status in ("OPEN", "DCA_PENDING") and p.total_qty > 0:
+                    self._mark_protection_pending(
+                        f"protective algo stop {status} on the exchange - re-arming"
+                    )
+                    print(color(
+                        f"{now_str()} [protective-stop] *** HIGH SEVERITY *** algo stop {status} "
+                        f"while the position is still OPEN - PROTECTION_PENDING re-entered; the "
+                        f"sweep will re-arm it (new DCA blocked meanwhile).", RED,
+                    ))
+            return
+
+        if status == "FINISHED":
+            # Binance documents FINISHED as ambiguous: it can mean the algo
+            # filled OR that it was canceled. Never finalize a trade on this
+            # alone - resolve it against the algo record and the real
+            # exchange position.
+            info = await self._resolve_protective_algo_via_rest(context="ALGO_UPDATE FINISHED")
+            child = (info or {}).get("actualOrderId") or actual_order_id
+            if child:
+                await self._register_protective_child_order(
+                    child, context="ALGO_UPDATE FINISHED (verified)",
+                )
+                return
+            # No child id anywhere -> it did not trigger, so FINISHED means
+            # canceled. Treat exactly like CANCELED.
+            print(color(
+                f"{now_str()} [protective-stop] algo FINISHED with no actualOrderId - this is a "
+                f"CANCELED outcome, not a fill; not finalizing any trade.", YELLOW,
+            ))
+            if matches_tracked:
+                self._clear_protective_stop_tracking()
+                if p.status in ("OPEN", "DCA_PENDING") and p.total_qty > 0:
+                    self._mark_protection_pending(
+                        "protective algo stop FINISHED/canceled without triggering - re-arming"
+                    )
+            return
+
+    def _clear_protective_stop_tracking(self) -> None:
+        """Clears every locally-tracked protective-stop identifier. Used only
+        where the order is PROVEN gone from the exchange."""
+        p = self.position
+        p.protective_stop_algo_id = None
+        p.protective_stop_price = None
+        p.protective_stop_client_algo_id = None
+        p.protective_stop_actual_order_id = None
+        p.protective_stop_cancel_pending = False
 
     async def _cancel_protective_stop(self, reason: str) -> bool:
         """Cancels the currently-tracked protective stop order and reports
         whether the order is now PROVABLY gone from Binance.
 
         2026-08 cancel-confirmation fix (review finding 5): local tracking
-        (protective_stop_order_id/price/client_order_id) is now cleared ONLY
+        (protective_stop_algo_id/price/client_order_id) is now cleared ONLY
         when cancellation is confirmed - either the cancel call succeeded, or
         Binance answered -2011 "Unknown order sent" which proves the order no
         longer exists (already triggered/expired/manually cancelled). On any
@@ -4525,16 +4780,17 @@ class MartingaleManager:
         resting (caller must not assume the exchange side is clean).
         """
         p = self.position
-        order_id = p.protective_stop_order_id
-        if order_id is None:
+        algo_id = p.protective_stop_algo_id
+        if algo_id is None:
             return True
         if DRY_RUN:
-            p.protective_stop_order_id = None
+            p.protective_stop_algo_id = None
             p.protective_stop_price = None
-            p.protective_stop_client_order_id = None
+            p.protective_stop_client_algo_id = None
+            p.protective_stop_actual_order_id = None
             p.protective_stop_cancel_pending = False
             print(color(
-                f"{now_str()} [DRY RUN] would cancel protective stop orderId={order_id} ({reason})", GRAY,
+                f"{now_str()} [DRY RUN] would cancel protective algo stop algoId={algo_id} ({reason})", GRAY,
             ))
             return True
 
@@ -4547,34 +4803,37 @@ class MartingaleManager:
             p.protective_stop_cancel_pending = True
             if self._should_log_protection_pending():
                 print(color(
-                    f"{now_str()} [protective-stop] cancel orderId={order_id} deferred - REST "
+                    f"{now_str()} [protective-stop] cancel algoId={algo_id} deferred - REST "
                     f"cooldown active ({reason}); keeping the tracked id so it can be cancelled "
                     f"once cooldown clears (no orphan).", YELLOW,
                 ))
             return False
 
         def _confirmed_gone() -> None:
-            p.protective_stop_order_id = None
+            p.protective_stop_algo_id = None
             p.protective_stop_price = None
-            p.protective_stop_client_order_id = None
+            p.protective_stop_client_algo_id = None
+            p.protective_stop_actual_order_id = None
             p.protective_stop_cancel_pending = False
 
         try:
-            await self.client.cancel_order(self.symbol, order_id)
+            # 2026-08 Algo-Service migration: DELETE /fapi/v1/algoOrder, keyed
+            # by algoId (no symbol param - the algo id alone identifies it).
+            await self.client.cancel_algo_order(algo_id=algo_id)
             _confirmed_gone()
-            print(color(f"{now_str()} [protective-stop] cancelled orderId={order_id} ({reason})", GRAY))
+            print(color(f"{now_str()} [protective-stop] cancelled algoId={algo_id} ({reason})", GRAY))
             return True
         except BinanceApiError as e:
             if e.code == -2011:  # "Unknown order sent" - Binance PROVES it is gone
                 _confirmed_gone()
                 print(color(
-                    f"{now_str()} [protective-stop] cancel orderId={order_id} - already gone "
+                    f"{now_str()} [protective-stop] cancel algoId={algo_id} - already gone "
                     f"(likely triggered or expired) ({reason})", GRAY,
                 ))
                 return True
             p.protective_stop_cancel_pending = True
             print(color(
-                f"{now_str()} [protective-stop] cancel orderId={order_id} FAILED: {e} ({reason}) - "
+                f"{now_str()} [protective-stop] cancel algoId={algo_id} FAILED: {e} ({reason}) - "
                 f"order may STILL be resting; keeping the tracked id and retrying on the "
                 f"protective-stop sweep.", YELLOW,
             ))
@@ -4582,7 +4841,7 @@ class MartingaleManager:
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             p.protective_stop_cancel_pending = True
             print(color(
-                f"{now_str()} [protective-stop] cancel orderId={order_id} network error: {e} ({reason}) - "
+                f"{now_str()} [protective-stop] cancel algoId={algo_id} network error: {e} ({reason}) - "
                 f"order may STILL be resting; keeping the tracked id and retrying on the "
                 f"protective-stop sweep.", YELLOW,
             ))
@@ -4590,7 +4849,7 @@ class MartingaleManager:
         except Exception as e:  # noqa: BLE001 - a cancel attempt must never crash the trading loop
             p.protective_stop_cancel_pending = True
             print(color(
-                f"{now_str()} [protective-stop] cancel orderId={order_id} unexpected error: {e} "
+                f"{now_str()} [protective-stop] cancel algoId={algo_id} unexpected error: {e} "
                 f"({reason}) - order may STILL be resting; keeping the tracked id and retrying "
                 f"on the protective-stop sweep.", YELLOW,
             ))
@@ -4687,73 +4946,79 @@ class MartingaleManager:
         # STOP_MARKETs is exactly the duplicate-order state this sequence
         # exists to avoid. Leave the tracked id in place and let the sweep
         # retry the cancel first.
-        if p.protective_stop_order_id is not None:
+        if p.protective_stop_algo_id is not None:
             confirmed_gone = await self._cancel_protective_stop(reason=f"replacing before: {reason}")
             if not confirmed_gone:
                 self._mark_protection_pending(
-                    f"stale protective stop orderId={p.protective_stop_order_id} could not be "
+                    f"stale protective stop algoId={p.protective_stop_algo_id} could not be "
                     f"confirmed cancelled - not placing a replacement on top of it ({reason})"
                 )
                 return
 
         close_side = "SELL" if p.side == "LONG" else "BUY"
-        client_order_id = self._new_protective_stop_client_order_id()
+        client_algo_id = self._new_protective_stop_client_algo_id()
 
         if DRY_RUN:
             fake_id = -(int(time.time() * 1000) % 1_000_000) - 800000
-            p.protective_stop_order_id = fake_id
+            p.protective_stop_algo_id = fake_id
             p.protective_stop_price = stop_price
-            p.protective_stop_client_order_id = client_order_id
+            p.protective_stop_client_algo_id = client_algo_id
+            p.protective_stop_actual_order_id = None
             p.protective_stop_cancel_pending = False
             self._clear_protection_pending()
-            # Register in the same fill-routing map every other order uses,
-            # so a simulated protective-stop fill routes identically.
-            self._order_index[fake_id] = "protective_stop"
             print(color(
-                f"{now_str()} [DRY RUN] would place PROTECTIVE STOP {close_side} "
-                f"closePosition=true stopPrice={stop_price:.4f} {self.symbol} "
-                f"clientOrderId={client_order_id} ({reason})", GRAY,
+                f"{now_str()} [DRY RUN] would place PROTECTIVE ALGO STOP {close_side} "
+                f"algoType=CONDITIONAL type=STOP_MARKET closePosition=true "
+                f"triggerPrice={stop_price:.4f} {self.symbol} "
+                f"clientAlgoId={client_algo_id} ({reason})", GRAY,
             ))
             return
 
         try:
-            resp = await self.client.place_order(
-                symbol=self.symbol, side=close_side, type="STOP_MARKET",
-                stopPrice=f"{stop_price:.8f}", closePosition="true",
+            # 2026-08 Algo-Service migration (root cause of live -4120):
+            # conditional types MUST go to POST /fapi/v1/algoOrder, with
+            # Binance's algo field names - triggerPrice (not stopPrice) and
+            # clientAlgoId (not newClientOrderId). `quantity`/`reduceOnly` are
+            # deliberately NOT sent: Binance rejects them alongside
+            # closePosition="true", which is itself reduce-only by
+            # construction and always closes the ENTIRE current position.
+            resp = await self.client.place_algo_order(
+                symbol=self.symbol, side=close_side,
+                algoType="CONDITIONAL", type="STOP_MARKET",
+                triggerPrice=f"{stop_price:.8f}", closePosition="true",
                 workingType=PROTECTIVE_STOP_WORKING_TYPE,
-                newClientOrderId=client_order_id,
+                clientAlgoId=client_algo_id,
             )
-            order_id = resp["orderId"]
-            p.protective_stop_order_id = order_id
+            algo_id = resp.get("algoId")
+            if algo_id is None:
+                raise BinanceApiError(
+                    400, {"code": -1, "msg": f"algoOrder response missing algoId: {resp}"}
+                )
+            p.protective_stop_algo_id = algo_id
             p.protective_stop_price = stop_price
-            p.protective_stop_client_order_id = client_order_id
+            p.protective_stop_client_algo_id = client_algo_id
+            p.protective_stop_actual_order_id = None
             p.protective_stop_cancel_pending = False
             self._clear_protection_pending()
             print(color(
-                f"{now_str()} [protective-stop] PLACED {close_side} closePosition=true "
-                f"stopPrice={stop_price:.4f} {self.symbol} orderId={order_id} "
-                f"clientOrderId={client_order_id} "
+                f"{now_str()} [protective-stop] PLACED ALGO {close_side} algoType=CONDITIONAL "
+                f"type=STOP_MARKET closePosition=true triggerPrice={stop_price:.4f} "
+                f"{self.symbol} algoId={algo_id} clientAlgoId={client_algo_id} "
                 f"workingType={PROTECTIVE_STOP_WORKING_TYPE} ({reason})", CYAN,
             ))
-            # 2026-08 protective-stop fill-routing fix (review finding 2):
-            # register this order in _order_index under its own role BEFORE
-            # anything else can await, so a later ORDER_TRADE_UPDATE FILLED
-            # event for it is routed through the normal close bookkeeping
-            # (_on_close_filled) instead of being dropped as
-            # "untracked_order_id". _register_order_and_replay() also
-            # replays a FILLED event that arrived BEFORE this registration
-            # (the exchange can trigger a stop the instant it is accepted),
-            # so the fill cannot be lost in either ordering.
-            already_filled = await self._register_order_and_replay(order_id, "protective_stop")
-            if not already_filled:
-                # Persist AFTER registration so the snapshot can never claim
-                # a protective stop that this process has not yet wired up
-                # for fill routing.
-                asyncio.create_task(self.save_dca_state(reason=f"protective stop placed: {reason}"))
+            # 2026-08 Algo-Service migration: an ALGO order id is NOT an order
+            # id and never appears in ORDER_TRADE_UPDATE, so it is deliberately
+            # NOT registered in _order_index here. Registration happens for the
+            # CHILD order (actualOrderId) the moment Binance reports it - see
+            # _register_protective_child_order(), driven by ALGO_UPDATE or a
+            # REST query. If the child's FILLED event beats that registration,
+            # the existing unmatched-fill buffer replays it, unchanged.
+            asyncio.create_task(self.save_dca_state(reason=f"protective stop placed: {reason}"))
         except Exception as e:  # noqa: BLE001 - order placement must never crash the trading loop (matches _place_reduce_only_close_order's own convention; covers BinanceApiError/aiohttp/timeout and any unexpected error e.g. a missing/None client in a test harness)
-            p.protective_stop_order_id = None
+            p.protective_stop_algo_id = None
             p.protective_stop_price = None
-            p.protective_stop_client_order_id = None
+            p.protective_stop_client_algo_id = None
+            p.protective_stop_actual_order_id = None
             p.protective_stop_cancel_pending = False
             self._mark_protection_pending(f"placement failed: {e}")
             print(color(
@@ -4812,7 +5077,7 @@ class MartingaleManager:
         now = time.time()
 
         # (1) stale-cancel retry
-        if p.protective_stop_cancel_pending and p.protective_stop_order_id is not None:
+        if p.protective_stop_cancel_pending and p.protective_stop_algo_id is not None:
             if now - p.protection_last_retry_ts >= PROTECTIVE_STOP_RETRY_SEC:
                 p.protection_last_retry_ts = now
                 await self._cancel_protective_stop(reason="stale-cancel sweep retry")
@@ -6287,7 +6552,10 @@ class MartingaleManager:
         # triggered while the process was down would be dropped here and the
         # bot would resume managing an already-closed position.
         matched_role = None
-        snap_protective_id = snapshot.get("protective_stop_order_id")
+        # 2026-08 Algo-Service migration: ORDER_TRADE_UPDATE carries the
+        # CHILD order id (actualOrderId), never the algoId - so restart
+        # recovery must match the persisted child id.
+        snap_protective_id = snapshot.get("protective_stop_actual_order_id")
         if snap_protective_id is not None:
             try:
                 if int(snap_protective_id) == int(order_id):
@@ -6326,10 +6594,7 @@ class MartingaleManager:
             # The stop triggered; it is gone from the exchange. Clear local
             # tracking and tag the exit reason so the trade log records how
             # this trade actually ended.
-            self.position.protective_stop_order_id = None
-            self.position.protective_stop_price = None
-            self.position.protective_stop_client_order_id = None
-            self.position.protective_stop_cancel_pending = False
+            self._clear_protective_stop_tracking()
             self._pending_exit_reason = "protective_stop"
         print(color(
             f"{now_str()} [fill-trace] path=restart_recovery order_id={order_id} "
@@ -6707,10 +6972,7 @@ class MartingaleManager:
             # local tracking is cleared here WITHOUT a cancel call - there is
             # nothing left to cancel, and issuing one would just produce a
             # spurious -2011.
-            self.position.protective_stop_order_id = None
-            self.position.protective_stop_price = None
-            self.position.protective_stop_client_order_id = None
-            self.position.protective_stop_cancel_pending = False
+            self._clear_protective_stop_tracking()
             self._pending_exit_reason = "protective_stop"
             print(color(
                 f"{now_str()} [fill-trace] path=live_user_websocket order_id={order_id} "
@@ -7036,16 +7298,44 @@ class MartingaleManager:
             ))
 
         was_success = combined_net_pnl > 0
-        self.recent_trade_outcomes.append(1.0 if was_success else 0.0)
-        self.recent_trade_timestamps.append(time.time())
 
-        if p.entry_features is not None:
+        # 2026-08 Brain-contamination fix: some exits say nothing whatsoever
+        # about whether the ENTRY was a good decision - they are forced by
+        # local infrastructure/API failures. The live -4120 incident is the
+        # exact case: three entries were closed after exactly 300s by the
+        # protective-stop fail-safe purely because Binance had migrated
+        # conditional orders to the Algo Service, and all three were fed to
+        # Brain as success=False. That teaches the entry model that perfectly
+        # ordinary setups fail, on evidence that is really about a REST
+        # endpoint.
+        #
+        # Such exits are excluded from BRAIN TRAINING ONLY. Everything
+        # financial is deliberately untouched and still exact: realized PnL,
+        # commission, the trade CSV/JSONL record, daily loss/profit counters,
+        # trade_count, session totals and the exit_reason itself all record
+        # the real outcome, because the money was really lost.
+        # recent_trade_outcomes (a live feature input, not a label) is also
+        # skipped so an infrastructure failure cannot distort the
+        # recent-win-rate feature fed into future entry decisions.
+        infra_only_exit = exit_reason in INFRASTRUCTURE_ONLY_EXIT_REASONS
+
+        if not infra_only_exit:
+            self.recent_trade_outcomes.append(1.0 if was_success else 0.0)
+            self.recent_trade_timestamps.append(time.time())
+
+        if p.entry_features is not None and not infra_only_exit:
             self.brain.learn_success(p.entry_features, was_success)
             self.brain.learn_quality(p.entry_features, reward)
             self._brain_dirty = True
             print(color(
                 f"{now_str()} [brain] reinforced entry decision (success={was_success}, "
                 f"reward={reward:+.4f}, brain_updates={self.brain.update_count})", MAGENTA,
+            ))
+        elif infra_only_exit:
+            print(color(
+                f"{now_str()} [brain] SKIPPED learning for exit_reason={exit_reason} - this is an "
+                f"infrastructure/API failure, not a strategy outcome; the trade's PnL, fees, CSV "
+                f"record and daily counters are unaffected and remain exact.", YELLOW,
             ))
 
         # 2026-08 Smart Exit diagnostics (logging-only - see attribute's own
@@ -7112,7 +7402,7 @@ class MartingaleManager:
         # cancel any resting protective stop now so TP/Hard-Stop/Profit-
         # Lock/Smart-Exit/max-hold/manual closes can never leave one
         # orphaned on the exchange.
-        if p.protective_stop_order_id is not None:
+        if p.protective_stop_algo_id is not None:
             confirmed_gone = await self._cancel_protective_stop(
                 reason=f"position closed ({exit_reason})"
             )
@@ -7120,10 +7410,10 @@ class MartingaleManager:
             # PositionState below is discarded, so an unconfirmed cancel
             # would lose the only record of a possibly-still-resting order.
             # Hand it to the manager-level orphan sweep instead.
-            if not confirmed_gone and p.protective_stop_order_id is not None:
-                self._orphan_protective_stop_ids.add(p.protective_stop_order_id)
+            if not confirmed_gone and p.protective_stop_algo_id is not None:
+                self._orphan_protective_algo_ids.add(p.protective_stop_algo_id)
                 print(color(
-                    f"{now_str()} [protective-stop] orderId={p.protective_stop_order_id} could not "
+                    f"{now_str()} [protective-stop] orderId={p.protective_stop_algo_id} could not "
                     f"be confirmed cancelled while closing - handing to the orphan sweep so it is "
                     f"retried until Binance accepts the cancel or proves it is gone.", YELLOW,
                 ))
@@ -7632,10 +7922,12 @@ async def initialize_sync(
     # actual authority that confirms/repairs this against Binance's own
     # open orders - this restore is only a best-effort head start so that
     # call has less work to do, never a substitute for it.
-    restored_protective_stop_order_id: Optional[int] = None
+    restored_protective_stop_algo_id: Optional[int] = None
     restored_protective_stop_price: Optional[float] = None
-    restored_protective_stop_client_order_id: Optional[str] = None
+    restored_protective_stop_client_algo_id: Optional[str] = None
+    restored_protective_stop_actual_order_id: Optional[int] = None
     restored_protective_stop_cancel_pending: bool = False
+    restored_protective_stop_legacy_seen: bool = False
     restored_protection_pending = True
     restored_protection_pending_reason: Optional[str] = "not yet reconciled against exchange open orders"
     restored_protection_pending_since: Optional[float] = None
@@ -7739,13 +8031,13 @@ async def initialize_sync(
             # function returns - a stale orderId here (e.g. it triggered
             # while this process was down) is corrected there, not here.
             try:
-                restored_protective_stop_order_id = snapshot.get("protective_stop_order_id")
-                restored_protective_stop_order_id = (
-                    int(restored_protective_stop_order_id)
-                    if restored_protective_stop_order_id is not None else None
+                restored_protective_stop_algo_id = snapshot.get("protective_stop_algo_id")
+                restored_protective_stop_algo_id = (
+                    int(restored_protective_stop_algo_id)
+                    if restored_protective_stop_algo_id is not None else None
                 )
             except (TypeError, ValueError):
-                restored_protective_stop_order_id = None
+                restored_protective_stop_algo_id = None
             try:
                 restored_protective_stop_price = snapshot.get("protective_stop_price")
                 restored_protective_stop_price = (
@@ -7756,10 +8048,52 @@ async def initialize_sync(
                 restored_protective_stop_price = None
             restored_protection_pending = bool(snapshot.get("protection_pending", False))
             restored_protection_pending_reason = snapshot.get("protection_pending_reason")
-            restored_protective_stop_client_order_id = snapshot.get("protective_stop_client_order_id")
+            restored_protective_stop_client_algo_id = snapshot.get("protective_stop_client_algo_id")
             restored_protective_stop_cancel_pending = bool(
                 snapshot.get("protective_stop_cancel_pending", False)
             )
+            try:
+                restored_protective_stop_actual_order_id = snapshot.get(
+                    "protective_stop_actual_order_id"
+                )
+                restored_protective_stop_actual_order_id = (
+                    int(restored_protective_stop_actual_order_id)
+                    if restored_protective_stop_actual_order_id not in (None, "", 0, "0") else None
+                )
+            except (TypeError, ValueError):
+                restored_protective_stop_actual_order_id = None
+            # 2026-08 Algo-Service migration: a snapshot written BEFORE this
+            # migration carries the legacy plain-order fields
+            # (protective_stop_order_id / protective_stop_client_order_id).
+            # Those ids belong to the /fapi/v1/order namespace and are
+            # meaningless as algoIds - adopting one would let this process
+            # believe it is protected when it is not, and cancelling by that
+            # id via the algo endpoint could hit an unrelated algo order.
+            #
+            # Handled conservatively, exactly as required: dca_step is NOT
+            # reset and no blind replacement is placed. Instead the position
+            # is marked PROTECTION_PENDING and stale-cleanup is forced, so
+            # reconciliation must enumerate the real open ALGO orders before
+            # anything is placed or cancelled.
+            legacy_stop_id = snapshot.get("protective_stop_order_id")
+            legacy_stop_client_id = snapshot.get("protective_stop_client_order_id")
+            if (
+                restored_protective_stop_algo_id is None
+                and (legacy_stop_id is not None or legacy_stop_client_id)
+            ):
+                restored_protective_stop_legacy_seen = True
+                restored_protection_pending = True
+                restored_protection_pending_reason = (
+                    f"legacy pre-Algo protective-stop snapshot (orderId={legacy_stop_id}, "
+                    f"clientOrderId={legacy_stop_client_id}) - re-arm via the Algo API after "
+                    f"reconciliation confirms what is actually resting"
+                )
+                print(color(
+                    f"{now_str()} [sync:{context}] [protective-stop] legacy pre-Algo snapshot "
+                    f"detected (orderId={legacy_stop_id}) - NOT adopting it as an algoId and NOT "
+                    f"placing a blind replacement; entering PROTECTION_PENDING and forcing stale "
+                    f"cleanup. dca_step is untouched.", YELLOW,
+                ))
             # 2026-08 PROTECTION_PENDING fail-safe (review finding 3): the
             # unprotected clock must survive a restart, otherwise a process
             # that restarts more often than PROTECTION_PENDING_MAX_SEC could
@@ -8001,9 +8335,10 @@ async def initialize_sync(
         # confirms this against Binance's own open orders and corrects it
         # (including clearing a stale orderId, or placing a fresh stop if
         # none is found resting).
-        protective_stop_order_id=restored_protective_stop_order_id,
+        protective_stop_algo_id=restored_protective_stop_algo_id,
         protective_stop_price=restored_protective_stop_price,
-        protective_stop_client_order_id=restored_protective_stop_client_order_id,
+        protective_stop_client_algo_id=restored_protective_stop_client_algo_id,
+        protective_stop_actual_order_id=restored_protective_stop_actual_order_id,
         protective_stop_cancel_pending=restored_protective_stop_cancel_pending,
         protection_pending=restored_protection_pending,
         protection_pending_reason=restored_protection_pending_reason,
@@ -8016,8 +8351,16 @@ async def initialize_sync(
     # through _on_close_filled() rather than being dropped as
     # "untracked_order_id". _try_recover_close_fill()'s snapshot lookup
     # remains the fallback for any window this doesn't cover.
-    if restored_protective_stop_order_id is not None:
-        manager._order_index[restored_protective_stop_order_id] = "protective_stop"
+    # 2026-08 Algo-Service migration: register the CHILD order id
+    # (actualOrderId) - an algoId never appears in ORDER_TRADE_UPDATE, so
+    # putting it here would both fail to route the real fill and risk
+    # colliding with an unrelated orderId.
+    if restored_protective_stop_actual_order_id is not None:
+        manager._order_index[restored_protective_stop_actual_order_id] = "protective_stop"
+    # A legacy pre-Algo snapshot must force reconciliation before anything is
+    # placed or cancelled (see the migration block above).
+    if restored_protective_stop_legacy_seen:
+        manager._stale_protective_stops_possible = True
     # Keep the peak-save throttle consistent with whatever peak was just
     # restored (or reset to 0.0 on a fresh/mismatched snapshot), so the
     # next Profit Lock peak update in _manage_open_position() is measured
@@ -8123,7 +8466,7 @@ async def reconcile_protective_stop_on_startup(client: RestClient, manager: Mart
     )
 
     try:
-        open_orders = await client.get_open_orders(manager.symbol)
+        open_orders = await client.get_open_algo_orders(manager.symbol)
     except Exception as e:  # noqa: BLE001 - a reconciliation fetch must never crash startup
         # 2026-08 startup-reconciliation safety: block placement until a
         # fetch actually succeeds, so nothing is ever placed on top of a
@@ -8172,7 +8515,7 @@ async def reconcile_protective_stop_on_startup(client: RestClient, manager: Mart
     if not position_is_open:
         owned_flat = [
             o for o in open_orders
-            if o.get("type") == "STOP_MARKET"
+            if (o.get("orderType") or o.get("type")) == "STOP_MARKET"
             and str(o.get("closePosition")).lower() == "true"
             and manager._is_own_protective_stop(o)
         ]
@@ -8180,7 +8523,7 @@ async def reconcile_protective_stop_on_startup(client: RestClient, manager: Mart
             # Enumeration succeeded and there is nothing bot-owned resting:
             # this is the ONLY proof that no stale leftover exists. Combined
             # with an empty orphan set, it re-opens the entry gate.
-            if not manager._orphan_protective_stop_ids:
+            if not manager._orphan_protective_algo_ids:
                 if manager._stale_protective_stops_possible:
                     print(color(
                         f"{now_str()} [protective-stop] reconciliation confirms no bot-owned "
@@ -8200,19 +8543,19 @@ async def reconcile_protective_stop_on_startup(client: RestClient, manager: Mart
         manager._stale_protective_stops_possible = True
         unresolved = False
         for o in owned_flat:
-            order_id = o.get("orderId")
+            order_id = o.get("algoId")
             if order_id is None:
                 continue
             try:
-                await client.cancel_order(manager.symbol, order_id)
-                manager._orphan_protective_stop_ids.discard(order_id)
+                await client.cancel_algo_order(algo_id=order_id)
+                manager._orphan_protective_algo_ids.discard(order_id)
                 print(color(
                     f"{now_str()} [protective-stop] cancelled leftover orderId={order_id} "
-                    f"clientOrderId={o.get('clientOrderId')} (flat at startup).", GRAY,
+                    f"clientOrderId={o.get('clientAlgoId')} (flat at startup).", GRAY,
                 ))
             except BinanceApiError as e:
                 if e.code == -2011:  # Binance proves it is already gone
-                    manager._orphan_protective_stop_ids.discard(order_id)
+                    manager._orphan_protective_algo_ids.discard(order_id)
                     print(color(
                         f"{now_str()} [protective-stop] leftover orderId={order_id} already gone.",
                         GRAY,
@@ -8220,7 +8563,7 @@ async def reconcile_protective_stop_on_startup(client: RestClient, manager: Mart
                 else:
                     # 2026-08: retain + retry instead of silently passing -
                     # an uncancelled leftover is exactly the hazard here.
-                    manager._orphan_protective_stop_ids.add(order_id)
+                    manager._orphan_protective_algo_ids.add(order_id)
                     unresolved = True
                     print(color(
                         f"{now_str()} [protective-stop] cancel of leftover orderId={order_id} "
@@ -8228,14 +8571,14 @@ async def reconcile_protective_stop_on_startup(client: RestClient, manager: Mart
                         f"blocked.", YELLOW,
                     ))
             except Exception as e:  # noqa: BLE001 - must never crash startup
-                manager._orphan_protective_stop_ids.add(order_id)
+                manager._orphan_protective_algo_ids.add(order_id)
                 unresolved = True
                 print(color(
                     f"{now_str()} [protective-stop] cancel of leftover orderId={order_id} errored "
                     f"({e}) - handed to the orphan sweep for retry; entries stay blocked.", YELLOW,
                 ))
         # Only unblock once EVERY stale owned stop is confirmed gone.
-        if not unresolved and not manager._orphan_protective_stop_ids:
+        if not unresolved and not manager._orphan_protective_algo_ids:
             manager._stale_protective_stops_possible = False
             print(color(
                 f"{now_str()} [protective-stop] all leftover protective stops confirmed cancelled - "
@@ -8246,7 +8589,7 @@ async def reconcile_protective_stop_on_startup(client: RestClient, manager: Mart
     close_side = "SELL" if p.side == "LONG" else "BUY"
     candidates = [
         o for o in open_orders
-        if o.get("type") == "STOP_MARKET"
+        if (o.get("orderType") or o.get("type")) == "STOP_MARKET"
         and o.get("side") == close_side
         and str(o.get("closePosition")).lower() == "true"
     ]
@@ -8268,8 +8611,8 @@ async def reconcile_protective_stop_on_startup(client: RestClient, manager: Mart
     # an order this process itself placed and is already tracking (same
     # orderId) is trustworthy; everything else owned is cancelled as stale.
     if manager._stale_protective_stops_possible and matching:
-        trusted = [o for o in matching if o.get("orderId") == p.protective_stop_order_id
-                   and p.protective_stop_order_id is not None]
+        trusted = [o for o in matching if o.get("algoId") == p.protective_stop_algo_id
+                   and p.protective_stop_algo_id is not None]
         stale = [o for o in matching if o not in trusted]
         if stale:
             print(color(
@@ -8280,34 +8623,34 @@ async def reconcile_protective_stop_on_startup(client: RestClient, manager: Mart
             ))
         unresolved = False
         for o in stale:
-            stale_id = o.get("orderId")
+            stale_id = o.get("algoId")
             if stale_id is None:
                 continue
             try:
-                await client.cancel_order(manager.symbol, stale_id)
-                manager._orphan_protective_stop_ids.discard(stale_id)
+                await client.cancel_algo_order(algo_id=stale_id)
+                manager._orphan_protective_algo_ids.discard(stale_id)
                 print(color(
                     f"{now_str()} [protective-stop] cancelled stale orderId={stale_id} "
-                    f"clientOrderId={o.get('clientOrderId')}.", GRAY,
+                    f"clientOrderId={o.get('clientAlgoId')}.", GRAY,
                 ))
             except BinanceApiError as e:
                 if e.code == -2011:
-                    manager._orphan_protective_stop_ids.discard(stale_id)
+                    manager._orphan_protective_algo_ids.discard(stale_id)
                 else:
-                    manager._orphan_protective_stop_ids.add(stale_id)
+                    manager._orphan_protective_algo_ids.add(stale_id)
                     unresolved = True
                     print(color(
                         f"{now_str()} [protective-stop] cancel of stale orderId={stale_id} FAILED "
                         f"({e}) - handed to the orphan sweep for retry.", YELLOW,
                     ))
             except Exception as e:  # noqa: BLE001 - must never crash reconciliation
-                manager._orphan_protective_stop_ids.add(stale_id)
+                manager._orphan_protective_algo_ids.add(stale_id)
                 unresolved = True
                 print(color(
                     f"{now_str()} [protective-stop] cancel of stale orderId={stale_id} errored "
                     f"({e}) - handed to the orphan sweep for retry.", YELLOW,
                 ))
-        if not unresolved and not manager._orphan_protective_stop_ids:
+        if not unresolved and not manager._orphan_protective_algo_ids:
             manager._stale_protective_stops_possible = False
         # Fall through with ONLY the trusted (already-tracked) order, if any.
         # If none remains, the "no stop found" path below places a fresh one
@@ -8316,48 +8659,52 @@ async def reconcile_protective_stop_on_startup(client: RestClient, manager: Mart
 
     if matching:
         chosen = next(
-            (o for o in matching if o.get("orderId") == p.protective_stop_order_id), matching[0]
+            (o for o in matching if o.get("algoId") == p.protective_stop_algo_id), matching[0]
         )
-        p.protective_stop_order_id = chosen.get("orderId")
+        p.protective_stop_algo_id = chosen.get("algoId")
         try:
-            p.protective_stop_price = float(chosen.get("stopPrice", 0) or 0) or None
+            p.protective_stop_price = float(chosen.get("triggerPrice", 0) or 0) or None
         except (TypeError, ValueError):
             p.protective_stop_price = None
-        p.protective_stop_client_order_id = chosen.get("clientOrderId")
+        p.protective_stop_client_algo_id = chosen.get("clientAlgoId")
         p.protective_stop_cancel_pending = False
         manager._clear_protection_pending()
-        # review finding 2: an adopted stop must be wired into the
-        # fill-routing map, exactly like a freshly-placed one, or its FILLED
-        # event would be dropped as "untracked_order_id".
-        if p.protective_stop_order_id is not None:
-            manager._order_index[p.protective_stop_order_id] = "protective_stop"
+        # 2026-08 Algo-Service migration: an algoId is NOT an orderId and
+        # never appears in ORDER_TRADE_UPDATE, so it must NOT be put into
+        # _order_index. Only the CHILD order Binance creates when the algo
+        # triggers (actualOrderId) fills and emits ORDER_TRADE_UPDATE - if
+        # this adopted algo has already triggered, wire that child up now so
+        # its fill routes through _on_close_filled() exactly once.
+        await manager._register_protective_child_order(
+            chosen.get("actualOrderId"), context="startup reconciliation adopt",
+        )
         if len(matching) > 1:
             print(color(
                 f"{now_str()} [protective-stop] startup reconciliation found {len(matching)} resting "
-                f"protective stop(s) for {manager.symbol} - adopted orderId="
-                f"{p.protective_stop_order_id}; cancelling the rest so at most one remains.", YELLOW,
+                f"protective stop(s) for {manager.symbol} - adopted algoId="
+                f"{p.protective_stop_algo_id}; cancelling the rest so at most one remains.", YELLOW,
             ))
             for o in matching:
-                if o.get("orderId") != p.protective_stop_order_id:
-                    dup_id = o.get("orderId")
+                if o.get("algoId") != p.protective_stop_algo_id:
+                    dup_id = o.get("algoId")
                     if dup_id is None:
                         continue
                     try:
-                        await client.cancel_order(manager.symbol, dup_id)
+                        await client.cancel_algo_order(algo_id=dup_id)
                     except BinanceApiError as e:
                         if e.code != -2011:  # -2011 proves it is already gone
                             # 2026-08: retain + retry instead of the previous
                             # silent `pass`. A duplicate closePosition=true
                             # stop left resting can close the position at the
                             # wrong price, so it must not be forgotten.
-                            manager._orphan_protective_stop_ids.add(dup_id)
+                            manager._orphan_protective_algo_ids.add(dup_id)
                             print(color(
                                 f"{now_str()} [protective-stop] cancel of duplicate orderId="
                                 f"{dup_id} FAILED ({e}) - handed to the orphan sweep for retry.",
                                 YELLOW,
                             ))
                     except Exception as e:  # noqa: BLE001 - must never crash startup
-                        manager._orphan_protective_stop_ids.add(dup_id)
+                        manager._orphan_protective_algo_ids.add(dup_id)
                         print(color(
                             f"{now_str()} [protective-stop] cancel of duplicate orderId={dup_id} "
                             f"errored ({e}) - handed to the orphan sweep for retry.", YELLOW,
@@ -8365,8 +8712,8 @@ async def reconcile_protective_stop_on_startup(client: RestClient, manager: Mart
         else:
             print(color(
                 f"{now_str()} [protective-stop] startup reconciliation adopted existing "
-                f"orderId={p.protective_stop_order_id} stopPrice={p.protective_stop_price} for "
-                f"{manager.symbol}.", GREEN,
+                f"algoId={p.protective_stop_algo_id} clientAlgoId={p.protective_stop_client_algo_id} "
+                f"triggerPrice={p.protective_stop_price} for {manager.symbol}.", GREEN,
             ))
         asyncio.create_task(manager.save_dca_state(reason="protective stop reconciled on startup"))
         return
