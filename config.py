@@ -286,6 +286,64 @@ ENTRY_MOMENTUM_SATURATION_PCT = float(os.environ.get("ENTRY_MOMENTUM_SATURATION_
 PROFIT_LOCK_ACTIVATION_USDT = float(os.environ.get("PROFIT_LOCK_ACTIVATION_USDT", "0.10"))
 PROFIT_LOCK_RATIO = float(os.environ.get("PROFIT_LOCK_RATIO", "0.50"))
 
+# --- 2026-08-19 Profit Lock / risk-geometry hardening (P1-P6) -----------------
+# Root incident: 15:28:19-15:28:20 UTC, LONG 82.43 -> 82.47, exit_reason=
+# profit_lock, REALIZED net -$0.0170 on a decision estimated at +$0.0936.
+#
+# P3 - PROFIT_LOCK_MIN_AGE_SEC: minimum seconds a position must have been open
+#   before Profit Lock may ARM. In the incident the lock armed 0.02s after the
+#   entry fill, on a mark price (82.695) 0.32% away from its own fill price
+#   (82.43), then closed 1.3s later. That peak was an artifact of price/fill
+#   incoherence and was never realizable. Peak TRACKING and the exit check are
+#   unaffected once armed - this only delays arming.
+PROFIT_LOCK_MIN_AGE_SEC = float(os.environ.get("PROFIT_LOCK_MIN_AGE_SEC", "4.0"))
+# P2 - PROFIT_LOCK_SLIPPAGE_ATR_MULT: the fee-safe floor Profit Lock requires
+#   before closing was a FLAT MIN_NET_PROFIT_USDT ($0.05). In a 0.33%-ATR tape
+#   one second of movement was worth $0.11 - more than twice the whole buffer.
+#   The floor is now max(MIN_NET_PROFIT_USDT, mult * atr_pct * notional), so it
+#   grows with volatility. At 0.5 x 0.333% x $79 that is ~$0.13.
+PROFIT_LOCK_SLIPPAGE_ATR_MULT = float(os.environ.get("PROFIT_LOCK_SLIPPAGE_ATR_MULT", "0.5"))
+
+# P4 - ATR-scaled risk geometry. Fixed-dollar thresholds on a fixed notional are
+#   INVERSELY proportional to volatility in ATR terms, which is why the same
+#   $0.15 loss trigger was ~3.5 ATR on 2026-08-18 (target unreachable at 12 ATR)
+#   and ~0.36 ATR on 2026-08-19 (stopped out by ordinary tick noise in 3.5s).
+#   Scaling both legs by ATR keeps the risk:reward ratio stable across regimes.
+#   The pre-existing dollar/percent values are retained as CAPS, per the agreed
+#   design - see the deployment notes about the cap binding at high ATR.
+ATR_RISK_SCALING_ENABLED = os.environ.get("ATR_RISK_SCALING_ENABLED", "true").lower() != "false"
+SL_ATR_MULT = float(os.environ.get("SL_ATR_MULT", "1.2"))
+# FLOOR on the ATR-scaled stop. Caught by test_new_features.py during
+# implementation: with the dollar value used purely as a CAP, a dead tape
+# (atr 0.02%) produced 1.2 x 0.0002 x $80 = a $0.02 stop - smaller than the
+# ~$0.055 round-trip fee, so the position could be stopped out before it could
+# ever cover its own costs, and the RR stop fired ahead of every other exit.
+# The effective stop is therefore clamped to
+# [max(SL_MIN_USD, 1.5 x round-trip fee), MAX_STOP_LOSS_USD].
+SL_MIN_USD = float(os.environ.get("SL_MIN_USD", "0.12"))
+TP_ATR_MULT = float(os.environ.get("TP_ATR_MULT", "2.5"))
+
+# P5 - Momentum-exhaustion guard. Both 2026-08-19 losses entered with
+#   momentum_magnitude saturated at exactly 1.0000 AND |flow_delta| ~1e5
+#   (+105,041 and +96,810) - i.e. the bot bought the top of a vertical move and
+#   immediately mean-reverted. Saturated momentum plus extreme one-sided flow is
+#   treated as LATE-ENTRY risk, not confirmation.
+MOMENTUM_EXHAUSTION_GUARD_ENABLED = os.environ.get(
+    "MOMENTUM_EXHAUSTION_GUARD_ENABLED", "true"
+).lower() != "false"
+MOMENTUM_EXHAUSTION_MAGNITUDE = float(os.environ.get("MOMENTUM_EXHAUSTION_MAGNITUDE", "1.0"))
+MOMENTUM_EXHAUSTION_FLOW_DELTA = float(os.environ.get("MOMENTUM_EXHAUSTION_FLOW_DELTA", "50000"))
+
+# P6 - Market-websocket reconnect cooldown. Both losing entries fired 1-3s after
+#   a bookTicker "1011 keepalive ping timeout" reconnect, and the incident tick
+#   showed a 0.32% incoherence between the bot's own price and its own fill.
+#   New entries are suppressed briefly after any market-stream reconnect so the
+#   price/orderbook series is coherent before a decision is made. Open-position
+#   management (TP/SL/Profit-Lock/Smart-Exit/DCA) is deliberately NOT gated.
+MARKET_WS_RECONNECT_COOLDOWN_SEC = float(
+    os.environ.get("MARKET_WS_RECONNECT_COOLDOWN_SEC", "3.0")
+)
+
 # --- Simple entry signal (warmup/fallback only, see BRAIN V2 below) ---------
 SIGNAL_LOOKBACK_TICKS = 20
 SIGNAL_DEADBAND_PCT = 0.0005
@@ -910,6 +968,16 @@ __all__ = [
     "ENTRY_MOMENTUM_SATURATION_PCT",
     "PROFIT_LOCK_ACTIVATION_USDT",
     "PROFIT_LOCK_RATIO",
+    "PROFIT_LOCK_MIN_AGE_SEC",
+    "PROFIT_LOCK_SLIPPAGE_ATR_MULT",
+    "ATR_RISK_SCALING_ENABLED",
+    "SL_ATR_MULT",
+    "SL_MIN_USD",
+    "TP_ATR_MULT",
+    "MOMENTUM_EXHAUSTION_GUARD_ENABLED",
+    "MOMENTUM_EXHAUSTION_MAGNITUDE",
+    "MOMENTUM_EXHAUSTION_FLOW_DELTA",
+    "MARKET_WS_RECONNECT_COOLDOWN_SEC",
     "SIGNAL_LOOKBACK_TICKS",
     "SIGNAL_DEADBAND_PCT",
     "TRADE_COOLDOWN_SEC",
