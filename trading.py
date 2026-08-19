@@ -279,6 +279,16 @@ from config import (
     ENTRY_MOMENTUM_SATURATION_PCT,
     PROFIT_LOCK_ACTIVATION_USDT,
     PROFIT_LOCK_RATIO,
+    PROFIT_LOCK_MIN_AGE_SEC,
+    PROFIT_LOCK_SLIPPAGE_ATR_MULT,
+    ATR_RISK_SCALING_ENABLED,
+    SL_ATR_MULT,
+    SL_MIN_USD,
+    TP_ATR_MULT,
+    MOMENTUM_EXHAUSTION_GUARD_ENABLED,
+    MOMENTUM_EXHAUSTION_MAGNITUDE,
+    MOMENTUM_EXHAUSTION_FLOW_DELTA,
+    MARKET_WS_RECONNECT_COOLDOWN_SEC,
     SIGNAL_LOOKBACK_TICKS,
     SIGNAL_DEADBAND_PCT,
     TRADE_COOLDOWN_SEC,
@@ -1339,7 +1349,36 @@ class EntryEngineV2:
         components["liquidity_guard_active"] = liquidity["active"]
         components["imbalance_threshold_used"] = liquidity["threshold"]
 
-        technical_ok = (not regime_blocked) and score >= active_threshold
+        # --- Momentum-exhaustion guard (2026-08-19 P5) -----------------------
+        # Both losses on 2026-08-19 shared one signature: momentum_magnitude
+        # saturated at exactly 1.0000 (the move already exceeded
+        # ENTRY_MOMENTUM_SATURATION_PCT, so the score component is clipped and
+        # can no longer distinguish "strong" from "blown off") together with an
+        # extreme one-sided flow_delta (+105,041 and +96,810). Both were LONGs
+        # into a vertical spike, and both mean-reverted within seconds:
+        #   14:54:45 LONG @ 80.55 -> stopped 80.42 in 3.5s
+        #   15:28:19 LONG @ 82.43 -> closed  82.47 in 1.3s (at a net loss)
+        # tp_hit_p read 0.9999 and 1.0000 at those moments - the model was
+        # maximally confident at exactly the wrong time.
+        #
+        # Saturated momentum + extreme aligned flow is therefore treated as
+        # LATE-ENTRY risk rather than confirmation. This is a hard block on the
+        # same footing as the regime / dead-market / counter-momentum gates: it
+        # can only ever reject a trade the old code would have taken.
+        # Deliberately requires BOTH conditions - saturated momentum alone is
+        # common and healthy in a real trend.
+        trade_delta = float(liquidity.get("trade_delta", 0.0) or 0.0)
+        momentum_exhausted = bool(
+            MOMENTUM_EXHAUSTION_GUARD_ENABLED
+            and liquidity["data_available"]
+            and momentum_magnitude >= MOMENTUM_EXHAUSTION_MAGNITUDE
+            and abs(trade_delta) >= MOMENTUM_EXHAUSTION_FLOW_DELTA
+        )
+        components["momentum_exhausted"] = momentum_exhausted
+
+        technical_ok = (
+            (not regime_blocked) and score >= active_threshold and not momentum_exhausted
+        )
         components["technical_signal"] = technical_ok
         # The three confirmation factors, all required.
         multi_factor_confirmed = (
@@ -1353,6 +1392,12 @@ class EntryEngineV2:
                 "dead_market_blocked" if dead_market_blocked
                 else "sideways_counter_momentum_blocked" if sideways_counter_momentum_blocked
                 else "regime_not_allowed"
+            )
+        elif momentum_exhausted:
+            rejection_reason = (
+                f"momentum_exhausted: magnitude {momentum_magnitude:.4f} saturated with "
+                f"flow_delta {trade_delta:+.2f} (>= {MOMENTUM_EXHAUSTION_FLOW_DELTA:.0f}) - "
+                f"late entry into an exhausted move"
             )
         elif not technical_ok:
             rejection_reason = f"score {score:.4f} below threshold {active_threshold:.4f}"
@@ -1371,6 +1416,7 @@ class EntryEngineV2:
                 f"{now_str()} [entry-debug] regime={regime.regime} "
                 f"regime_blocked={regime_blocked} dead_market_blocked={dead_market_blocked} "
                 f"counter_momentum_blocked={sideways_counter_momentum_blocked} "
+                f"momentum_exhausted={momentum_exhausted} "
                 f"atr_pct={regime.atr_pct:.6f} "
                 f"brain_confidence={components['brain_confidence']:.4f} "
                 f"trend_confidence={components['trend_confidence']:.4f} "
@@ -2107,6 +2153,12 @@ class MartingaleManager:
         # genuinely unmatchable fill is retried once and then left alone
         # instead of re-fetching Binance history on every poll.
         self._orphan_rewind_attempted_id: Optional[int] = None
+        # 2026-08-19 P6: when a market data stream last (re)connected, and which
+        # one. Written only by note_market_stream_reconnect(); read by the entry
+        # gate to suppress NEW entries for a moment after a discontinuity.
+        self._last_market_stream_reconnect_ts: float = 0.0
+        self._last_market_stream_reconnect_label: str = ""
+        self._last_ws_settle_skip_log_ts: float = 0.0  # throttles the [entry-skip] ws-settling line
 
         # --- Brain V2 stack -----------------------------------------------------
         self.candles = CandleAggregator()
@@ -3769,8 +3821,12 @@ class MartingaleManager:
     # nothing that already protected a position was weakened or removed.
 
     def rr_stop_loss_usd(self) -> float:
-        """Hard fee-net loss ceiling for one trade ($0.20 by default)."""
-        return MAX_STOP_LOSS_USD
+        """Hard fee-net loss ceiling for one trade ($0.20 by default).
+
+        2026-08-19 P4: now ATR-scaled via atr_scaled_stop_loss_usd(), which is
+        capped at MAX_STOP_LOSS_USD - so this can only ever return the same
+        value or a TIGHTER one, never a looser one than before."""
+        return self.atr_scaled_stop_loss_usd()
 
     def rr_target_profit_usd(self) -> float:
         """Fee-net profit target for one trade ($0.40 by default)."""
@@ -3792,6 +3848,102 @@ class MartingaleManager:
     def rr_ratio(self) -> float:
         """Realized reward:risk of the configured envelope, for logging."""
         return safe_div(TARGET_PROFIT_USD, MAX_STOP_LOSS_USD, 0.0)
+
+    def _position_notional_usdt(self) -> float:
+        """Current position notional (avg entry x qty), 0.0 when flat."""
+        p = self.position
+        if not p.avg_entry_price or p.total_qty <= 0:
+            return 0.0
+        return p.avg_entry_price * p.total_qty
+
+    def _profit_lock_min_net_floor(self) -> float:
+        """2026-08-19 P2. Minimum executable net PnL Profit Lock must still see
+        before it is allowed to close.
+
+        max(MIN_NET_PROFIT_USDT, PROFIT_LOCK_SLIPPAGE_ATR_MULT * atr_pct *
+        notional) - a flat $0.05 buffer is meaningless when one second of a
+        0.33%-ATR tape is worth $0.11. Falls back to the flat floor whenever
+        ATR is unavailable (warm-up, atr_pct == 0.0), which preserves the
+        pre-fix behavior rather than guessing."""
+        floor = MIN_NET_PROFIT_USDT
+        atr_pct = self.last_regime.atr_pct if self.last_regime else 0.0
+        notional = self._position_notional_usdt()
+        if atr_pct > 0 and notional > 0 and PROFIT_LOCK_SLIPPAGE_ATR_MULT > 0:
+            floor = max(floor, PROFIT_LOCK_SLIPPAGE_ATR_MULT * atr_pct * notional)
+        return floor
+
+    def atr_scaled_stop_loss_usd(self) -> float:
+        """2026-08-19 P4. Per-trade fee-net loss ceiling, scaled by ATR.
+
+        SL_ATR_MULT (1.2) x atr_pct x notional, CAPPED at the pre-existing
+        MAX_STOP_LOSS_USD so this can only ever tighten risk, never widen it
+        beyond what was already authorised. Returns the unchanged dollar value
+        when scaling is disabled or ATR/notional are unavailable.
+
+        NOTE ON THE CAP: at high volatility the ATR term exceeds the cap and the
+        cap binds, so the stop stays at MAX_STOP_LOSS_USD. On 2026-08-19
+        (atr 0.333%, notional $79) 1.2 ATR = $0.316 vs a $0.20 cap - the stop
+        widens from 0.36 ATR to 0.76 ATR, an improvement but not the full
+        1.2 ATR. Raising MAX_TRADE_NET_LOSS_USDT / MAX_STOP_LOSS_USD is a
+        deliberate risk decision and is left to the operator."""
+        base = MAX_STOP_LOSS_USD
+        if not ATR_RISK_SCALING_ENABLED or SL_ATR_MULT <= 0:
+            return base
+        atr_pct = self.last_regime.atr_pct if self.last_regime else 0.0
+        notional = self._position_notional_usdt()
+        if atr_pct <= 0 or notional <= 0:
+            return base
+        p = self.position
+        # FLOOR (see SL_MIN_USD in config.py): a stop tighter than the round
+        # trip fee is unwinnable by construction - the trade would be stopped
+        # out before it could ever cover its own costs. Clamp to
+        # [max(SL_MIN_USD, 1.5 x fees), MAX_STOP_LOSS_USD].
+        fee_est = self.estimate_round_trip_fee_usdt(
+            p.total_qty, p.avg_entry_price, self.current_price or p.avg_entry_price
+        )
+        floor = min(base, max(SL_MIN_USD, 1.5 * fee_est))
+        return min(base, max(floor, SL_ATR_MULT * atr_pct * notional))
+
+    def atr_scaled_take_profit_pct(self, base_tp_pct: float) -> float:
+        """2026-08-19 P4. Take-profit distance as a multiple of ATR.
+
+        TP_ATR_MULT (2.5) x atr_pct, floored at the caller's existing base TP so
+        a quiet tape never SHRINKS the target below what was configured, and
+        capped at TAKE_PROFIT_MAX_PCT so a volatility spike cannot push the
+        target somewhere unreachable. Together with atr_scaled_stop_loss_usd()
+        above this keeps the risk:reward geometry roughly constant across
+        regimes instead of inverting between them - the single root cause behind
+        both the 2026-08-18 (target 12 ATR away, unreachable) and 2026-08-19
+        (stop 0.36 ATR away, noise-triggered) loss clusters."""
+        if not ATR_RISK_SCALING_ENABLED or TP_ATR_MULT <= 0:
+            return base_tp_pct
+        atr_pct = self.last_regime.atr_pct if self.last_regime else 0.0
+        if atr_pct <= 0:
+            return base_tp_pct
+        return clamp(TP_ATR_MULT * atr_pct, base_tp_pct, TAKE_PROFIT_MAX_PCT)
+
+    def note_market_stream_reconnect(self, label: str = "") -> None:
+        """2026-08-19 P6. Called by websocket.py whenever a MARKET data stream
+        (re)connects. Starts a short window during which no NEW entry may be
+        opened, so a decision is never made on a price/orderbook series that has
+        just been discontinuous.
+
+        Both 2026-08-19 losses were accepted 1-3s after a bookTicker
+        "1011 keepalive ping timeout" reconnect, and the second showed a 0.32%
+        incoherence between the bot's own current price and its own fill price.
+        Open-position management (TP / SL / Profit Lock / Smart Exit / DCA) is
+        deliberately NOT gated by this - an open position must always stay
+        managed."""
+        self._last_market_stream_reconnect_ts = time.time()
+        self._last_market_stream_reconnect_label = label or "market-ws"
+
+    def market_stream_settling(self) -> float:
+        """Seconds still remaining in the post-reconnect entry cooldown (0.0 if
+        none). Read-only."""
+        if MARKET_WS_RECONNECT_COOLDOWN_SEC <= 0 or not self._last_market_stream_reconnect_ts:
+            return 0.0
+        elapsed = time.time() - self._last_market_stream_reconnect_ts
+        return max(0.0, MARKET_WS_RECONNECT_COOLDOWN_SEC - elapsed)
 
     def update_price_history(self, price: float) -> None:
         self.price_history.append(price)
@@ -3994,6 +4146,11 @@ class MartingaleManager:
         # for a fresh (step-0) position in a non-trending/non-sideways
         # regime is unchanged (scale == 1.0).
         adaptive_tp = base_tp * self._adaptive_scale_factor()
+        # 2026-08-19 P4: express the target as a multiple of ATR (floored at the
+        # adaptive value just computed, capped at TAKE_PROFIT_MAX_PCT), so the
+        # target scales with how far price can actually travel. Inert whenever
+        # ATR_RISK_SCALING_ENABLED=false or ATR is unavailable.
+        adaptive_tp = self.atr_scaled_take_profit_pct(adaptive_tp)
         return clamp(
             adaptive_tp,
             TAKE_PROFIT_PCT * ADAPTIVE_TP_MIN_RATIO,
@@ -4549,6 +4706,24 @@ class MartingaleManager:
                         f"(candles={len(candles)}/{max(EMA_SLOW, ATR_PERIOD) + 2}, "
                         f"atr_pct={self.last_regime.atr_pct:.6f}) - indicators not yet valid, "
                         f"no entries opened", GRAY,
+                    ))
+                return
+
+            # 2026-08-19 P6: market-websocket reconnect cooldown. NEW entries
+            # only - an already-open position keeps being managed normally by
+            # TP / Hard Stop / Profit Lock / Smart Exit / DCA below, which must
+            # never be gated on feed freshness.
+            settling_sec = self.market_stream_settling()
+            if settling_sec > 0:
+                now_ts = time.time()
+                if now_ts - self._last_ws_settle_skip_log_ts >= 30.0:
+                    self._last_ws_settle_skip_log_ts = now_ts
+                    print(color(
+                        f"{now_str()} [entry-skip] market stream "
+                        f"({self._last_market_stream_reconnect_label}) reconnected "
+                        f"{MARKET_WS_RECONNECT_COOLDOWN_SEC - settling_sec:.1f}s ago - holding new "
+                        f"entries for another {settling_sec:.1f}s so the price/orderbook series is "
+                        f"coherent before deciding. Open-position management is unaffected.", GRAY,
                     ))
                 return
 
@@ -6645,7 +6820,26 @@ class MartingaleManager:
         # and every other gate below: once armed, it protects profit on its
         # own terms and can close the position before Partial TP / TP /
         # Smart Exit / DCA are ever evaluated this tick.
-        unrealized_pnl_usdt = self.estimate_net_pnl_usdt(price)
+        # 2026-08-19 P1: Profit Lock now decides on the EXECUTABLE closing-side
+        # price (best_bid for a LONG, best_ask for a SHORT) and the ACTUAL
+        # accumulated commission, via estimate_net_pnl_usdt_executable() - the
+        # same estimator the per-trade loss budget and the protective-stop
+        # calculation already use.
+        #
+        # Before this, Profit Lock used estimate_net_pnl_usdt(price): the
+        # mid/mark tick price with BOTH legs estimated at TAKER_FEE_RATE. That
+        # estimator's own docstring notes it was kept "deliberately separate"
+        # from the executable one so the loss-budget change "cannot alter any of
+        # THEIR existing behavior" - which left Profit Lock deciding on mid and
+        # executing at the bid. Measured cost of that gap on 2026-08-19:
+        #   loss budget  (executable estimator): est -0.1548 -> real -0.1845  (-0.030)
+        #   profit lock  (mid/mark estimator)  : est +0.0936 -> real -0.0170  (-0.111)
+        # i.e. 3.7x the error on the optimistic path, in the same market.
+        #
+        # `price` is still used for every OTHER consumer below (TP, Smart Exit,
+        # diagnostics) exactly as before - only the Profit Lock decision value
+        # changes here.
+        unrealized_pnl_usdt = self.estimate_net_pnl_usdt_executable()
 
         # 2026-08 Profit Lock debug diagnostics (Issue 2 - logging only, no
         # behavior change: everything below this block, starting with the
@@ -6752,7 +6946,33 @@ class MartingaleManager:
         if unrealized_pnl_usdt <= 0:
             pass
         else:
-            if not p.profit_lock_active and unrealized_pnl_usdt >= PROFIT_LOCK_ACTIVATION_USDT:
+            # 2026-08-19 P3: a position must be at least PROFIT_LOCK_MIN_AGE_SEC
+            # old before Profit Lock may ARM. In the 15:28 incident the lock
+            # armed 0.02 SECONDS after the entry fill, on a mark price 0.32%
+            # away from its own fill price, and closed 1.3s later at a realized
+            # loss. That peak was an artifact of entry-fill/price incoherence,
+            # not of the trade working. Delaying arming lets the price series
+            # settle first. Peak tracking and the exit check below are NOT
+            # gated - once armed, the lock behaves exactly as before.
+            position_age_sec = time.time() - p.opened_at if p.opened_at else 0.0
+            too_young_to_arm = (
+                not p.profit_lock_active
+                and PROFIT_LOCK_MIN_AGE_SEC > 0
+                and position_age_sec < PROFIT_LOCK_MIN_AGE_SEC
+            )
+            if too_young_to_arm and unrealized_pnl_usdt >= PROFIT_LOCK_ACTIVATION_USDT:
+                if self._should_log_profit_lock_peak_update():
+                    print(color(
+                        f"{now_str()} [profit-lock] arming DEFERRED - position is only "
+                        f"{position_age_sec:.2f}s old (< {PROFIT_LOCK_MIN_AGE_SEC:.1f}s minimum) "
+                        f"while executable net=${unrealized_pnl_usdt:+.4f}; waiting for the price "
+                        f"series to settle before locking a peak.", GRAY,
+                    ))
+            if (
+                not p.profit_lock_active
+                and not too_young_to_arm
+                and unrealized_pnl_usdt >= PROFIT_LOCK_ACTIVATION_USDT
+            ):
                 p.profit_lock_active = True
                 p.peak_unrealized_pnl = unrealized_pnl_usdt
                 # 2026-08 Profit Lock diagnostics (logging only - activation/
@@ -6832,15 +7052,34 @@ class MartingaleManager:
                 # this additional floor isn't met, Profit Lock simply holds
                 # for this tick instead of closing - Hard Stop/Smart Exit
                 # remain fully active as the risk backstop either way.
-                if unrealized_pnl_usdt <= locked_profit and unrealized_pnl_usdt >= MIN_NET_PROFIT_USDT:
+                # 2026-08-19 P2: the fee-safe floor is now VOLATILITY-AWARE.
+                # It used to be a flat MIN_NET_PROFIT_USDT ($0.05), sized for a
+                # normal spread. In the 15:28 incident the market moved 0.17%
+                # between decision and fill - $0.11 on this notional, more than
+                # TWICE the entire buffer - so the guard passed (+0.0936 >=
+                # 0.05) and the close still realized -$0.0170. Scaling the floor
+                # by ATR makes the buffer track how far price can actually
+                # travel in the decision-to-fill window.
+                slippage_floor = self._profit_lock_min_net_floor()
+                if unrealized_pnl_usdt <= locked_profit and unrealized_pnl_usdt >= slippage_floor:
                     await self.close_position(
                         f"PROFIT LOCK: unrealized pnl ${unrealized_pnl_usdt:+.4f} fell to/below "
                         f"locked level ${locked_profit:+.4f} (peak=${p.peak_unrealized_pnl:+.4f}, "
-                        f"ratio={PROFIT_LOCK_RATIO*100:.0f}%, fee-safe floor=${MIN_NET_PROFIT_USDT:.4f})",
+                        f"ratio={PROFIT_LOCK_RATIO*100:.0f}%, vol-aware fee-safe floor="
+                        f"${slippage_floor:.4f})",
                         exit_reason_tag="profit_lock",
                         expected_position=p,
                     )
                     return
+                if unrealized_pnl_usdt <= locked_profit and self._should_log_profit_lock_peak_update():
+                    print(color(
+                        f"{now_str()} [profit-lock] HOLDING - executable net "
+                        f"${unrealized_pnl_usdt:+.4f} is at/below the locked level "
+                        f"${locked_profit:+.4f} but under the vol-aware fee-safe floor "
+                        f"${slippage_floor:.4f} (atr%={self.last_regime.atr_pct*100:.3f}); closing "
+                        f"here would likely realize a loss after slippage. Hard Stop / Smart Exit "
+                        f"remain active.", GRAY,
+                    ))
 
         # --- Max Hold Time Protection (scalping-bot safety net) --------------------
         # This is a scalping bot; positions are meant to resolve in minutes,

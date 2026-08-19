@@ -429,6 +429,15 @@ async def _run_single_market_stream(
                 url, ping_interval=15, ping_timeout=10, max_queue=2048
             ) as ws:
                 print(color(f"[market-ws:{label}] connected.", GREEN))
+                # 2026-08-19 P6: tell the manager a market stream just
+                # (re)connected, so it can hold NEW entries for a moment while
+                # the price/orderbook series settles. Both losing entries on
+                # 2026-08-19 were accepted 1-3s after a bookTicker "1011
+                # keepalive ping timeout" reconnect. getattr-guarded so any
+                # manager stub without the method is completely unaffected.
+                note_reconnect = getattr(manager, "note_market_stream_reconnect", None)
+                if callable(note_reconnect):
+                    note_reconnect(label)
                 backoff = 1.0
                 last_msg_time = time.time()
 
