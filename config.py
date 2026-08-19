@@ -225,7 +225,27 @@ CLOSE_VERIFY_MAX_RETRIES = int(os.environ.get("CLOSE_VERIFY_MAX_RETRIES", "3"))
 # atr_pct, independent of that ratio, so only truly dead conditions are
 # blocked - normal ranging/SIDEWAYS markets above this floor are unaffected.
 LOW_VOLATILITY_FILTER_ENABLED = os.environ.get("LOW_VOLATILITY_FILTER_ENABLED", "true").lower() != "false"
-LOW_VOLATILITY_ATR_PCT_THRESHOLD = float(os.environ.get("LOW_VOLATILITY_ATR_PCT_THRESHOLD", "0.00015"))
+# 2026-08-18 fee-drag recalibration (value only - the gate itself is unchanged
+# and already existed; see FeatureBuilderV2's dead_market_blocked check).
+# Raised from 0.00015 (0.015%) to 0.0008 (0.08%) after three consecutive losing
+# scalps in a dead tape:
+#
+#   SHORT 76.90->76.99  atr%=0.032   net -$0.1496
+#   SHORT 77.18->77.27  atr%=0.044   net -$0.1483
+#   LONG  77.28->77.21  atr%=0.029   net -$0.1118
+#
+# Every one of those ran at 0.029%-0.044% ATR - well ABOVE the old 0.015%
+# floor, so dead_market_blocked stayed False and all three were allowed. At
+# that volatility the take-profit floor (+0.35%) sits 8-12 ATR away while the
+# per-trade loss budget stops out at ~3 ATR, so the target is ~4x less
+# reachable than the stop and the strategy is negative-expectancy before any
+# edge is considered. Round-trip fees (~0.07-0.10% of notional) alone consume
+# a third of a winning move at this ATR.
+#
+# 0.0008 makes the +0.35% take-profit ~4x ATR instead of ~12x - a distance a
+# real move can actually cover - and keeps the bot flat through exactly the
+# chop that produced the losing streak.
+LOW_VOLATILITY_ATR_PCT_THRESHOLD = float(os.environ.get("LOW_VOLATILITY_ATR_PCT_THRESHOLD", "0.0008"))
 
 # --- Percentage Adaptive TP/DCA System (NEW) ---------------------------------
 # Applies a bounded multiplier on TOP of the existing ATR-based dynamic TP
@@ -447,7 +467,31 @@ BRAIN_HEAD_MIN_SAMPLES = int(os.environ.get("BRAIN_HEAD_MIN_SAMPLES", "20"))
 
 # --- Entry Engine V2 ---------------------------------------------------------
 ENTRY_SCORE_THRESHOLD = float(os.environ.get("ENTRY_SCORE_THRESHOLD", "0.75"))  # raised from 0.60 (2026-07 profitability fix)
-SIDEWAYS_ENTRY_SCORE_THRESHOLD = float(os.environ.get("SIDEWAYS_ENTRY_SCORE_THRESHOLD", "0.60"))  # SIDEWAYS is structurally capped lower (volatility_fit/regime_fit/momentum), all other regimes unchanged at 0.75
+# 2026-08-18: raised 0.60 -> 0.63. This is the threshold that actually gated
+# the losing streak - all three trades were SIDEWAYS, so ENTRY_SCORE_THRESHOLD
+# (0.75) never applied. The accepted scores were 0.6021 / 0.6093 / 0.6251
+# against a 0.6000 bar: the bot was systematically taking only its WEAKEST
+# qualifying signals, clearing the gate by as little as 0.002.
+#
+# WHY 0.63 AND NOT 0.65/0.70 - measured, not guessed. The SIDEWAYS composite
+# score is structurally capped: volatility_fit is fixed at 0.40 and regime_fit
+# at 0.50 for this regime, so even a PERFECT SIDEWAYS setup (saturated aligned
+# momentum, volume_z=2.0, low risk) tops out at 0.6358. Live-accepted scores
+# ranged 0.6021-0.6251. So:
+#
+#   0.63 -> rejects 0.6021 and 0.6093 (the two marginal losers), keeps the
+#           strongest live setup (0.6251) and a clean aligned one (0.6358)
+#           tradable. A genuine filter.
+#   0.65 -> above the ENTIRE observed distribution AND above the structural
+#           maximum of 0.6358. That is not a filter, it is an off-switch for
+#           SIDEWAYS trading.
+#   0.70 -> unreachable in this regime under any conditions.
+#
+# The ATR floor (LOW_VOLATILITY_ATR_PCT_THRESHOLD, above) already blocks all
+# three losing trades on its own and is the principled gate here; this
+# threshold is the secondary filter. Set SIDEWAYS_ENTRY_SCORE_THRESHOLD=0.65
+# in the environment if you deliberately want SIDEWAYS entries off entirely.
+SIDEWAYS_ENTRY_SCORE_THRESHOLD = float(os.environ.get("SIDEWAYS_ENTRY_SCORE_THRESHOLD", "0.63"))  # SIDEWAYS is structurally capped lower (volatility_fit/regime_fit/momentum), all other regimes unchanged at 0.75
 # Clean Live entry evidence exposed a directional scoring hole: the entry
 # engine rewarded abs(momentum), so a strong upward move boosted a proposed
 # SHORT exactly like a LONG. In SIDEWAYS, block a meaningful counter move

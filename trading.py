@@ -5605,13 +5605,38 @@ class MartingaleManager:
     # payloads and short names on the wire, and the Algo Service migration
     # is recent enough that both appear in the wild. Ordered most-specific
     # first; the first non-empty match wins.
+    # CORRECTED 2026-08-18 against the real LIVE envelope, which this handler's
+    # own UNATTRIBUTED diagnostic finally captured once fix A made the failure
+    # visible:
+    #
+    #   envelope_keys=['E','T','e','o']
+    #   payload_keys =['R','S','V','X','ai','aid','at','caid','cp','f','gtd',
+    #                  'ia','o','p','pP','pm','ps','q','s','tp','tt','wt']
+    #
+    # Two corrections the live data forced, both of which the first pass got
+    # wrong by guessing:
+    #
+    #   1. The ids are `aid` / `caid` - NOT the `ai` / `cai` originally
+    #      guessed. `ai` IS present in the payload but is something else
+    #      entirely, so it is deliberately NOT listed: reading an unknown
+    #      field as the algoId is exactly the class of guess that caused the
+    #      original incident.
+    #   2. Status is `X`. The first pass listed `S` ahead of `X`, and `S` is
+    #      the SIDE field - so every live event parsed as status="SELL",
+    #      matched no status branch, and did nothing. `S` is now removed
+    #      entirely; it is never a status under any Binance spelling.
+    #
+    # Verbose/documented spellings are kept first so a REST payload (which
+    # uses algoId/clientAlgoId/algoStatus/actualOrderId) still parses through
+    # the same table - _resolve_protective_algo_via_rest() feeds its result
+    # straight into _register_protective_child_order().
     _ALGO_FIELD_ALIASES = {
-        "algo_id": ("algoId", "algoID", "algo_id", "strategyId", "ai", "si"),
+        "algo_id": ("algoId", "algoID", "algo_id", "aid", "strategyId", "si"),
         "client_algo_id": (
-            "clientAlgoId", "clientAlgoID", "client_algo_id", "cai", "clientOrderId", "c",
+            "clientAlgoId", "clientAlgoID", "client_algo_id", "caid", "clientOrderId", "c",
         ),
         "status": (
-            "algoStatus", "algo_status", "strategyStatus", "status", "as", "st", "S", "X",
+            "algoStatus", "algo_status", "strategyStatus", "status", "X", "as", "st",
         ),
         "actual_order_id": (
             "actualOrderId", "actualOrderID", "actual_order_id", "aoi", "orderId", "i",
