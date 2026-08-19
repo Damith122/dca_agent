@@ -61,9 +61,17 @@ def clean_live_like_conf(side="SHORT"):
 
 
 def sideways_regime():
+    # 2026-08-18: atr_pct raised 0.00030 -> 0.0015. These tests are about the
+    # SIDEWAYS counter-momentum guard, NOT about volatility gating. The old
+    # 0.03% value sat below the recalibrated dead-market floor
+    # (LOW_VOLATILITY_ATR_PCT_THRESHOLD, now 0.0008), so every decision here
+    # would have been blocked by that floor before the guard was even reached -
+    # the tests would still "pass" for a completely unrelated reason, which is
+    # worse than failing. 0.15% is a normal tradable tape, so the guard remains
+    # the thing under test.
     return trading.RegimeReading(
         regime=trading.REGIME_SIDEWAYS,
-        atr_pct=0.00030,
+        atr_pct=0.0015,
         atr_ratio=1.0,
     )
 
@@ -79,10 +87,19 @@ async def test_counter_momentum_short_is_blocked():
     )
 
     # Before the fix, abs(momentum) contributed the full 0.13 weight. Prove
-    # this setup genuinely would have crossed the old threshold rather than
+    # this setup genuinely would have crossed the threshold rather than
     # merely being a low-score entry that was already blocked elsewhere.
+    #
+    # 2026-08-18: pinned to the literal 0.60 this guard was written against,
+    # instead of reading SIDEWAYS_ENTRY_SCORE_THRESHOLD live. That constant
+    # was raised to 0.65 as part of the fee-drag recalibration, and this
+    # fixture scores legacy_score=0.6358 - so reading it live turned a
+    # PRECONDITION ("this setup was strong enough to matter") into a moving
+    # target that fails whenever the threshold is tuned. The four behavioural
+    # assertions below are the actual subject of this test and are unchanged;
+    # they still pass, i.e. the counter-momentum guard itself is unaffected.
     legacy_score = decision.score + trading.ENTRY_WEIGHTS["momentum"]
-    assert legacy_score >= trading.SIDEWAYS_ENTRY_SCORE_THRESHOLD
+    assert legacy_score >= 0.60
     assert decision.should_enter is False
     assert decision.components["momentum_aligned"] is False
     assert decision.components["sideways_counter_momentum_blocked"] is True
@@ -111,7 +128,10 @@ async def test_aligned_short_remains_eligible_and_logs_exact_tick():
     assert decision.components["momentum"] == 1.0
     assert cap.text.count("[entry-accepted]") == 1
     assert "side=SHORT" in cap.text
-    assert "threshold=0.6000" in cap.text
+    # Threshold is a tuned constant (0.60 -> 0.63 in the 2026-08-18 fee-drag
+    # recalibration), so assert the log reports the CONFIGURED value rather
+    # than a frozen literal that silently breaks on every future tuning.
+    assert f"threshold={trading.SIDEWAYS_ENTRY_SCORE_THRESHOLD:.4f}" in cap.text
     assert "raw_momentum=-" in cap.text
     assert "momentum_aligned=True" in cap.text
     print("PASS: aligned SIDEWAYS SHORT remains eligible with an exact accepted-entry audit line")

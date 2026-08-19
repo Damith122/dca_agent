@@ -177,8 +177,10 @@ def test_extractor_handles_every_envelope_shape():
         "flat / no wrapper": {
             "e": "ALGO_UPDATE", "algoId": 7, "clientAlgoId": "bv2ps-1-1",
             "algoStatus": "TRIGGERED", "actualOrderId": 42},
-        "short wire names": {"e": "ALGO_UPDATE", "ao": {
-            "ai": 7, "cai": "bv2ps-1-1", "as": "TRIGGERED", "aoi": 42}},
+        # Real production short names, confirmed against the live envelope
+        # captured 2026-08-18 (see test_real_live_envelope_parses_correctly).
+        "short wire names (live)": {"e": "ALGO_UPDATE", "o": {
+            "aid": 7, "caid": "bv2ps-1-1", "X": "TRIGGERED", "aoi": 42}},
         "nested one level deeper": {"e": "ALGO_UPDATE", "data": {"algo": {
             "algoId": 7, "clientAlgoId": "bv2ps-1-1", "algoStatus": "TRIGGERED",
             "actualOrderId": 42}}},
@@ -200,6 +202,81 @@ def test_extractor_handles_every_envelope_shape():
     assert (algo_id, client_algo_id, status, actual) == (None, "", "", None)
     trading.MartingaleManager._extract_algo_fields(None)  # must not raise
     print("TEST 2: PASS - every envelope shape parses; an empty one stays empty\n")
+
+
+# ----------------------------------------------------------------------------
+# TEST 2b: the REAL live envelope, captured 2026-08-18 19:33:23 by fix A's own
+# UNATTRIBUTED diagnostic. This is the shape that caused the original incident
+# and that the first alias table still mis-parsed (as status="SELL").
+# ----------------------------------------------------------------------------
+def test_real_live_envelope_parses_correctly():
+    print("=== test_real_live_envelope_parses_correctly ===")
+
+    # Payload keys exactly as logged in production:
+    #   ['R','S','V','X','ai','aid','at','caid','cp','f','gtd','ia','o','p',
+    #    'pP','pm','ps','q','s','tp','tt','wt']
+    live_event = {
+        "e": "ALGO_UPDATE", "E": 1787081603348, "T": 1787081603348,
+        "o": {
+            "s": "SOLUSDT",
+            "S": "SELL",                       # SIDE - must never be read as status
+            "o": "STOP_MARKET",
+            "f": "GTC",
+            "q": "0",
+            "p": "0",
+            "tp": "77.2100",
+            "X": "NEW",                        # the REAL status field
+            "aid": 3000002144201146,           # the REAL algoId
+            "caid": "bv2ps-7081603348-1",      # the REAL clientAlgoId
+            "ai": 0,                           # present, meaning unknown - must be ignored
+            "cp": True, "ps": "BOTH", "R": False, "wt": "MARK_PRICE",
+            "pP": False, "V": "NONE", "pm": "NONE", "gtd": 0,
+            "at": "CONDITIONAL", "ia": False, "tt": "NONE",
+        },
+    }
+
+    _, algo_id, client_algo_id, status, actual = trading.MartingaleManager._extract_algo_fields(live_event)
+    print(f"TEST 2b: algoId={algo_id} clientAlgoId={client_algo_id} status={status} actualOrderId={actual}")
+
+    assert str(algo_id) == "3000002144201146", (
+        f"algoId must come from 'aid', not the unknown 'ai' field (got {algo_id})"
+    )
+    assert client_algo_id == "bv2ps-7081603348-1", "clientAlgoId must come from 'caid'"
+    assert status == "NEW", (
+        f"status must come from 'X'. The pre-correction table listed 'S' first and "
+        f"parsed every live event as status='SELL' (got {status!r})"
+    )
+    assert status != "SELL", "'S' is the SIDE field and must never be read as a status"
+    assert actual is None, "this event predates the trigger - no child order id yet"
+    print("TEST 2b: PASS - the real production envelope parses correctly\n")
+
+
+# ----------------------------------------------------------------------------
+# TEST 2c: ownership now resolves on the live envelope, so a NEW event for our
+# own stop is adopted instead of being logged as UNATTRIBUTED.
+# ----------------------------------------------------------------------------
+async def test_live_envelope_is_attributed_to_our_stop():
+    print("=== test_live_envelope_is_attributed_to_our_stop ===")
+
+    m = open_short_at_76_90(make_manager())
+    m.position.protective_stop_algo_id = 3000002144201146
+    m.position.protective_stop_client_algo_id = "bv2ps-7081603348-1"
+
+    with Capture() as cap:
+        await m.handle_algo_update({"e": "ALGO_UPDATE", "o": {
+            "s": "SOLUSDT", "S": "SELL", "X": "NEW",
+            "aid": 3000002144201146, "caid": "bv2ps-7081603348-1", "ai": 0,
+            "cp": True, "wt": "MARK_PRICE", "tp": "76.9900",
+        }})
+
+    print(f"TEST 2c: unattributed={'UNATTRIBUTED' in cap.text}")
+    print(f"TEST 2c: attributed_diagnostic={'[algo-update] algoId=' in cap.text}")
+    assert "UNATTRIBUTED" not in cap.text, (
+        "our own stop must now be recognised - this is the exact event that was "
+        "logged as UNATTRIBUTED in production before the alias correction"
+    )
+    assert "status=NEW" in cap.text, "the NEW status must be parsed and reported"
+    print("TEST 2c: PASS - the live envelope is attributed to our tracked stop\n")
 
 
 # ----------------------------------------------------------------------------
@@ -557,9 +634,111 @@ async def test_reset_still_happens_if_reconcile_fails():
     print("TEST 9: PASS - a reconciliation failure never blocks the reset\n")
 
 
+# ============================================================================
+# ENTRY-GATE RECALIBRATION (2026-08-18 losing streak)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# TEST 10: the ATR floor and SIDEWAYS threshold must now reject the three real
+# trades that produced the streak, and must NOT reject a healthy setup.
+# ----------------------------------------------------------------------------
+def test_recalibrated_gates_reject_the_losing_streak():
+    print("=== test_recalibrated_gates_reject_the_losing_streak ===")
+
+    import config
+
+    # The three live trades, exactly as logged by [entry-accepted].
+    streak = [
+        ("SHORT 76.90->76.99", 0.000320, 0.6021),
+        ("SHORT 77.18->77.27", 0.000444, 0.6093),
+        ("LONG  77.28->77.21", 0.000287, 0.6251),
+    ]
+
+    print(f"TEST 10: ATR floor={config.LOW_VOLATILITY_ATR_PCT_THRESHOLD} "
+          f"SIDEWAYS threshold={config.SIDEWAYS_ENTRY_SCORE_THRESHOLD}")
+
+    for label, atr_pct, score in streak:
+        dead_blocked = (
+            config.LOW_VOLATILITY_FILTER_ENABLED
+            and atr_pct > 0
+            and atr_pct < config.LOW_VOLATILITY_ATR_PCT_THRESHOLD
+        )
+        score_blocked = score < config.SIDEWAYS_ENTRY_SCORE_THRESHOLD
+        print(f"TEST 10: {label}  atr%={atr_pct*100:.4f} score={score:.4f} "
+              f"-> dead_market_blocked={dead_blocked} score_blocked={score_blocked}")
+        assert dead_blocked, (
+            f"{label}: atr_pct={atr_pct} must now be below the {config.LOW_VOLATILITY_ATR_PCT_THRESHOLD} "
+            f"floor - this is the gate that let all three dead-tape trades through"
+        )
+
+    # The raised score bar is the SECONDARY filter: at 0.63 it rejects the two
+    # marginal entries (0.6021, 0.6093) while still allowing the strongest one
+    # (0.6251). That is deliberate - the SIDEWAYS composite is structurally
+    # capped at 0.6358 (volatility_fit 0.40, regime_fit 0.50), so a bar above
+    # that would disable SIDEWAYS trading rather than filter it. The ATR floor
+    # above is what actually blocks all three.
+    blocked_by_score = sum(1 for _, _, sc in streak if sc < config.SIDEWAYS_ENTRY_SCORE_THRESHOLD)
+    print(f"TEST 10: {blocked_by_score}/3 also blocked by the raised SIDEWAYS score bar")
+    assert blocked_by_score >= 2, "the two marginal entries must fail the raised bar"
+    assert config.SIDEWAYS_ENTRY_SCORE_THRESHOLD <= 0.6358, (
+        "the SIDEWAYS threshold must stay at or below the regime's structural "
+        "maximum composite score (0.6358) - above it, no SIDEWAYS entry can ever "
+        "qualify and the bar becomes an off-switch instead of a filter"
+    )
+
+    # A healthy setup - real volatility and a strong score - still passes both.
+    healthy_atr, healthy_score = 0.0015, 0.6358
+    assert not (
+        config.LOW_VOLATILITY_FILTER_ENABLED
+        and healthy_atr > 0
+        and healthy_atr < config.LOW_VOLATILITY_ATR_PCT_THRESHOLD
+    ), "a 0.15% ATR tape must still be tradable - this is a floor, not a ban"
+    assert healthy_score >= config.SIDEWAYS_ENTRY_SCORE_THRESHOLD
+    print(f"TEST 10: healthy setup (atr%={healthy_atr*100:.2f}, score={healthy_score:.4f}) "
+          f"still passes both gates")
+
+    # And warm-up ticks (atr_pct == 0.0) must never be blocked by the floor,
+    # which would deadlock startup.
+    assert not (
+        config.LOW_VOLATILITY_FILTER_ENABLED and 0.0 > 0
+        and 0.0 < config.LOW_VOLATILITY_ATR_PCT_THRESHOLD
+    ), "atr_pct==0.0 (warm-up default) must never trip the floor"
+    print("TEST 10: PASS - the streak is gated out, healthy conditions still trade\n")
+
+
+# ----------------------------------------------------------------------------
+# TEST 11: the take-profit is now a reachable multiple of ATR at the floor.
+# ----------------------------------------------------------------------------
+def test_take_profit_is_reachable_at_the_atr_floor():
+    print("=== test_take_profit_is_reachable_at_the_atr_floor ===")
+
+    import config
+
+    tp_pct = config.TAKE_PROFIT_PCT
+    floor = config.LOW_VOLATILITY_ATR_PCT_THRESHOLD
+    tp_in_atr = tp_pct / floor
+
+    # What the streak actually ran at, for contrast.
+    worst_streak_atr = 0.000287
+    tp_in_atr_before = tp_pct / worst_streak_atr
+
+    print(f"TEST 11: TP={tp_pct*100:.2f}%  ATR floor={floor*100:.3f}%")
+    print(f"TEST 11: TP distance at the floor = {tp_in_atr:.1f} ATR "
+          f"(was {tp_in_atr_before:.1f} ATR on the worst streak trade)")
+
+    assert tp_in_atr <= 5.0, (
+        f"at the ATR floor the take-profit must be within ~5 ATR to be reachable "
+        f"before the loss budget stops the trade out (got {tp_in_atr:.1f} ATR)"
+    )
+    assert tp_in_atr < tp_in_atr_before, "the floor must improve reachability"
+    print("TEST 11: PASS - TP is a reachable distance at the new floor\n")
+
+
 async def main():
     await test_unparsed_envelope_is_never_silently_dropped()
     test_extractor_handles_every_envelope_shape()
+    test_real_live_envelope_parses_correctly()
+    await test_live_envelope_is_attributed_to_our_stop()
     await test_triggered_event_wires_child_and_replays_buffered_fill()
     await test_reconcile_window_includes_the_open_entry_leg()
     await test_reconcile_window_unchanged_when_flat()
@@ -567,6 +746,8 @@ async def main():
     await test_orphan_backfill_is_attempted_once()
     await test_reset_to_flat_reconciles_before_discarding_state()
     await test_reset_still_happens_if_reconcile_fails()
+    test_recalibrated_gates_reject_the_losing_streak()
+    test_take_profit_is_reachable_at_the_atr_floor()
     print("ALL TESTS PASSED")
 
 
