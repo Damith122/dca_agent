@@ -499,6 +499,18 @@ RECONCILE_BACKOFF_MAX_SEC = 300.0     # cap on the cooldown even after repeated 
 # 7-day userTrades startTime/endTime limit.
 ORPHAN_REWIND_LOOKBACK_MS = 24 * 60 * 60 * 1000
 
+# 2026-08-19 F1: how many recently-finalized close order ids to remember for
+# duplicate suppression. Only needs to outlive the window in which a stale
+# positionRisk read plus the REST-recovery grace can re-deliver the same fill
+# (seconds to minutes); 64 covers days of trading at this frequency.
+FINALIZED_CLOSE_ID_MEMORY = 64
+
+# 2026-08-19 F2: furthest the reconciliation window may be rewound below the
+# cursor to pick up an open position's entry leg. A real entry leg is at most a
+# handful of account trades back; anything further means the stored floor is
+# corrupt, and rewinding to it would scan unrelated history.
+MAX_RECONCILE_REWIND_IDS = int(os.environ.get("MAX_RECONCILE_REWIND_IDS", "100000"))
+
 
 # ============================================================================
 # SESSION START FILTER (new - 2026-07 session-start filter, see config.py's
@@ -2156,6 +2168,20 @@ class MartingaleManager:
         # 2026-08-19 P6: when a market data stream last (re)connected, and which
         # one. Written only by note_market_stream_reconnect(); read by the entry
         # gate to suppress NEW entries for a moment after a discontinuity.
+        # 2026-08-19 F1 close-order idempotency. Binance close order ids whose
+        # trade has ALREADY been finalized into the trade log by this account.
+        # Bounded (newest kept) and persisted in the DCA snapshot, so it also
+        # survives a restart.
+        #
+        # The 21:06 incident: the close order filled and was finalized
+        # correctly at 21:06:37, then a STALE positionRisk read (the REST call
+        # was timing out - see F3) let initialize_sync rebuild the just-closed
+        # position from the local snapshot, restoring pending_order_id for the
+        # SAME close order. Its REST-recovery grace expired 62s later and
+        # routed the identical fill into _on_close_filled() a second time,
+        # producing a duplicate trade-log row, double-counted session/daily
+        # PnL, and a second (phantom) Brain reinforcement.
+        self._finalized_close_order_ids: Deque[int] = deque(maxlen=FINALIZED_CLOSE_ID_MEMORY)
         self._last_market_stream_reconnect_ts: float = 0.0
         self._last_market_stream_reconnect_label: str = ""
         self._last_ws_settle_skip_log_ts: float = 0.0  # throttles the [entry-skip] ws-settling line
@@ -2727,6 +2753,11 @@ class MartingaleManager:
             # a position is open loses the only marker that keeps the entry
             # and close fills in the same userTrades window.
             "open_position_first_trade_id": self._open_position_first_trade_id,
+            # 2026-08-19 F1: so a restart cannot re-finalize a close this
+            # process already logged (the snapshot is what initialize_sync
+            # rebuilds a position from, and it is exactly that rebuild which
+            # resurrected the closed 21:06 trade).
+            "finalized_close_order_ids": list(self._finalized_close_order_ids),
             # 2026-08 CLOSING-resync opened_at fix: the real entry
             # timestamp, so a full process restart (where the in-memory
             # PositionState is gone entirely, unlike an in-process resync
@@ -3316,7 +3347,35 @@ class MartingaleManager:
             return None
         if self._open_position_first_trade_id is None:
             return None
-        return max(1, int(self._open_position_first_trade_id))
+        try:
+            floor = int(self._open_position_first_trade_id)
+        except (TypeError, ValueError):
+            return None
+
+        # 2026-08-19 F2. The original version returned max(1, floor), so a
+        # stored 0 (or any implausible value) collapsed to 1 and the caller
+        # rewound the userTrades window to id>=1 - a FULL ACCOUNT HISTORY scan
+        # that returns the OLDEST 1000 trades rather than the current
+        # position's. Observed live at 21:06:33:
+        #   "rewinding userTrades window from id>3462286436 back to id>=1"
+        #
+        # A legitimate floor is a real trade id belonging to the position that
+        # is open RIGHT NOW, so it must be positive AND close to the cursor.
+        # Anything else means the value is corrupt or stale, and the safe
+        # response is to not rewind at all - the caller then keeps its normal
+        # cursor-based window, which is exactly the pre-fix-B behavior.
+        if floor <= 1:
+            return None
+        reference = max(self._trade_sync_cursor, self._last_live_trade_id)
+        if reference > 0 and (reference - floor) > MAX_RECONCILE_REWIND_IDS:
+            print(color(
+                f"[reconcile] ignoring implausible entry-leg floor id={floor}: it is "
+                f"{reference - floor} ids behind the cursor ({reference}), beyond the "
+                f"{MAX_RECONCILE_REWIND_IDS} limit. Not rewinding - a window that wide would "
+                f"scan old account history instead of this position.", YELLOW,
+            ))
+            return None
+        return floor
 
     async def reconcile_trade_history_from_exchange(self, context: str = "reconcile") -> None:
         """Fetches executed fills for `self.symbol` from Binance starting
@@ -8737,7 +8796,42 @@ class MartingaleManager:
         # handled, rather than racing the next price tick.
         await self._place_or_replace_protective_stop(reason=f"{step_label} filled")
 
+    def _close_order_already_finalized(self, order_id: Optional[int]) -> bool:
+        """2026-08-19 F1. True if this close order id has already produced a
+        finalized trade-log record. Read-only."""
+        if order_id is None:
+            return False
+        try:
+            return int(order_id) in self._finalized_close_order_ids
+        except (TypeError, ValueError):
+            return False
+
+    def _mark_close_order_finalized(self, order_id: Optional[int]) -> None:
+        """2026-08-19 F1. Records that this close order's trade is done, so no
+        later recovery path can finalize it a second time."""
+        if order_id is None:
+            return
+        try:
+            oid = int(order_id)
+        except (TypeError, ValueError):
+            return
+        if oid not in self._finalized_close_order_ids:
+            self._finalized_close_order_ids.append(oid)
+
     async def _on_close_filled(self, fill_price: float, total_rp: float, order_id: Optional[int] = None) -> None:
+        # 2026-08-19 F1: hard idempotency gate. Every path that can deliver a
+        # close fill converges here - the live websocket event, the REST
+        # recovery fallback, the buffered unmatched-fill replay, and the
+        # restart-safe snapshot recovery. Any of them can legitimately see the
+        # SAME order twice (that is the whole point of having fallbacks), so
+        # the guard belongs here rather than in each caller.
+        if self._close_order_already_finalized(order_id):
+            print(color(
+                f"{now_str()} [close-dedup] close order {order_id} was already finalized into "
+                f"the trade log - ignoring this duplicate delivery. No second trade row, no "
+                f"double-counted PnL, no repeated Brain reinforcement.", YELLOW,
+            ))
+            return
         p = self.position
         # 2026-08 realized-PnL/fee-accounting fix: realized_pnl_total and
         # daily_realized_pnl are NO LONGER updated here per-leg with the
@@ -8836,6 +8930,16 @@ class MartingaleManager:
 
         # --- finalize: exchange confirmed flat (or DRY_RUN, where the
         # simulated fill is authoritative by definition) ------------------
+        # 2026-08-19 F1: mark this close order finalized BEFORE any of the
+        # bookkeeping below runs, and clear the pending-order fields on the
+        # live PositionState in the same synchronous step. Ordering matters:
+        # everything after this point (trade_count, realized PnL, the trade
+        # record, the Brain reinforcement) must be unreachable for this order
+        # id ever again, including via a snapshot written moments from now.
+        self._mark_close_order_finalized(order_id)
+        p.pending_order_id = None
+        p.pending_role = None
+
         total_rp_for_record = self._closing_accumulated_rp  # raw Binance realized PnL, excludes commission
         self._closing_accumulated_rp = 0.0
         self._closing_retry_count = 0
@@ -9921,6 +10025,12 @@ async def initialize_sync(
                 snap_first_trade_id = snapshot.get("open_position_first_trade_id")
                 if snap_first_trade_id is not None:
                     manager._open_position_first_trade_id = int(snap_first_trade_id)
+            except (TypeError, ValueError):
+                pass
+            # 2026-08-19 F1: restore the finalized-close memory alongside it.
+            try:
+                for oid in snapshot.get("finalized_close_order_ids") or []:
+                    manager._mark_close_order_finalized(oid)
             except (TypeError, ValueError):
                 pass
             # 2026-08 DCA State Recovery V2: restore the full fill-by-fill
