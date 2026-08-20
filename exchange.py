@@ -58,6 +58,35 @@ class BinanceApiError(Exception):
         return self.data.get("code") if isinstance(self.data, dict) else None
 
 
+# 2026-08 egress-stall resilience fix (N1). These three constants only.
+#
+# Symptom in production: bursts of HTTP 400 -1021 "Timestamp for this request
+# is outside of the recvWindow" interleaved with aiohttp TimeoutError on the
+# very same minutes, while all four websockets simultaneously dropped with
+# 1011 keepalive-ping timeouts. Simultaneous four-socket drops are not a
+# Binance-side event - they are the container's own egress stalling.
+#
+# Mechanism: _sign() stamps `timestamp` at signing time, then the request has
+# to actually reach Binance's gateway. If it spends longer than recvWindow in
+# flight (DNS, TLS, connector queue) Binance rejects it as -1021; if it spends
+# longer than the client timeout it surfaces as TimeoutError. Same event, two
+# severities. A 5000ms window left almost no headroom for a stall.
+#
+# RECV_WINDOW_MS: how stale a signed request's timestamp may be on arrival.
+#   Binance's hard ceiling is 60000; 10000 buys real headroom against a stall
+#   while still bounding how long a replayed request stays valid.
+# TIME_RESYNC_INTERVAL_SEC: how often the clock offset is refreshed. It used
+#   to be computed exactly once, in start(), and then trusted for the entire
+#   process lifetime (7h+ in production) - so any genuine drift compounded on
+#   top of the stall margin with nothing to correct it.
+# TIME_RESYNC_MIN_RETRY_SEC: floor between resync ATTEMPTS after one fails, so
+#   a resync that keeps failing during a stall window cannot itself turn into
+#   a retry storm against /fapi/v1/time.
+RECV_WINDOW_MS = 10000
+TIME_RESYNC_INTERVAL_SEC = 1800.0
+TIME_RESYNC_MIN_RETRY_SEC = 30.0
+
+
 class RestClient:
     def __init__(self, api_key: str, api_secret: str, base_url: str):
         self.api_key = api_key
@@ -90,6 +119,18 @@ class RestClient:
         # time any caller notices it has cleared. Prevents every poller
         # from printing its own duplicate resume line.
         self._cooldown_resume_logged: bool = True
+        # 2026-08 egress-stall resilience fix (N1), these three fields only.
+        # _time_synced_ts: wall-clock time.time() the offset in
+        #   _time_offset_ms was last successfully established. 0.0 means
+        #   "never" - start() sets it on its first successful sync.
+        # _time_resync_attempt_ts: when a resync was last ATTEMPTED (success
+        #   or failure), used only to rate-limit failed attempts.
+        # _time_resync_lock: serialises resyncs so a burst of concurrent
+        #   pollers all noticing a stale offset produces ONE /fapi/v1/time
+        #   call, not one per poller.
+        self._time_synced_ts: float = 0.0
+        self._time_resync_attempt_ts: float = 0.0
+        self._time_resync_lock = asyncio.Lock()
 
     async def start(self) -> None:
         # 2026-08 session-cleanup fix (this method only - _sync_server_time/
@@ -127,6 +168,64 @@ class RestClient:
         server_ms = data["serverTime"]
         local_ms = int(time.time() * 1000)
         self._time_offset_ms = server_ms - local_ms
+        # 2026-08 egress-stall resilience fix (N1), this line only: stamp
+        # when the offset became valid so _maybe_resync_server_time() below
+        # can tell how stale it is. Everything above is unchanged.
+        self._time_synced_ts = time.time()
+
+    async def _maybe_resync_server_time(self, force: bool = False) -> None:
+        """2026-08 egress-stall resilience fix (N1). Refresh the server-time
+        offset if it has gone stale, best-effort.
+
+        Called from _request() immediately before signing (never for an
+        unsigned request, so the /fapi/v1/time call inside
+        _sync_server_time() cannot recurse back into here), and from the
+        -1021 retry path with force=True.
+
+        This NEVER raises. A resync that fails leaves the previous offset in
+        place and the caller's own request proceeds exactly as it would have
+        before this fix existed - a stale offset is strictly better than a
+        request that never gets sent. Failures are rate-limited to one
+        attempt per TIME_RESYNC_MIN_RETRY_SEC so a stall window cannot turn
+        this into a retry storm.
+        """
+        now = time.time()
+        if not force:
+            # A client that has NEVER synced is not "overdue" - it is either
+            # about to be synced by start() (which does it unconditionally and
+            # re-raises on failure, so a live client always has an offset
+            # before any poller runs) or it was constructed directly. Treating
+            # _time_synced_ts == 0.0 as stale would smuggle an extra unsigned
+            # /fapi/v1/time request in ahead of the caller's FIRST signed
+            # request, which is a surprising side effect for a method whose
+            # only job is correcting drift from an established baseline. The
+            # force=True path from the -1021 handler still covers the case
+            # where the offset is genuinely wrong.
+            if not self._time_synced_ts:
+                return
+            if (now - self._time_synced_ts) < TIME_RESYNC_INTERVAL_SEC:
+                return
+            if self._time_resync_attempt_ts and (
+                now - self._time_resync_attempt_ts
+            ) < TIME_RESYNC_MIN_RETRY_SEC:
+                return
+        async with self._time_resync_lock:
+            # Re-check under the lock: while this coroutine waited, another
+            # one may already have completed the resync. Without this, a
+            # burst of concurrent pollers would each still fire their own
+            # /fapi/v1/time call one after another.
+            now = time.time()
+            if not force and self._time_synced_ts and (
+                now - self._time_synced_ts
+            ) < TIME_RESYNC_INTERVAL_SEC:
+                return
+            if not force and not self._time_synced_ts:
+                return
+            self._time_resync_attempt_ts = now
+            try:
+                await self._sync_server_time()
+            except Exception:
+                pass
 
     def _timestamp(self) -> int:
         return int(time.time() * 1000) + self._time_offset_ms
@@ -134,7 +233,10 @@ class RestClient:
     def _sign(self, params: dict) -> dict:
         params = dict(params)
         params["timestamp"] = self._timestamp()
-        params.setdefault("recvWindow", 5000)
+        # 2026-08 egress-stall resilience fix (N1): was a hardcoded 5000.
+        # See RECV_WINDOW_MS above for why. setdefault() semantics are
+        # unchanged - an explicit per-call recvWindow still wins.
+        params.setdefault("recvWindow", RECV_WINDOW_MS)
         query = urllib.parse.urlencode(params, doseq=True)
         signature = hmac.new(
             self.api_secret.encode(), query.encode(), hashlib.sha256
@@ -238,7 +340,12 @@ class RestClient:
         self.note_cooldown_resume_if_needed()
 
     async def _request(
-        self, method: str, path: str, params: Optional[dict] = None, signed: bool = False
+        self,
+        method: str,
+        path: str,
+        params: Optional[dict] = None,
+        signed: bool = False,
+        retry_stale_timestamp: bool = False,
     ) -> dict:
         # 2026-08 HTTP 418/429 global cooldown fix (this check only - every
         # other line in this method is unchanged): while a cooldown armed
@@ -257,6 +364,48 @@ class RestClient:
             )
 
         params = params or {}
+        # 2026-08 egress-stall resilience fix (N1), this branch only: refresh
+        # the clock offset before signing if it has gone stale. Gated on
+        # `signed` so the unsigned /fapi/v1/time request that
+        # _sync_server_time() itself issues can never recurse into here.
+        # Best-effort - _maybe_resync_server_time() swallows its own errors.
+        if signed:
+            await self._maybe_resync_server_time()
+        # 2026-08 egress-stall resilience fix (N1): the body below was
+        # lifted verbatim into _send_once() so the -1021 retry can re-sign
+        # and re-send it. Neither the request construction, the 418/429
+        # cooldown arming, nor the raised BinanceApiError changed.
+        try:
+            return await self._send_once(method, path, params, signed)
+        except BinanceApiError as e:
+            # ONE bounded retry, and only when the caller explicitly opted in
+            # by passing retry_stale_timestamp=True. Only the read-only signed
+            # GETs do that (get_balance / get_position_risk / get_user_trades /
+            # get_open_orders / get_order / get_algo_order /
+            # get_open_algo_orders). Every mutating endpoint - place_order,
+            # cancel_order, place_algo_order, cancel_algo_order, set_leverage,
+            # set_margin_type - leaves it False and is therefore completely
+            # unaffected by this block: a -1021 there still propagates on the
+            # first failure exactly as before, because a request whose
+            # execution result is ambiguous must never be blindly replayed.
+            if not (retry_stale_timestamp and signed and e.code == -1021):
+                raise
+            # A -1021 is proof the offset we signed with was wrong (or the
+            # request stalled long enough that it may as well have been), so
+            # force a fresh sync rather than waiting out the interval, then
+            # re-sign and send once more. If this attempt fails too it
+            # propagates normally - there is no second retry.
+            await self._maybe_resync_server_time(force=True)
+            return await self._send_once(method, path, params, signed)
+
+    async def _send_once(
+        self, method: str, path: str, params: dict, signed: bool
+    ) -> dict:
+        """2026-08 egress-stall resilience fix (N1). The exact request body
+        that used to live inline in _request(), extracted unchanged so the
+        -1021 path can re-sign and re-send it. Signing happens HERE, not in
+        the caller, so a retry stamps a fresh timestamp off the refreshed
+        offset instead of replaying the stale one that was just rejected."""
         if signed:
             params = self._sign(params)
         url = f"{self.base_url}{path}"
@@ -316,7 +465,9 @@ class RestClient:
 
     # --- signed account endpoints -------------------------------------------
     async def get_balance(self) -> list:
-        return await self._request("GET", "/fapi/v2/balance", signed=True)
+        return await self._request(
+            "GET", "/fapi/v2/balance", signed=True, retry_stale_timestamp=True
+        )
 
     async def set_leverage(self, symbol: str, leverage: int) -> dict:
         return await self._request(
@@ -336,7 +487,8 @@ class RestClient:
 
     async def get_position_risk(self, symbol: str) -> list:
         return await self._request(
-            "GET", "/fapi/v2/positionRisk", {"symbol": symbol}, signed=True
+            "GET", "/fapi/v2/positionRisk", {"symbol": symbol}, signed=True,
+            retry_stale_timestamp=True,
         )
 
     async def get_user_trades(
@@ -363,7 +515,10 @@ class RestClient:
             params["fromId"] = from_id
         elif start_time_ms is not None:
             params["startTime"] = start_time_ms
-        return await self._request("GET", "/fapi/v1/userTrades", params, signed=True)
+        return await self._request(
+            "GET", "/fapi/v1/userTrades", params, signed=True,
+            retry_stale_timestamp=True,
+        )
 
     # --- signed trading endpoints -------------------------------------------
     async def place_order(self, **kwargs) -> dict:
@@ -384,7 +539,8 @@ class RestClient:
         Docs: https://developers.binance.com/en/docs/derivatives/usds-margined-futures/trade/rest-api
         """
         return await self._request(
-            "GET", "/fapi/v1/openOrders", {"symbol": symbol}, signed=True
+            "GET", "/fapi/v1/openOrders", {"symbol": symbol}, signed=True,
+            retry_stale_timestamp=True,
         )
 
     # --- Algo (conditional) order endpoints ---------------------------------
@@ -437,7 +593,10 @@ class RestClient:
             params["algoId"] = algo_id
         else:
             params["clientAlgoId"] = client_algo_id
-        return await self._request("GET", "/fapi/v1/algoOrder", params, signed=True)
+        return await self._request(
+            "GET", "/fapi/v1/algoOrder", params, signed=True,
+            retry_stale_timestamp=True,
+        )
 
     async def cancel_algo_order(
         self, algo_id: Optional[int] = None, client_algo_id: Optional[str] = None
@@ -467,7 +626,10 @@ class RestClient:
         params: dict = {}
         if symbol is not None:
             params["symbol"] = symbol
-        return await self._request("GET", "/fapi/v1/openAlgoOrders", params, signed=True)
+        return await self._request(
+            "GET", "/fapi/v1/openAlgoOrders", params, signed=True,
+            retry_stale_timestamp=True,
+        )
 
     async def get_order(self, symbol: str, order_id: int) -> dict:
         """Signed GET /fapi/v1/order - query a single order's current
@@ -479,7 +641,8 @@ class RestClient:
         Docs: https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/trade
         """
         return await self._request(
-            "GET", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id}, signed=True
+            "GET", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id},
+            signed=True, retry_stale_timestamp=True,
         )
 
     # --- user data stream ----------------------------------------------------

@@ -50,6 +50,27 @@ def color(text: str, code: str) -> str:
 GREEN, RED, YELLOW, CYAN, GRAY, BOLD, MAGENTA, BLUE = "32", "31", "33", "36", "90", "1", "35", "34"
 
 
+def _exc_text(e: BaseException) -> str:
+    """2026-08-20 N2. Identical copy of dca2.py's _exc_text(), duplicated for
+    exactly the same reason color()/YELLOW above are - importing it back from
+    dca2.py would be a circular import (dca2.py imports GithubBrainSync from
+    here). Behaviour must stay in lockstep with dca2.py's version.
+
+    The 2026-08-19 F3 pass replaced every bare `{e}` in dca2.py/trading.py
+    with this, but the three call sites in THIS module were missed, so they
+    kept emitting the blank-tailed lines F3 was meant to eliminate. Live
+    production logs on 2026-08-20 showed it twice:
+
+        [brain-sync] GitHub push failed for brain_LIVE_SOLUSDT.pkl (bot keeps trading):
+
+    That was an aiohttp timeout during an egress stall - str(e) on
+    asyncio.TimeoutError and several aiohttp.ClientError subclasses is "",
+    so the message identified nothing. Prefixing the exception class means an
+    empty message still names what went wrong."""
+    text = str(e).strip()
+    return f"{type(e).__name__}: {text}" if text else type(e).__name__
+
+
 # ============================================================================
 # CLOUD-SYNC BRAIN (push/pull brain snapshot to GitHub across ephemeral
 # restarts). Unchanged in behavior from the previous build - still generic
@@ -155,7 +176,7 @@ class GithubBrainSync:
                     return None
                 return base64.b64decode(content_b64)
         except Exception as e:  # noqa: BLE001 - sync must never take the bot down
-            print(color(f"[brain-sync] GitHub download failed for {p} (continuing without it): {e}", YELLOW))
+            print(color(f"[brain-sync] GitHub download failed for {p} (continuing without it): {_exc_text(e)}", YELLOW))
             return None
 
     async def _ensure_branch(self) -> None:
@@ -216,7 +237,7 @@ class GithubBrainSync:
         except Exception as e:  # noqa: BLE001 - sync must never take the bot down
             print(color(
                 f"[brain-sync] could not confirm/create branch '{self.branch}' "
-                f"(will still attempt uploads): {e}", YELLOW,
+                f"(will still attempt uploads): {_exc_text(e)}", YELLOW,
             ))
             self._branch_ready = False
 
@@ -296,5 +317,5 @@ class GithubBrainSync:
                     self._last_sha[p] = (result.get("content") or {}).get("sha")
                     return True
             except Exception as e:  # noqa: BLE001 - sync must never take the bot down
-                print(color(f"[brain-sync] GitHub push failed for {p} (bot keeps trading): {e}", YELLOW))
+                print(color(f"[brain-sync] GitHub push failed for {p} (bot keeps trading): {_exc_text(e)}", YELLOW))
                 return False
