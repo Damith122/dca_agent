@@ -598,6 +598,28 @@ async def load_dca_state(manager: MartingaleManager) -> None:
         print(color(f"[dca-state] failed to apply DCA state snapshot ({e}), starting flat.", YELLOW))
 
 
+def _exc_text(e: BaseException) -> str:
+    """2026-08-19 F3. Human-readable text for an exception that is NEVER empty.
+
+    asyncio.TimeoutError, aiohttp.ClientError and several aiohttp subclasses
+    carry NO message - str(e) is "". Logging a bare {e} therefore produced
+    lines like:
+
+        [risk] position risk poll failed:
+        [balance] refresh failed:
+
+    which is what the 2026-08-19 21:06 logs showed. Those blanks were REST
+    timeouts, and they mattered: the timing-out positionRisk poll is what left
+    initialize_sync with a stale "position still open" read, which resurrected
+    an already-closed position and produced the duplicate trade record. The
+    failure was fully diagnosable the whole time - it just had no text.
+
+    Always prefixes the exception class, so an empty message still identifies
+    what went wrong."""
+    text = str(e).strip()
+    return f"{type(e).__name__}: {text}" if text else type(e).__name__
+
+
 async def balance_refresher(client: RestClient, manager: MartingaleManager) -> None:
     while True:
         # 2026-08 HTTP 418/429 cooldown-survival fix (this check only -
@@ -631,7 +653,7 @@ async def balance_refresher(client: RestClient, manager: MartingaleManager) -> N
                 real_balance = float(usdt["availableBalance"])
                 manager.available_balance = min(real_balance, 50.0)
         except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-            print(color(f"[balance] refresh failed: {e}", RED))
+            print(color(f"[balance] refresh failed: {_exc_text(e)}", RED))
         await asyncio.sleep(jittered_interval(BALANCE_REFRESH_SEC))
 
 
@@ -649,12 +671,12 @@ async def funding_oi_poller(client: RestClient, manager: MartingaleManager) -> N
             premium = await client.get_premium_index(SYMBOL)
             manager.funding_rate = float(premium.get("lastFundingRate", 0) or 0)
         except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-            print(color(f"[funding] premiumIndex poll failed (continuing without it): {e}", YELLOW))
+            print(color(f"[funding] premiumIndex poll failed (continuing without it): {_exc_text(e)}", YELLOW))
         try:
             oi = await client.get_open_interest(SYMBOL)
             manager.open_interest = float(oi.get("openInterest", 0) or 0)
         except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-            print(color(f"[funding] openInterest poll failed (continuing without it): {e}", YELLOW))
+            print(color(f"[funding] openInterest poll failed (continuing without it): {_exc_text(e)}", YELLOW))
         # 2026-08 HTTP 429 fix: jittered so this poller never lines up with
         # the balance/positionRisk pollers on the same wall-clock tick.
         await asyncio.sleep(jittered_interval(FUNDING_OI_POLL_SEC))
@@ -770,7 +792,7 @@ async def position_risk_poller(client: RestClient, manager: MartingaleManager) -
                 manager.liquidation_price = None
             await initialize_sync(client, manager, context="periodic poll", rows=rows)
         except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-            print(color(f"[risk] position risk poll failed: {e}", RED))
+            print(color(f"[risk] position risk poll failed: {_exc_text(e)}", RED))
         await asyncio.sleep(jittered_interval(_position_risk_interval(manager)))
 
 
@@ -966,7 +988,7 @@ async def main() -> None:
             manager.funding_rate = float(premium.get("lastFundingRate", 0) or 0)
             print(color(f"[setup] current funding rate: {manager.funding_rate:.6f}", GRAY))
         except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-            print(color(f"[setup] could not fetch initial funding rate (continuing without it): {e}", YELLOW))
+            print(color(f"[setup] could not fetch initial funding rate (continuing without it): {_exc_text(e)}", YELLOW))
 
         # Persistent Adaptive Learning: local brain snapshot -> GitHub -> fresh model.
         await manager.load_or_init_brain()
