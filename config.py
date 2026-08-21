@@ -45,12 +45,129 @@ SYMBOL = os.environ.get("SYMBOL", "BTCUSDT").strip().upper()
 # fallen back to for ANY symbol, including BTCUSDT. Every symbol, with no
 # exception, now uses the identical "<name>_<SYMBOL>.<ext>" convention.
 
+# ============================================================================
+# ROBUST ENVIRONMENT PARSING (2026-08-21)
+#
+# Every tunable below is read from the environment. Previously each one did
+# its own bare float(os.environ.get(NAME, default)) / int(...) conversion,
+# which meant an EMPTY or malformed variable raised ValueError at import
+# time - before main() runs, before the banner prints, and therefore with no
+# log line explaining what went wrong. Clearing a variable in Railway (the
+# natural way to "unset" it, since the dashboard has no delete) is exactly
+# the case that hit this: os.environ.get returns "" rather than None, the
+# default is skipped, and float("") explodes.
+#
+# These helpers make that impossible. A variable that is missing, empty,
+# whitespace-only, or unparseable falls back to the code default and records
+# a warning instead of raising. Nothing here can abort startup.
+#
+# Warnings are collected rather than printed, because config.py is imported
+# before the banner exists; dca2.py prints them via env_parse_warnings()
+# once there is somewhere sensible to put them.
+# ============================================================================
+
+_ENV_WARNINGS: list = []
+
+
+def _env_raw(name: str):
+    """Return a usable raw string for `name`, or None if it is absent or
+    blank. Empty and whitespace-only are treated as ABSENT, not as a value -
+    that is the whole point: clearing a variable must mean "use the code
+    default", never "crash"."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    raw = raw.strip()
+    return raw or None
+
+
+def _env_float(name: str, default: float) -> float:
+    # The default is coerced too, so a float-typed knob is ALWAYS a float
+    # regardless of whether the environment supplied it. Returning the bare
+    # literal would make e.g. an unset 50 an int while a set "50" is a
+    # float - a type that varies with configuration is a latent bug.
+    default = float(default)
+    raw = _env_raw(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        _ENV_WARNINGS.append(
+            f"{name}={raw!r} is not a number - using default {default}"
+        )
+        return default
+    # NaN/inf would poison every downstream comparison silently, so they are
+    # rejected the same way a malformed string is.
+    if value != value or value in (float("inf"), float("-inf")):
+        _ENV_WARNINGS.append(
+            f"{name}={raw!r} is not finite - using default {default}"
+        )
+        return default
+    return value
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = _env_raw(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        pass
+    # Accept "5.0" for an int-typed knob rather than rejecting it outright;
+    # a value that is genuinely fractional still falls back to the default.
+    # OverflowError is caught alongside ValueError because int(float("inf"))
+    # raises it - "inf" must degrade to the default like any other bad value.
+    try:
+        as_float = float(raw)
+        if as_float == as_float and as_float not in (float("inf"), float("-inf")):
+            if as_float == int(as_float):
+                return int(as_float)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    _ENV_WARNINGS.append(
+        f"{name}={raw!r} is not an integer - using default {default}"
+    )
+    return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Parse a boolean tunable. Recognises the usual spellings in both
+    directions; anything unrecognised warns and falls back rather than
+    silently reading as False (the old `.lower() != "false"` idiom turned a
+    typo like "flase" into True without a word)."""
+    raw = _env_raw(name)
+    if raw is None:
+        return default
+    lowered = raw.lower()
+    if lowered in ("true", "1", "yes", "y", "on"):
+        return True
+    if lowered in ("false", "0", "no", "n", "off"):
+        return False
+    _ENV_WARNINGS.append(
+        f"{name}={raw!r} is not a boolean - using default {default}"
+    )
+    return default
+
+
+def _env_str(name: str, default: str) -> str:
+    raw = _env_raw(name)
+    return default if raw is None else raw
+
+
+def env_parse_warnings() -> list:
+    """Every environment variable that could not be parsed, as human-readable
+    strings. Empty when the environment is clean."""
+    return list(_ENV_WARNINGS)
+
+
 # 2026-08 USE_TESTNET moved up from the "Safety gates" section below
 # (verbatim - same env var, same parsing, same default) so RUNTIME_ENV and
 # _symbol_scoped_default() can be computed from it. USE_TESTNET's own
 # meaning/behavior as a safety gate is completely unchanged - it is simply
 # read a few lines earlier than before.
-USE_TESTNET = os.environ.get("USE_TESTNET", "true").lower() != "false"
+USE_TESTNET = _env_bool("USE_TESTNET", True)
 
 # 2026-08 environment + symbol state isolation: runtime persistence must
 # be isolated by BOTH which Binance environment this process is trading
@@ -103,7 +220,7 @@ ACTIVE_SYMBOLS = _parse_symbol_list(
 # to >= 1: a 0 or negative value would silently disable trading entirely,
 # which is a far more surprising outcome than falling back to 1.
 try:
-    MAX_ACTIVE_TRADES = max(1, int(os.environ.get("MAX_ACTIVE_TRADES", "1")))
+    MAX_ACTIVE_TRADES = max(1, _env_int("MAX_ACTIVE_TRADES", 1))
 except (TypeError, ValueError):
     MAX_ACTIVE_TRADES = 1
 
@@ -149,10 +266,7 @@ def _clamped_tick_interval(env_var: str, default: float) -> float:
     """Parse a tick interval, clamped to [0, 1] seconds. 0 disables the
     throttle; anything above 1s is refused because it would start to delay
     risk exits meaningfully rather than just decimating idle scans."""
-    try:
-        value = float(os.environ.get(env_var, default))
-    except (TypeError, ValueError):
-        return default
+    value = _env_float(env_var, default)
     if value < 0:
         return default
     return min(value, 1.0)
@@ -226,13 +340,11 @@ def _warn_if_explicit_path_bypasses_isolation(env_var_name: str) -> None:
         )
 
 # --- Safety gates - read the header above before touching these -------------
-DRY_RUN = os.environ.get("DRY_RUN", "false").lower() != "false"
+DRY_RUN = _env_bool("DRY_RUN", False)
 I_UNDERSTAND_THIS_IS_REAL_MONEY = os.environ.get(
     "I_UNDERSTAND_THIS_IS_REAL_MONEY", ""
 ).lower() == "yes"
-LIVE_TRADING_CONFIRMATION = os.environ.get(
-    "LIVE_TRADING_CONFIRMATION", "false"
-).lower() == "true"
+LIVE_TRADING_CONFIRMATION = _env_bool("LIVE_TRADING_CONFIRMATION", False)
 # 2026-08 Live Trading Safety Guard: a second, explicit gate alongside
 # I_UNDERSTAND_THIS_IS_REAL_MONEY above - both must be satisfied before
 # mainnet trading (USE_TESTNET=false) is allowed to start. Deliberately a
@@ -252,12 +364,12 @@ API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
 # EXACT SAME default values as before, so an unconfigured Railway deploy
 # behaves identically to today - only an operator explicitly setting one of
 # these env vars changes anything.
-LEVERAGE = int(os.environ.get("LEVERAGE", "20"))
-MAX_ALLOWED_LEVERAGE = int(os.environ.get("MAX_ALLOWED_LEVERAGE", "50"))
+LEVERAGE = _env_int("LEVERAGE", 20)
+MAX_ALLOWED_LEVERAGE = _env_int("MAX_ALLOWED_LEVERAGE", 50)
 MARGIN_TYPE = "CROSSED"
 
 # --- Position sizing (Fixed Amount base, Martingale, now confidence-scaled) -
-INITIAL_ENTRY_USDT = float(os.environ.get("INITIAL_ENTRY_USDT", "4"))
+INITIAL_ENTRY_USDT = _env_float("INITIAL_ENTRY_USDT", 4)
 # 2026-08 min-notional fix (this value only - DCA_MULTIPLIER, MAX_DCA_STEPS,
 # SIZE_MIN_MULT/MAX_MULT, and every other DCA/TP/Risk-Engine/Daily-Loss-
 # Protection value are unchanged): after reducing LEVERAGE to 20x, the
@@ -321,8 +433,8 @@ def _notional_scaled(env_var: str, fraction_of_notional: float, *, floor: float 
     being meaningful below a certain size regardless of notional - it is
     deliberately NOT scaled.
     """
-    explicit = os.environ.get(env_var)
-    if explicit not in (None, ""):
+    explicit = _env_raw(env_var)
+    if explicit is not None:
         try:
             value = float(explicit)
             _NOTIONAL_SCALED_OVERRIDDEN[env_var] = value
@@ -344,19 +456,19 @@ def notional_scaling_report() -> list:
     ]
 
 
-DCA_MULTIPLIER = float(os.environ.get("DCA_MULTIPLIER", "1.6"))  # reduced from 2.0 (2026-07 profitability fix) - less notional/fee blowup per DCA rung
-MAX_DCA_STEPS = int(os.environ.get("MAX_DCA_STEPS", "2"))        # reduced from 3 (2026-08 $33-account risk fix) - 3 steps required 112% of a $33 account's margin to fully cascade and produced ~45% worst-case single-trade loss; 2 steps fits within the account (~62.5% margin) and cuts worst-case loss to ~25% while keeping the final-DCA low-probability-recovery gate active at the depth where trade evidence showed it protecting against genuine trend moves
+DCA_MULTIPLIER = _env_float("DCA_MULTIPLIER", 1.6)  # reduced from 2.0 (2026-07 profitability fix) - less notional/fee blowup per DCA rung
+MAX_DCA_STEPS = _env_int("MAX_DCA_STEPS", 2)        # reduced from 3 (2026-08 $33-account risk fix) - 3 steps required 112% of a $33 account's margin to fully cascade and produced ~45% worst-case single-trade loss; 2 steps fits within the account (~62.5% margin) and cuts worst-case loss to ~25% while keeping the final-DCA low-probability-recovery gate active at the depth where trade evidence showed it protecting against genuine trend moves
 
 # --- Trade management ---------------------------------------------------------
-DCA_TRIGGER_PCT = float(os.environ.get("DCA_TRIGGER_PCT", "0.002"))    # floor / fallback DCA spacing (also used if ATR unavailable)
-TAKE_PROFIT_PCT = float(os.environ.get("TAKE_PROFIT_PCT", "0.0035"))   # raised from 0.002 (2026-07 profitability fix) - clears round-trip fee floor with real margin
-HARD_STOP_PCT = float(os.environ.get("HARD_STOP_PCT", "0.02"))         # tightened from 0.05 (2026-07 profitability fix) - fixes stop:TP risk/reward skew
+DCA_TRIGGER_PCT = _env_float("DCA_TRIGGER_PCT", 0.002)    # floor / fallback DCA spacing (also used if ATR unavailable)
+TAKE_PROFIT_PCT = _env_float("TAKE_PROFIT_PCT", 0.0035)   # raised from 0.002 (2026-07 profitability fix) - clears round-trip fee floor with real margin
+HARD_STOP_PCT = _env_float("HARD_STOP_PCT", 0.02)         # tightened from 0.05 (2026-07 profitability fix) - fixes stop:TP risk/reward skew
 
 # --- Dynamic (volatility-based) Take Profit ----------------------------------
-DYNAMIC_TP_ENABLED = os.environ.get("DYNAMIC_TP_ENABLED", "true").lower() != "false"
-TAKE_PROFIT_MAX_PCT = float(os.environ.get("TAKE_PROFIT_MAX_PCT", "0.010"))  # raised from 0.006 (2026-07 profitability fix) - lets winners run further in trend/high-vol
-TP_VOL_LOW = float(os.environ.get("TP_VOL_LOW", "0.0003"))    # tick-return std at/below this -> quiet -> base TP
-TP_VOL_HIGH = float(os.environ.get("TP_VOL_HIGH", "0.0012"))  # tick-return std at/above this -> max TP expansion
+DYNAMIC_TP_ENABLED = _env_bool("DYNAMIC_TP_ENABLED", True)
+TAKE_PROFIT_MAX_PCT = _env_float("TAKE_PROFIT_MAX_PCT", 0.010)  # raised from 0.006 (2026-07 profitability fix) - lets winners run further in trend/high-vol
+TP_VOL_LOW = _env_float("TP_VOL_LOW", 0.0003)    # tick-return std at/below this -> quiet -> base TP
+TP_VOL_HIGH = _env_float("TP_VOL_HIGH", 0.0012)  # tick-return std at/above this -> max TP expansion
 
 # --- Max Hold Time Protection (NEW - scalping bot safety net) ----------------
 # This is a scalping bot; positions are meant to resolve in minutes, not
@@ -367,22 +479,22 @@ TP_VOL_HIGH = float(os.environ.get("TP_VOL_HIGH", "0.0012"))  # tick-return std 
 # consulted before this is allowed to force-close a trade (it does NOT
 # blindly close profitable/trending positions - see MAX_HOLD_TIME_HARD_CAP_SEC
 # for the unconditional absolute ceiling).
-MAX_HOLD_TIME_ENABLED = os.environ.get("MAX_HOLD_TIME_ENABLED", "true").lower() != "false"
-MAX_HOLD_TIME_SEC = int(os.environ.get("MAX_HOLD_TIME_SEC", str(4 * 3600)))       # 4h soft cap
-MAX_HOLD_TIME_HARD_CAP_SEC = int(os.environ.get("MAX_HOLD_TIME_HARD_CAP_SEC", str(8 * 3600)))  # 8h absolute cap, always closes regardless of PnL/regime/profit-lock
-MAX_HOLD_TIME_SMALL_LOSS_PCT = float(os.environ.get("MAX_HOLD_TIME_SMALL_LOSS_PCT", "0.0015"))
+MAX_HOLD_TIME_ENABLED = _env_bool("MAX_HOLD_TIME_ENABLED", True)
+MAX_HOLD_TIME_SEC = _env_int("MAX_HOLD_TIME_SEC", 4 * 3600)       # 4h soft cap
+MAX_HOLD_TIME_HARD_CAP_SEC = _env_int("MAX_HOLD_TIME_HARD_CAP_SEC", 8 * 3600)  # 8h absolute cap, always closes regardless of PnL/regime/profit-lock
+MAX_HOLD_TIME_SMALL_LOSS_PCT = _env_float("MAX_HOLD_TIME_SMALL_LOSS_PCT", 0.0015)
 # 2026-08 Max Hold Time V2: a loss smaller (in magnitude) than this at timeout
 # is treated as "very small" and closes normally (not worth an emergency
 # recovery review). 0.15% mirrors DCA_MIN_DISTANCE_PCT's floor - roughly the
 # smallest adverse move the bot's own DCA/exit machinery treats as meaningful.
-MAX_HOLD_TIME_RECOVERY_MIN_AGREE = int(os.environ.get("MAX_HOLD_TIME_RECOVERY_MIN_AGREE", "2"))
+MAX_HOLD_TIME_RECOVERY_MIN_AGREE = _env_int("MAX_HOLD_TIME_RECOVERY_MIN_AGREE", 2)
 # Of the 5 recovery-risk signals evaluated at timeout for a position with a
 # genuinely significant loss (trend_against, high_risk, momentum_against,
 # extreme_volatility, dca_exhausted - see trading.py's
 # _manage_open_position()), how many must agree before the position is
 # force-closed as "low probability of recovery" rather than kept open past
 # MAX_HOLD_TIME_SEC (still bounded by MAX_HOLD_TIME_HARD_CAP_SEC either way).
-MAX_HOLD_TIME_DCA_MULTIPLIER = float(os.environ.get("MAX_HOLD_TIME_DCA_MULTIPLIER", "0.5"))
+MAX_HOLD_TIME_DCA_MULTIPLIER = _env_float("MAX_HOLD_TIME_DCA_MULTIPLIER", 0.5)
 # 2026-08 DCA-aware Max Hold Time tuning: once a position has DCA'd at
 # least once (dca_step >= 1), the SOFT max-hold-time threshold
 # (MAX_HOLD_TIME_SEC) is multiplied by this factor - default 0.5 means a
@@ -398,7 +510,7 @@ MAX_HOLD_TIME_DCA_MULTIPLIER = float(os.environ.get("MAX_HOLD_TIME_DCA_MULTIPLIE
 # completely unchanged.
 
 # --- Close-order verification (2026-08 execution-reliability hardening) ------
-CLOSE_VERIFY_MAX_RETRIES = int(os.environ.get("CLOSE_VERIFY_MAX_RETRIES", "3"))
+CLOSE_VERIFY_MAX_RETRIES = _env_int("CLOSE_VERIFY_MAX_RETRIES", 3)
 # After every close-order fill, close_position()'s finalization step
 # (_on_close_filled() in trading.py) re-fetches the exchange's own
 # positionAmt to confirm the position is actually flat before treating the
@@ -420,7 +532,7 @@ CLOSE_VERIFY_MAX_RETRIES = int(os.environ.get("CLOSE_VERIFY_MAX_RETRIES", "3"))
 # mean itself has also been low for a while. This is an ABSOLUTE floor on
 # atr_pct, independent of that ratio, so only truly dead conditions are
 # blocked - normal ranging/SIDEWAYS markets above this floor are unaffected.
-LOW_VOLATILITY_FILTER_ENABLED = os.environ.get("LOW_VOLATILITY_FILTER_ENABLED", "true").lower() != "false"
+LOW_VOLATILITY_FILTER_ENABLED = _env_bool("LOW_VOLATILITY_FILTER_ENABLED", True)
 # 2026-08-18 fee-drag recalibration (value only - the gate itself is unchanged
 # and already existed; see FeatureBuilderV2's dead_market_blocked check).
 # Raised from 0.00015 (0.015%) to 0.0008 (0.08%) after three consecutive losing
@@ -441,7 +553,7 @@ LOW_VOLATILITY_FILTER_ENABLED = os.environ.get("LOW_VOLATILITY_FILTER_ENABLED", 
 # 0.0008 makes the +0.35% take-profit ~4x ATR instead of ~12x - a distance a
 # real move can actually cover - and keeps the bot flat through exactly the
 # chop that produced the losing streak.
-LOW_VOLATILITY_ATR_PCT_THRESHOLD = float(os.environ.get("LOW_VOLATILITY_ATR_PCT_THRESHOLD", "0.0008"))
+LOW_VOLATILITY_ATR_PCT_THRESHOLD = _env_float("LOW_VOLATILITY_ATR_PCT_THRESHOLD", 0.0008)
 
 # --- Percentage Adaptive TP/DCA System (NEW) ---------------------------------
 # Applies a bounded multiplier on TOP of the existing ATR-based dynamic TP
@@ -460,12 +572,12 @@ LOW_VOLATILITY_ATR_PCT_THRESHOLD = float(os.environ.get("LOW_VOLATILITY_ATR_PCT_
 # within those already-established ceilings/floors, never beyond them,
 # unless ADAPTIVE_TP_MIN_RATIO/ADAPTIVE_TP_MAX_RATIO are explicitly changed
 # from their backward-compatible defaults of 1.0.
-ADAPTIVE_SIZING_ENABLED = os.environ.get("ADAPTIVE_SIZING_ENABLED", "true").lower() != "false"
-ADAPTIVE_SIZE_SENSITIVITY = float(os.environ.get("ADAPTIVE_SIZE_SENSITIVITY", "0.25"))
-ADAPTIVE_SCALE_MIN = float(os.environ.get("ADAPTIVE_SCALE_MIN", "0.45"))
-ADAPTIVE_SCALE_MAX = float(os.environ.get("ADAPTIVE_SCALE_MAX", "1.15"))
-ADAPTIVE_TP_MIN_RATIO = float(os.environ.get("ADAPTIVE_TP_MIN_RATIO", "0.45"))
-ADAPTIVE_TP_MAX_RATIO = float(os.environ.get("ADAPTIVE_TP_MAX_RATIO", "1.0"))
+ADAPTIVE_SIZING_ENABLED = _env_bool("ADAPTIVE_SIZING_ENABLED", True)
+ADAPTIVE_SIZE_SENSITIVITY = _env_float("ADAPTIVE_SIZE_SENSITIVITY", 0.25)
+ADAPTIVE_SCALE_MIN = _env_float("ADAPTIVE_SCALE_MIN", 0.45)
+ADAPTIVE_SCALE_MAX = _env_float("ADAPTIVE_SCALE_MAX", 1.15)
+ADAPTIVE_TP_MIN_RATIO = _env_float("ADAPTIVE_TP_MIN_RATIO", 0.45)
+ADAPTIVE_TP_MAX_RATIO = _env_float("ADAPTIVE_TP_MAX_RATIO", 1.0)
 
 # --- Entry Timing: momentum feature calibration (2026-08 entry-timing fix) ---
 # See trading.py EntryEngineV2/on_price_tick module notes for root cause:
@@ -475,13 +587,13 @@ ADAPTIVE_TP_MAX_RATIO = float(os.environ.get("ADAPTIVE_TP_MAX_RATIO", "1.0"))
 # - the momentum term was effectively always ~0 regardless of real market
 # momentum. Entry now reads the short rolling return (features[4],
 # ROLLING_RETURN_WINDOWS[0]=5 candles) against this threshold instead.
-ENTRY_MOMENTUM_SATURATION_PCT = float(os.environ.get("ENTRY_MOMENTUM_SATURATION_PCT", "0.0015"))
+ENTRY_MOMENTUM_SATURATION_PCT = _env_float("ENTRY_MOMENTUM_SATURATION_PCT", 0.0015)
 
 # --- Profit Lock (env-configurable - 2026-08 Railway-tuning fix; values and
 # behavior are UNCHANGED, only made overridable without a code edit) --------
 # 0.125% of notional -> $0.10 at $80. Arms the lock.
 PROFIT_LOCK_ACTIVATION_USDT = _notional_scaled("PROFIT_LOCK_ACTIVATION_USDT", 0.00125)
-PROFIT_LOCK_RATIO = float(os.environ.get("PROFIT_LOCK_RATIO", "0.50"))
+PROFIT_LOCK_RATIO = _env_float("PROFIT_LOCK_RATIO", 0.50)
 
 # --- 2026-08-19 Profit Lock / risk-geometry hardening (P1-P6) -----------------
 # Root incident: 15:28:19-15:28:20 UTC, LONG 82.43 -> 82.47, exit_reason=
@@ -493,7 +605,7 @@ PROFIT_LOCK_RATIO = float(os.environ.get("PROFIT_LOCK_RATIO", "0.50"))
 #   (82.43), then closed 1.3s later. That peak was an artifact of price/fill
 #   incoherence and was never realizable. Peak TRACKING and the exit check are
 #   unaffected once armed - this only delays arming.
-PROFIT_LOCK_MIN_AGE_SEC = float(os.environ.get("PROFIT_LOCK_MIN_AGE_SEC", "4.0"))
+PROFIT_LOCK_MIN_AGE_SEC = _env_float("PROFIT_LOCK_MIN_AGE_SEC", 4.0)
 # P2 - PROFIT_LOCK_SLIPPAGE_ATR_MULT: the fee-safe floor Profit Lock requires
 #   before closing was a FLAT MIN_NET_PROFIT_USDT ($0.05). In a 0.33%-ATR tape
 #   one second of movement was worth $0.11 - more than twice the whole buffer.
@@ -550,7 +662,7 @@ PROFIT_LOCK_MIN_AGE_SEC = float(os.environ.get("PROFIT_LOCK_MIN_AGE_SEC", "4.0")
 # absolute floor underneath. Set back to 0.5 to restore the previous
 # behaviour exactly; raise toward 0.43+ to re-block the 15:28 scenario at the
 # cost of the narrow window returning.
-PROFIT_LOCK_SLIPPAGE_ATR_MULT = float(os.environ.get("PROFIT_LOCK_SLIPPAGE_ATR_MULT", "0.25"))
+PROFIT_LOCK_SLIPPAGE_ATR_MULT = _env_float("PROFIT_LOCK_SLIPPAGE_ATR_MULT", 0.25)
 
 # P4 - ATR-scaled risk geometry. Fixed-dollar thresholds on a fixed notional are
 #   INVERSELY proportional to volatility in ATR terms, which is why the same
@@ -559,8 +671,8 @@ PROFIT_LOCK_SLIPPAGE_ATR_MULT = float(os.environ.get("PROFIT_LOCK_SLIPPAGE_ATR_M
 #   Scaling both legs by ATR keeps the risk:reward ratio stable across regimes.
 #   The pre-existing dollar/percent values are retained as CAPS, per the agreed
 #   design - see the deployment notes about the cap binding at high ATR.
-ATR_RISK_SCALING_ENABLED = os.environ.get("ATR_RISK_SCALING_ENABLED", "true").lower() != "false"
-SL_ATR_MULT = float(os.environ.get("SL_ATR_MULT", "1.2"))
+ATR_RISK_SCALING_ENABLED = _env_bool("ATR_RISK_SCALING_ENABLED", True)
+SL_ATR_MULT = _env_float("SL_ATR_MULT", 1.2)
 # FLOOR on the ATR-scaled stop. Caught by test_new_features.py during
 # implementation: with the dollar value used purely as a CAP, a dead tape
 # (atr 0.02%) produced 1.2 x 0.0002 x $80 = a $0.02 stop - smaller than the
@@ -571,7 +683,7 @@ SL_ATR_MULT = float(os.environ.get("SL_ATR_MULT", "1.2"))
 # 0.15% of notional -> $0.12 at $80, floored at $0.05 so a very small
 # account still keeps a meaningful minimum stop.
 SL_MIN_USD = _notional_scaled("SL_MIN_USD", 0.0015, floor=0.05)
-TP_ATR_MULT = float(os.environ.get("TP_ATR_MULT", "2.5"))
+TP_ATR_MULT = _env_float("TP_ATR_MULT", 2.5)
 
 # P5 - Momentum-exhaustion guard. Both 2026-08-19 losses entered with
 #   momentum_magnitude saturated at exactly 1.0000 AND |flow_delta| ~1e5
@@ -619,15 +731,13 @@ TP_ATR_MULT = float(os.environ.get("TP_ATR_MULT", "2.5"))
 # would have cost that trade. Set TP_HIT_VETO_ENABLED=false to disable.
 # ============================================================================
 TP_HIT_VETO_ENABLED = (
-    os.environ.get("TP_HIT_VETO_ENABLED", "true").lower() != "false"
+    _env_bool("TP_HIT_VETO_ENABLED", True)
 )
-TP_HIT_VETO_MIN_PROB = float(os.environ.get("TP_HIT_VETO_MIN_PROB", "0.10"))
+TP_HIT_VETO_MIN_PROB = _env_float("TP_HIT_VETO_MIN_PROB", 0.10)
 
-MOMENTUM_EXHAUSTION_GUARD_ENABLED = os.environ.get(
-    "MOMENTUM_EXHAUSTION_GUARD_ENABLED", "true"
-).lower() != "false"
-MOMENTUM_EXHAUSTION_MAGNITUDE = float(os.environ.get("MOMENTUM_EXHAUSTION_MAGNITUDE", "1.0"))
-MOMENTUM_EXHAUSTION_FLOW_DELTA = float(os.environ.get("MOMENTUM_EXHAUSTION_FLOW_DELTA", "50000"))
+MOMENTUM_EXHAUSTION_GUARD_ENABLED = _env_bool("MOMENTUM_EXHAUSTION_GUARD_ENABLED", True)
+MOMENTUM_EXHAUSTION_MAGNITUDE = _env_float("MOMENTUM_EXHAUSTION_MAGNITUDE", 1.0)
+MOMENTUM_EXHAUSTION_FLOW_DELTA = _env_float("MOMENTUM_EXHAUSTION_FLOW_DELTA", 50000)
 
 # P6 - Market-websocket reconnect cooldown. Both losing entries fired 1-3s after
 #   a bookTicker "1011 keepalive ping timeout" reconnect, and the incident tick
@@ -635,17 +745,15 @@ MOMENTUM_EXHAUSTION_FLOW_DELTA = float(os.environ.get("MOMENTUM_EXHAUSTION_FLOW_
 #   New entries are suppressed briefly after any market-stream reconnect so the
 #   price/orderbook series is coherent before a decision is made. Open-position
 #   management (TP/SL/Profit-Lock/Smart-Exit/DCA) is deliberately NOT gated.
-MARKET_WS_RECONNECT_COOLDOWN_SEC = float(
-    os.environ.get("MARKET_WS_RECONNECT_COOLDOWN_SEC", "3.0")
-)
+MARKET_WS_RECONNECT_COOLDOWN_SEC = _env_float("MARKET_WS_RECONNECT_COOLDOWN_SEC", 3.0)
 
 # --- Simple entry signal (warmup/fallback only, see BRAIN V2 below) ---------
 SIGNAL_LOOKBACK_TICKS = 20
 SIGNAL_DEADBAND_PCT = 0.0005
 
 # --- Over-trading guardrails --------------------------------------------------
-TRADE_COOLDOWN_SEC = int(os.environ.get("TRADE_COOLDOWN_SEC", "60"))
-MIN_HOLD_SEC_BEFORE_EXIT = int(os.environ.get("MIN_HOLD_SEC_BEFORE_EXIT", "60"))
+TRADE_COOLDOWN_SEC = _env_int("TRADE_COOLDOWN_SEC", 60)
+MIN_HOLD_SEC_BEFORE_EXIT = _env_int("MIN_HOLD_SEC_BEFORE_EXIT", 60)
 # 1.25% of notional -> $1.00 at $80. Deliberately just above the
 # per-trade budget (1.125%), preserving the operator's existing choice
 # that roughly one full-budget loss ends the UTC day. Raise the fraction
@@ -663,7 +771,7 @@ DAILY_PROFIT_TARGET_USDT = _notional_scaled("DAILY_PROFIT_TARGET_USDT", 0.0125)
 # the next UTC day boundary. Set either value <=0 to disable that side.
 
 # --- Fee-aware profit threshold ----------------------------------------------
-TAKER_FEE_RATE = float(os.environ.get("TAKER_FEE_RATE", "0.0005"))
+TAKER_FEE_RATE = _env_float("TAKER_FEE_RATE", 0.0005)
 # 0.0625% of notional -> $0.05 at $80. Absolute floor under the Profit
 # Lock slippage buffer and the TP gates. This is a NET figure - fees are
 # already deducted by estimate_net_pnl_usdt_executable() - so it does not
@@ -673,7 +781,7 @@ MIN_NET_PROFIT_USDT = _notional_scaled("MIN_NET_PROFIT_USDT", 0.000625)
 # --- Liquidation-price sanity check -------------------------------------------
 LIQUIDATION_SANITY_MIN_RATIO = 0.2
 LIQUIDATION_SANITY_MAX_RATIO = 5.0
-LIQUIDATION_WARNING_BUFFER_PCT = float(os.environ.get("LIQUIDATION_WARNING_BUFFER_PCT", "0.15"))
+LIQUIDATION_WARNING_BUFFER_PCT = _env_float("LIQUIDATION_WARNING_BUFFER_PCT", 0.15)
 
 # --- Per-trade fee-net loss budget (2026-08 payoff-distribution fix) --------
 # Independent of MAX_DAILY_LOSS_USDT (a secondary, whole-day circuit
@@ -706,7 +814,7 @@ MAX_TRADE_EXIT_BUFFER_USDT = _notional_scaled("MAX_TRADE_EXIT_BUFFER_USDT", 0.00
 # the position and needs no quantity bookkeeping across DCA adds - see
 # trading.py's _place_or_replace_protective_stop() for the full rationale
 # and the accepted cancel-then-replace race window.
-PROTECTIVE_STOP_ENABLED = os.environ.get("PROTECTIVE_STOP_ENABLED", "true").lower() != "false"
+PROTECTIVE_STOP_ENABLED = _env_bool("PROTECTIVE_STOP_ENABLED", True)
 PROTECTIVE_STOP_WORKING_TYPE = os.environ.get("PROTECTIVE_STOP_WORKING_TYPE", "MARK_PRICE")
 # 2026-08 protective-stop ownership fix (review finding 4): every protective
 # stop this bot places carries a newClientOrderId beginning with this prefix,
@@ -726,14 +834,14 @@ PROTECTIVE_STOP_CLIENT_ID_PREFIX = os.environ.get("PROTECTIVE_STOP_CLIENT_ID_PRE
 # unprotected. Set PROTECTION_PENDING_MAX_SEC<=0 to disable the fail-safe
 # close (retries continue; the position is then allowed to stay open
 # unprotected - not recommended).
-PROTECTIVE_STOP_RETRY_SEC = float(os.environ.get("PROTECTIVE_STOP_RETRY_SEC", "30"))
-PROTECTION_PENDING_MAX_SEC = float(os.environ.get("PROTECTION_PENDING_MAX_SEC", "300"))
+PROTECTIVE_STOP_RETRY_SEC = _env_float("PROTECTIVE_STOP_RETRY_SEC", 30)
+PROTECTION_PENDING_MAX_SEC = _env_float("PROTECTION_PENDING_MAX_SEC", 300)
 
 # --- State reconciliation grace period ----------------------------------------
-SYNC_PENDING_GRACE_SEC = int(os.environ.get("SYNC_PENDING_GRACE_SEC", "8"))
+SYNC_PENDING_GRACE_SEC = _env_int("SYNC_PENDING_GRACE_SEC", 8)
 
 # --- Candle aggregation (backs ATR / EMA / regime / volume features) --------
-CANDLE_INTERVAL_SEC = int(os.environ.get("CANDLE_INTERVAL_SEC", "60"))
+CANDLE_INTERVAL_SEC = _env_int("CANDLE_INTERVAL_SEC", 60)
 CANDLE_HISTORY = 180          # ~3 hours of 1m candles kept in memory
 
 # --- Instant warm-up via historical klines ------------------------------------
@@ -758,8 +866,8 @@ CANDLE_HISTORY = 180          # ~3 hours of 1m candles kept in memory
 #   KLINE_WARMUP_INTERVAL - Binance kline interval string. Derived from
 #                          CANDLE_INTERVAL_SEC so it can never silently
 #                          disagree with the aggregator's own bucket size.
-KLINE_WARMUP_ENABLED = os.environ.get("KLINE_WARMUP_ENABLED", "true").lower() in ("1", "true", "yes")
-KLINE_WARMUP_LIMIT = max(1, min(int(os.environ.get("KLINE_WARMUP_LIMIT", "100")), CANDLE_HISTORY))
+KLINE_WARMUP_ENABLED = _env_bool("KLINE_WARMUP_ENABLED", True)
+KLINE_WARMUP_LIMIT = max(1, min(_env_int("KLINE_WARMUP_LIMIT", 100), CANDLE_HISTORY))
 
 _KLINE_INTERVAL_BY_SEC = {
     60: "1m", 180: "3m", 300: "5m", 900: "15m", 1800: "30m",
@@ -786,7 +894,7 @@ REGIME_LOOKBACK_CANDLES = 30
 
 # --- Brain V2 --------------------------------------------------------------
 N_FEATURES_V2 = 34
-BRAIN2_WARMUP_UPDATES = int(os.environ.get("BRAIN2_WARMUP_UPDATES", "80"))
+BRAIN2_WARMUP_UPDATES = _env_int("BRAIN2_WARMUP_UPDATES", 80)
 LABEL_HORIZON_TICKS = 10
 FEATURE_SHORT_LOOKBACK = 5
 RECENT_TRADE_WINDOW = 20
@@ -808,7 +916,7 @@ TP_HIT_LOOKAHEAD_CANDLES = 8      # how far ahead we check "did price reach TP-i
 # saturated-probability and entry-score-logging defects that WERE fixed),
 # so it was left alone per the "minimal targeted changes only" mandate.
 # Flagged here for a future, evidence-driven pass if warranted.
-BRAIN_HEAD_MIN_SAMPLES = int(os.environ.get("BRAIN_HEAD_MIN_SAMPLES", "20"))
+BRAIN_HEAD_MIN_SAMPLES = _env_int("BRAIN_HEAD_MIN_SAMPLES", 20)
 # 2026-08 entry-quality audit fix (confirmed defect - see brain.py):
 # success_model/tp_hit_model/noise_model are SGDClassifier heads that flip
 # their internal "fitted" flag True after their very FIRST partial_fit()
@@ -830,7 +938,7 @@ BRAIN_HEAD_MIN_SAMPLES = int(os.environ.get("BRAIN_HEAD_MIN_SAMPLES", "20"))
 # is_ready() gate) are completely unchanged.
 
 # --- Entry Engine V2 ---------------------------------------------------------
-ENTRY_SCORE_THRESHOLD = float(os.environ.get("ENTRY_SCORE_THRESHOLD", "0.75"))  # raised from 0.60 (2026-07 profitability fix)
+ENTRY_SCORE_THRESHOLD = _env_float("ENTRY_SCORE_THRESHOLD", 0.75)  # raised from 0.60 (2026-07 profitability fix)
 # 2026-08-18: raised 0.60 -> 0.63. This is the threshold that actually gated
 # the losing streak - all three trades were SIDEWAYS, so ENTRY_SCORE_THRESHOLD
 # (0.75) never applied. The accepted scores were 0.6021 / 0.6093 / 0.6251
@@ -855,18 +963,16 @@ ENTRY_SCORE_THRESHOLD = float(os.environ.get("ENTRY_SCORE_THRESHOLD", "0.75"))  
 # three losing trades on its own and is the principled gate here; this
 # threshold is the secondary filter. Set SIDEWAYS_ENTRY_SCORE_THRESHOLD=0.65
 # in the environment if you deliberately want SIDEWAYS entries off entirely.
-SIDEWAYS_ENTRY_SCORE_THRESHOLD = float(os.environ.get("SIDEWAYS_ENTRY_SCORE_THRESHOLD", "0.63"))  # SIDEWAYS is structurally capped lower (volatility_fit/regime_fit/momentum), all other regimes unchanged at 0.75
+SIDEWAYS_ENTRY_SCORE_THRESHOLD = _env_float("SIDEWAYS_ENTRY_SCORE_THRESHOLD", 0.63)  # SIDEWAYS is structurally capped lower (volatility_fit/regime_fit/momentum), all other regimes unchanged at 0.75
 # Clean Live entry evidence exposed a directional scoring hole: the entry
 # engine rewarded abs(momentum), so a strong upward move boosted a proposed
 # SHORT exactly like a LONG. In SIDEWAYS, block a meaningful counter move
 # (at least half the existing momentum-saturation scale); tiny sign jitter
 # remains governed by the normal composite score instead of a hard gate.
 SIDEWAYS_ENTRY_MOMENTUM_ALIGNMENT_ENABLED = (
-    os.environ.get("SIDEWAYS_ENTRY_MOMENTUM_ALIGNMENT_ENABLED", "true").lower() != "false"
+    _env_bool("SIDEWAYS_ENTRY_MOMENTUM_ALIGNMENT_ENABLED", True)
 )
-SIDEWAYS_ENTRY_COUNTER_MOMENTUM_BLOCK_RATIO = float(
-    os.environ.get("SIDEWAYS_ENTRY_COUNTER_MOMENTUM_BLOCK_RATIO", "0.50")
-)
+SIDEWAYS_ENTRY_COUNTER_MOMENTUM_BLOCK_RATIO = _env_float("SIDEWAYS_ENTRY_COUNTER_MOMENTUM_BLOCK_RATIO", 0.50)
 ENTRY_WEIGHTS = {
     "brain_confidence": 0.30,
     "trend_confidence": 0.20,
@@ -878,7 +984,7 @@ ENTRY_WEIGHTS = {
 }
 
 # --- Smart Exit V2 ------------------------------------------------------------
-SMART_EXIT_ENABLED = os.environ.get("SMART_EXIT_ENABLED", "true").lower() != "false"
+SMART_EXIT_ENABLED = _env_bool("SMART_EXIT_ENABLED", True)
 SMART_EXIT_MAX_LOSS_PCT = 0.01
 SMART_EXIT_MIN_LOSS_PCT = 0.0010   # Smart Exit gate: position must already be at least -0.10% adverse before Smart Exit is evaluated at all (2026-07 Smart Exit fix)
 SMART_EXIT_CONFIRM_TICKS = 5
@@ -886,12 +992,12 @@ SMART_EXIT_MIN_AGREE = 5          # of the following 6 signals, how many must ag
 SMART_EXIT_CONFIDENCE_DROP = 0.18  # confidence_score drop vs entry that counts as "dropped"
 SMART_EXIT_ATR_MOVE_MULT = 0.8     # adverse move >= this * ATR% counts as a signal
 SMART_EXIT_DCA_PROXIMITY_RATIO = 0.9  # if the adverse move is already >= this fraction of the current DCA trigger distance, Smart Exit is blocked so DCA can activate instead (2026-07 Smart Exit fix)
-SMART_EXIT_MIN_HOLD_SEC = float(os.environ.get("SMART_EXIT_MIN_HOLD_SEC", "90"))
+SMART_EXIT_MIN_HOLD_SEC = _env_float("SMART_EXIT_MIN_HOLD_SEC", 90)
 # Smart-Exit-only minimum hold, separate from and stricter than MIN_HOLD_SEC_BEFORE_EXIT
 # (60s) above. Only gates Smart Exit itself, so TP/partial-TP/trailing-stop timing is
 # unchanged - a fresh entry just gets extra room before Smart Exit can close it
 # (2026-08 Smart Exit V2 retune).
-SMART_EXIT_MIN_AGREE_RANGING = int(os.environ.get("SMART_EXIT_MIN_AGREE_RANGING", "6"))
+SMART_EXIT_MIN_AGREE_RANGING = _env_int("SMART_EXIT_MIN_AGREE_RANGING", 6)
 # In SIDEWAYS/WEAK_TREND, require ALL 6 signals (unanimous) instead of the normal
 # SMART_EXIT_MIN_AGREE (5), since ordinary chop/pullbacks in these regimes trip 1-2
 # signals often without a real reversal happening. STRONG_TREND/HIGH_VOL keep the
@@ -899,21 +1005,21 @@ SMART_EXIT_MIN_AGREE_RANGING = int(os.environ.get("SMART_EXIT_MIN_AGREE_RANGING"
 # (2026-08 Smart Exit V2 retune).
 
 # --- ATR-based Dynamic DCA ----------------------------------------------------
-DCA_ATR_MULTIPLIER = float(os.environ.get("DCA_ATR_MULTIPLIER", "1.2"))
-DCA_MIN_DISTANCE_PCT = float(os.environ.get("DCA_MIN_DISTANCE_PCT", "0.0015"))
-DCA_MAX_DISTANCE_PCT = float(os.environ.get("DCA_MAX_DISTANCE_PCT", "0.02"))
+DCA_ATR_MULTIPLIER = _env_float("DCA_ATR_MULTIPLIER", 1.2)
+DCA_MIN_DISTANCE_PCT = _env_float("DCA_MIN_DISTANCE_PCT", 0.0015)
+DCA_MAX_DISTANCE_PCT = _env_float("DCA_MAX_DISTANCE_PCT", 0.02)
 
 # --- Dynamic position sizing ---------------------------------------------------
-SIZE_MIN_MULT = float(os.environ.get("SIZE_MIN_MULT", "0.5"))
-SIZE_MAX_MULT = float(os.environ.get("SIZE_MAX_MULT", "1.5"))
+SIZE_MIN_MULT = _env_float("SIZE_MIN_MULT", 0.5)
+SIZE_MAX_MULT = _env_float("SIZE_MAX_MULT", 1.5)
 
 # --- Partial TP / breakeven / trailing stop -----------------------------------
-PARTIAL_TP_ENABLED = os.environ.get("PARTIAL_TP_ENABLED", "false").lower() != "false"  # disabled by default (2026-07 profitability fix) - was truncating winners; trailing stop remains active
-PARTIAL_TP_FRACTION = float(os.environ.get("PARTIAL_TP_FRACTION", "0.5"))
-PARTIAL_TP_TRIGGER_RATIO = float(os.environ.get("PARTIAL_TP_TRIGGER_RATIO", "0.6"))  # of dynamic TP distance
-BREAKEVEN_AFTER_PARTIAL = os.environ.get("BREAKEVEN_AFTER_PARTIAL", "true").lower() != "false"
-TRAILING_STOP_ENABLED = os.environ.get("TRAILING_STOP_ENABLED", "true").lower() != "false"
-TRAILING_STOP_ATR_MULT = float(os.environ.get("TRAILING_STOP_ATR_MULT", "1.0"))
+PARTIAL_TP_ENABLED = _env_bool("PARTIAL_TP_ENABLED", False)  # disabled by default (2026-07 profitability fix) - was truncating winners; trailing stop remains active
+PARTIAL_TP_FRACTION = _env_float("PARTIAL_TP_FRACTION", 0.5)
+PARTIAL_TP_TRIGGER_RATIO = _env_float("PARTIAL_TP_TRIGGER_RATIO", 0.6)  # of dynamic TP distance
+BREAKEVEN_AFTER_PARTIAL = _env_bool("BREAKEVEN_AFTER_PARTIAL", True)
+TRAILING_STOP_ENABLED = _env_bool("TRAILING_STOP_ENABLED", True)
+TRAILING_STOP_ATR_MULT = _env_float("TRAILING_STOP_ATR_MULT", 1.0)
 
 # --- Trade logging / offline dataset / performance stats ---------------------
 # 2026-08 (later revision): trade logs are now symbol-scoped, not shared.
@@ -933,10 +1039,10 @@ STATS_JSON_PATH = os.environ.get("STATS_JSON_PATH", _symbol_scoped_default("perf
 STATS_CSV_PATH = os.environ.get("STATS_CSV_PATH", _symbol_scoped_default("performance_stats.csv"))
 _warn_if_explicit_path_bypasses_isolation("STATS_JSON_PATH")
 _warn_if_explicit_path_bypasses_isolation("STATS_CSV_PATH")
-STATS_EXPORT_INTERVAL_SEC = int(os.environ.get("STATS_EXPORT_INTERVAL_SEC", "300"))
+STATS_EXPORT_INTERVAL_SEC = _env_int("STATS_EXPORT_INTERVAL_SEC", 300)
 
 # --- Funding rate / open interest (best-effort extra features) ---------------
-FUNDING_OI_POLL_SEC = int(os.environ.get("FUNDING_OI_POLL_SEC", "120"))
+FUNDING_OI_POLL_SEC = _env_int("FUNDING_OI_POLL_SEC", 120)
 
 # --- Persistent Adaptive Learning (Cloud-Sync Brain) -------------------------
 BRAIN_LOCAL_PATH = os.environ.get("BRAIN_LOCAL_PATH", _symbol_scoped_default("brain.pkl"))
@@ -957,7 +1063,7 @@ _warn_if_explicit_path_bypasses_isolation("GITHUB_BRAIN_PATH")
 # GitHub setup required. Do not set this to the same branch Railway deploys
 # from.
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "brain-state")
-BRAIN_AUTO_PUSH_INTERVAL_SEC = int(os.environ.get("BRAIN_AUTO_PUSH_INTERVAL_SEC", "300"))
+BRAIN_AUTO_PUSH_INTERVAL_SEC = _env_int("BRAIN_AUTO_PUSH_INTERVAL_SEC", 300)
 
 # CSV analytics sync (same repo/session as the Brain snapshot - see
 # GithubBrainSync). Default: same directory as GITHUB_BRAIN_PATH, so they
@@ -1171,11 +1277,7 @@ def _clamped_poll_interval(name: str, default: float) -> float:
     """Reads a poller interval from the environment and clamps it into the
     [REST_POLL_MIN_SEC, REST_POLL_MAX_SEC] rate-limit-safe band. A
     non-numeric value falls back to `default` rather than crashing startup."""
-    try:
-        value = float(os.environ.get(name, str(default)))
-    except (TypeError, ValueError):
-        print(f"[config] {name} is not a number - using default {default}s")
-        value = default
+    value = _env_float(name, default)
     clamped = min(max(value, REST_POLL_MIN_SEC), REST_POLL_MAX_SEC)
     if clamped != value:
         print(
@@ -1192,15 +1294,15 @@ POSITION_RISK_POLL_IDLE_SEC = max(
 # Balance is refreshed far less often than position risk (it is websocket-fed),
 # so it is only floor-clamped, never capped at REST_POLL_MAX_SEC.
 try:
-    BALANCE_REFRESH_SEC = max(float(os.environ.get("BALANCE_REFRESH_SEC", "60")), REST_POLL_MIN_SEC)
+    BALANCE_REFRESH_SEC = max(_env_float("BALANCE_REFRESH_SEC", 60), REST_POLL_MIN_SEC)
 except (TypeError, ValueError):
     BALANCE_REFRESH_SEC = 60.0
 try:
-    BALANCE_WS_FRESH_SEC = max(float(os.environ.get("BALANCE_WS_FRESH_SEC", "90")), 0.0)
+    BALANCE_WS_FRESH_SEC = max(_env_float("BALANCE_WS_FRESH_SEC", 90), 0.0)
 except (TypeError, ValueError):
     BALANCE_WS_FRESH_SEC = 90.0
 try:
-    REST_POLL_JITTER_PCT = min(max(float(os.environ.get("REST_POLL_JITTER_PCT", "0.15")), 0.0), 0.5)
+    REST_POLL_JITTER_PCT = min(max(_env_float("REST_POLL_JITTER_PCT", 0.15), 0.0), 0.5)
 except (TypeError, ValueError):
     REST_POLL_JITTER_PCT = 0.15
 
@@ -1236,6 +1338,10 @@ else:
 
 
 __all__ = [
+    # 2026-08-21 robust env parsing helpers (exported so trading.py and any
+    # future module can read the environment through the same safe path).
+    "_env_raw", "_env_float", "_env_int", "_env_bool", "_env_str",
+    "env_parse_warnings",
     "SYMBOL",
     # 2026-08-20 multi-coin watchlist
     "ACTIVE_SYMBOLS",
@@ -1436,15 +1542,15 @@ __all__ = [
 # ============================================================================
 
 # --- 1. Orderbook / flow guard (the eight required toggles) ------------------
-ENABLE_ORDERBOOK_GUARD = os.environ.get("ENABLE_ORDERBOOK_GUARD", "true").lower() != "false"
-ORDERBOOK_IMBALANCE_THRESHOLD = float(os.environ.get("ORDERBOOK_IMBALANCE_THRESHOLD", "0.20"))
-AGG_TRADE_DELTA_WINDOW_SEC = int(os.environ.get("AGG_TRADE_DELTA_WINDOW_SEC", "10"))
+ENABLE_ORDERBOOK_GUARD = _env_bool("ENABLE_ORDERBOOK_GUARD", True)
+ORDERBOOK_IMBALANCE_THRESHOLD = _env_float("ORDERBOOK_IMBALANCE_THRESHOLD", 0.20)
+AGG_TRADE_DELTA_WINDOW_SEC = _env_int("AGG_TRADE_DELTA_WINDOW_SEC", 10)
 # 1.125% of notional -> $0.90 at $80. Cap on the ATR-scaled stop.
 MAX_STOP_LOSS_USD = _notional_scaled("MAX_STOP_LOSS_USD", 0.01125)
 # 1.125% of notional -> $0.90 at $80. Reward leg of the 1:N RR envelope.
 TARGET_PROFIT_USD = _notional_scaled("TARGET_PROFIT_USD", 0.01125)
-COOL_OFF_PERIOD_MINUTES = float(os.environ.get("COOL_OFF_PERIOD_MINUTES", "15"))
-USE_POST_ONLY_LIMIT = os.environ.get("USE_POST_ONLY_LIMIT", "true").lower() != "false"
+COOL_OFF_PERIOD_MINUTES = _env_float("COOL_OFF_PERIOD_MINUTES", 15)
+USE_POST_ONLY_LIMIT = _env_bool("USE_POST_ONLY_LIMIT", True)
 
 # MAX_DCA_STEPS: deliberately RE-BOUND here rather than edited in place
 # above, so the original definition (and its full historical comment about
@@ -1456,7 +1562,7 @@ USE_POST_ONLY_LIMIT = os.environ.get("USE_POST_ONLY_LIMIT", "true").lower() != "
 # This assignment shadows the earlier one at import time; every consumer
 # (trading.py's DCA gates, sanitize_recovered_dca_step(), the DCA-state
 # snapshot clamps) reads this final value.
-MAX_DCA_STEPS = int(os.environ.get("MAX_DCA_STEPS", "1"))
+MAX_DCA_STEPS = _env_int("MAX_DCA_STEPS", 1)
 
 # --- 2. High-frequency market-data layer (websocket.py) ---------------------
 # Binance publishes partial book depth in fixed sizes (5/10/20) and at
@@ -1464,24 +1570,24 @@ MAX_DCA_STEPS = int(os.environ.get("MAX_DCA_STEPS", "1"))
 # compute the imbalance over the top ORDERBOOK_DEPTH_LEVELS (10) of each
 # side, per the spec:
 #     (top10_bid_vol - top10_ask_vol) / (top10_bid_vol + top10_ask_vol)
-ORDERBOOK_STREAM_DEPTH = int(os.environ.get("ORDERBOOK_STREAM_DEPTH", "20"))
-ORDERBOOK_STREAM_SPEED_MS = int(os.environ.get("ORDERBOOK_STREAM_SPEED_MS", "100"))
-ORDERBOOK_DEPTH_LEVELS = int(os.environ.get("ORDERBOOK_DEPTH_LEVELS", "10"))
+ORDERBOOK_STREAM_DEPTH = _env_int("ORDERBOOK_STREAM_DEPTH", 20)
+ORDERBOOK_STREAM_SPEED_MS = _env_int("ORDERBOOK_STREAM_SPEED_MS", 100)
+ORDERBOOK_DEPTH_LEVELS = _env_int("ORDERBOOK_DEPTH_LEVELS", 10)
 # RAM safety on Railway: both rolling buffers are collections.deque with a
 # hard maxlen, so the orderflow layer's memory footprint is bounded and
 # constant no matter how long the process runs. 600 depth samples at 100ms
 # is a 60s rolling view; 4000 aggTrades comfortably covers the 10s delta
 # window even in a violent tape.
-ORDERBOOK_BUFFER_MAXLEN = int(os.environ.get("ORDERBOOK_BUFFER_MAXLEN", "600"))
-AGG_TRADE_BUFFER_MAXLEN = int(os.environ.get("AGG_TRADE_BUFFER_MAXLEN", "4000"))
+ORDERBOOK_BUFFER_MAXLEN = _env_int("ORDERBOOK_BUFFER_MAXLEN", 600)
+AGG_TRADE_BUFFER_MAXLEN = _env_int("AGG_TRADE_BUFFER_MAXLEN", 4000)
 # A depth/trade reading older than this is treated as "no data" rather than
 # as a live signal - a silently dead stream must never look like a neutral
 # (0.0) orderbook.
-ORDERFLOW_STALE_SEC = float(os.environ.get("ORDERFLOW_STALE_SEC", "5.0"))
+ORDERFLOW_STALE_SEC = _env_float("ORDERFLOW_STALE_SEC", 5.0)
 # Dynamic auto-reconnect tuning for the market websockets (Railway network
 # drops): full jitter is applied to the existing exponential backoff so a
 # multi-stream reconnect storm never re-hits Binance in lockstep.
-WS_RECONNECT_JITTER_RATIO = float(os.environ.get("WS_RECONNECT_JITTER_RATIO", "0.5"))
+WS_RECONNECT_JITTER_RATIO = _env_float("WS_RECONNECT_JITTER_RATIO", 0.5)
 
 # --- 3. Entry Liquidity & Flow Guard (brain.py) ------------------------------
 # Multi-factor confirmation: a trade may only open when the TECHNICAL signal
@@ -1490,12 +1596,12 @@ WS_RECONNECT_JITTER_RATIO = float(os.environ.get("WS_RECONNECT_JITTER_RATIO", "0
 # same-side imbalance that counts as genuine book support (0.0 = book merely
 # not against us); AGG_TRADE_DELTA_MIN is the equivalent floor on the signed
 # 10s volume delta, in base-asset units.
-ORDERBOOK_SUPPORT_MIN = float(os.environ.get("ORDERBOOK_SUPPORT_MIN", "0.0"))
-AGG_TRADE_DELTA_MIN = float(os.environ.get("AGG_TRADE_DELTA_MIN", "0.0"))
+ORDERBOOK_SUPPORT_MIN = _env_float("ORDERBOOK_SUPPORT_MIN", 0.0)
+AGG_TRADE_DELTA_MIN = _env_float("AGG_TRADE_DELTA_MIN", 0.0)
 # When True (default), an unavailable/stale orderflow feed BLOCKS entries
 # instead of silently degrading to "no guard". Fail-safe, not fail-open.
 ORDERBOOK_GUARD_REQUIRES_DATA = (
-    os.environ.get("ORDERBOOK_GUARD_REQUIRES_DATA", "true").lower() != "false"
+    _env_bool("ORDERBOOK_GUARD_REQUIRES_DATA", True)
 )
 
 # --- 4. Strict 1:2 risk-to-reward envelope (trading.py) ---------------------
@@ -1509,21 +1615,21 @@ ORDERBOOK_GUARD_REQUIRES_DATA = (
 # DEAD VALUE. Imported by trading.py but never read for any decision - the
 # working stop floor is SL_MIN_USD above. Retained only so the existing import
 # does not break; setting it has no effect. Safe to delete from Railway.
-MIN_STOP_LOSS_USD = float(os.environ.get("MIN_STOP_LOSS_USD", "0.15"))
+MIN_STOP_LOSS_USD = _env_float("MIN_STOP_LOSS_USD", 0.15)
 # 0.4375% of notional -> $0.35 at $80. The orderflow-assisted TP path,
 # which produced the single best trade of 2026-08-21 (+$0.3596 on NEAR).
 MIN_TARGET_PROFIT_USD = _notional_scaled("MIN_TARGET_PROFIT_USD", 0.004375)
 ENFORCE_RISK_REWARD_USD = (
-    os.environ.get("ENFORCE_RISK_REWARD_USD", "true").lower() != "false"
+    _env_bool("ENFORCE_RISK_REWARD_USD", True)
 )
 # Post-only (maker) entry execution. A GTX order that would cross the book
 # is rejected by Binance rather than paying taker fees; we re-price once,
 # and only then fall back to the original MARKET behavior (so the bot can
 # never be left unable to trade at all by a fast tape).
-POST_ONLY_LIMIT_OFFSET_TICKS = int(os.environ.get("POST_ONLY_LIMIT_OFFSET_TICKS", "0"))
-POST_ONLY_LIMIT_TIMEOUT_SEC = float(os.environ.get("POST_ONLY_LIMIT_TIMEOUT_SEC", "20"))
+POST_ONLY_LIMIT_OFFSET_TICKS = _env_int("POST_ONLY_LIMIT_OFFSET_TICKS", 0)
+POST_ONLY_LIMIT_TIMEOUT_SEC = _env_float("POST_ONLY_LIMIT_TIMEOUT_SEC", 20)
 POST_ONLY_MARKET_FALLBACK = (
-    os.environ.get("POST_ONLY_MARKET_FALLBACK", "true").lower() != "false"
+    _env_bool("POST_ONLY_MARKET_FALLBACK", True)
 )
 
 # --- 5. Continuous 24/7 execution -------------------------------------------
@@ -1534,7 +1640,7 @@ POST_ONLY_MARKET_FALLBACK = (
 # set CONTINUOUS_24_7_TRADING=false to restore the previous daily-halt
 # behavior with no code change.
 CONTINUOUS_24_7_TRADING = (
-    os.environ.get("CONTINUOUS_24_7_TRADING", "true").lower() != "false"
+    _env_bool("CONTINUOUS_24_7_TRADING", True)
 )
 
 # --- 6. Dynamic post-loss cool-off window -----------------------------------
@@ -1543,19 +1649,17 @@ CONTINUOUS_24_7_TRADING = (
 # the adverse-imbalance veto trips earlier (threshold reduced by
 # COOL_OFF_IMBALANCE_TIGHTEN) and genuine same-side book support of at least
 # COOL_OFF_SUPPORT_MIN is required. This is the anti-revenge-trading rule.
-COOL_OFF_IMBALANCE_TIGHTEN = float(os.environ.get("COOL_OFF_IMBALANCE_TIGHTEN", "0.10"))
-COOL_OFF_SUPPORT_MIN = float(os.environ.get("COOL_OFF_SUPPORT_MIN", "0.20"))
+COOL_OFF_IMBALANCE_TIGHTEN = _env_float("COOL_OFF_IMBALANCE_TIGHTEN", 0.10)
+COOL_OFF_SUPPORT_MIN = _env_float("COOL_OFF_SUPPORT_MIN", 0.20)
 
 # --- 7. Smart Orderflow Early Exit ------------------------------------------
 # If the orderbook imbalance flips violently AGAINST an open position before
 # the stop is reached, exit at a micro-loss instead of riding it to the full
 # SL. Fires only inside the $0.05-$0.10 fee-net micro-loss band.
 SMART_ORDERFLOW_EXIT_ENABLED = (
-    os.environ.get("SMART_ORDERFLOW_EXIT_ENABLED", "true").lower() != "false"
+    _env_bool("SMART_ORDERFLOW_EXIT_ENABLED", True)
 )
-SMART_ORDERFLOW_EXIT_IMBALANCE = float(
-    os.environ.get("SMART_ORDERFLOW_EXIT_IMBALANCE", "0.35")
-)
+SMART_ORDERFLOW_EXIT_IMBALANCE = _env_float("SMART_ORDERFLOW_EXIT_IMBALANCE", 0.35)
 # 0.125% of notional -> $0.10 at $80. THE BAND FLOOR THAT MUST SCALE.
 # A fresh position's fee-net PnL starts at exactly minus the round-trip fee
 # (~0.07% of notional, measured from the live trade log). If this floor ever
@@ -1595,9 +1699,7 @@ SMART_ORDERFLOW_EXIT_MAX_LOSS_USD = _notional_scaled(
 # book, against the full winning distribution on the upside.
 #
 # Set back to 10 to restore the previous behaviour exactly.
-SMART_ORDERFLOW_EXIT_MIN_HOLD_SEC = float(
-    os.environ.get("SMART_ORDERFLOW_EXIT_MIN_HOLD_SEC", "50")
-)
+SMART_ORDERFLOW_EXIT_MIN_HOLD_SEC = _env_float("SMART_ORDERFLOW_EXIT_MIN_HOLD_SEC", 50)
 
 # --- 8. Safe DCA: single-step rescue order, break-even target ---------------
 # The one permitted DCA add is only submitted when the book itself supports
@@ -1605,11 +1707,11 @@ SMART_ORDERFLOW_EXIT_MIN_HOLD_SEC = float(
 # rescue has filled, the position stops chasing the full TP and targets a
 # fast break-even exit instead.
 DCA_REQUIRE_ORDERBOOK_SUPPORT = (
-    os.environ.get("DCA_REQUIRE_ORDERBOOK_SUPPORT", "true").lower() != "false"
+    _env_bool("DCA_REQUIRE_ORDERBOOK_SUPPORT", True)
 )
-DCA_RESCUE_SUPPORT_MIN = float(os.environ.get("DCA_RESCUE_SUPPORT_MIN", "0.10"))
+DCA_RESCUE_SUPPORT_MIN = _env_float("DCA_RESCUE_SUPPORT_MIN", 0.10)
 DCA_RESCUE_BREAKEVEN_ENABLED = (
-    os.environ.get("DCA_RESCUE_BREAKEVEN_ENABLED", "true").lower() != "false"
+    _env_bool("DCA_RESCUE_BREAKEVEN_ENABLED", True)
 )
 # 0.05% of notional -> $0.04 at $80.
 DCA_RESCUE_BREAKEVEN_MIN_NET_USD = _notional_scaled(
