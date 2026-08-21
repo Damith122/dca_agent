@@ -7167,12 +7167,27 @@ class MartingaleManager:
         # Smart Exit V2 further down (which is untouched): this reacts to live
         # orderflow within seconds, where Smart Exit V2 reasons about
         # candle/regime/confidence evidence over a much longer horizon.
+        #
+        # 2026-08-21 minimum-hold gate. SMART_ORDERFLOW_EXIT_MIN_HOLD_SEC was
+        # widened from 10s to 50s (see config.py for the live evidence). The
+        # age test moved OUT of this outer condition and into the decision
+        # below so a suppressed exit can be logged instead of vanishing
+        # silently - previously a young position skipped this whole block and
+        # left no trace, which made the gate impossible to observe in a deploy
+        # log. Nothing else about the trigger changed.
+        #
+        # What stays ACTIVE for the whole window, unchanged: the Hard Stop and
+        # the trade-loss budget and the 1:N RR stop all run EARLIER in this
+        # method and return on their own; Profit Lock runs LATER and is
+        # reached normally, because this block only returns when it actually
+        # closes the position.
         if (
             SMART_ORDERFLOW_EXIT_ENABLED
             and ENABLE_ORDERBOOK_GUARD
             and self.position_sync_ready
-            and (time.time() - p.opened_at) >= SMART_ORDERFLOW_EXIT_MIN_HOLD_SEC
         ):
+            held_sec = (time.time() - p.opened_at) if p.opened_at else 0.0
+            min_hold_met = held_sec >= SMART_ORDERFLOW_EXIT_MIN_HOLD_SEC
             flow = self.orderflow_snapshot()
             if flow.get("data_available"):
                 flow_imbalance = float(flow.get("imbalance", 0.0) or 0.0)
@@ -7191,7 +7206,7 @@ class MartingaleManager:
                     <= of_est_net
                     <= -SMART_ORDERFLOW_EXIT_MIN_LOSS_USD
                 )
-                if book_flipped and flow_against and in_micro_loss_band:
+                if book_flipped and flow_against and in_micro_loss_band and min_hold_met:
                     print(color(
                         f"{now_str()} [orderflow-exit] TRIGGERED: book flipped against the "
                         f"{p.side} (imbalance={flow_imbalance:+.4f}, threshold "
@@ -7209,6 +7224,24 @@ class MartingaleManager:
                         expected_position=p,
                     )
                     return
+                elif (
+                    book_flipped and flow_against and in_micro_loss_band
+                    and not min_hold_met and self._should_log_orderflow_exit()
+                ):
+                    # 2026-08-21: the exit was fully triggered on orderflow and
+                    # would have fired under the old 10s gate - the ONLY thing
+                    # holding it is the minimum-hold window. Logged explicitly
+                    # so the change is measurable: every one of these lines is
+                    # a micro-loss the old setting would have booked.
+                    print(color(
+                        f"{now_str()} [orderflow-exit] SUPPRESSED by the minimum-hold gate - "
+                        f"book flipped against the {p.side} (imbalance={flow_imbalance:+.4f}, "
+                        f"delta={flow_delta:+.4f}, fee-net ${of_est_net:+.4f}) but the position "
+                        f"is only {held_sec:.0f}s old and the gate is "
+                        f"{SMART_ORDERFLOW_EXIT_MIN_HOLD_SEC:.0f}s. Giving it room to work; "
+                        f"Hard Stop, the trade-loss budget, the RR stop and Profit Lock all "
+                        f"remain active.", GRAY,
+                    ))
                 elif book_flipped and flow_against and self._should_log_orderflow_exit():
                     print(color(
                         f"{now_str()} [orderflow-exit] book flipped against the {p.side} "
