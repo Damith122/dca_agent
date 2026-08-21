@@ -134,6 +134,7 @@ from websockets.exceptions import ConnectionClosed
 # ============================================================================
 
 from config import (
+    env_parse_warnings,
     SYMBOL,
     # 2026-08-20 multi-coin watchlist
     ACTIVE_SYMBOLS,
@@ -1040,6 +1041,19 @@ async def main() -> None:
     # pinning. A leftover explicit override does not scale with
     # INITIAL_ENTRY_USDT, so it silently changes the strategy's geometry the
     # next time position size moves - it must not be invisible.
+    # 2026-08-21 robust env parsing: any variable that was blank or
+    # unparseable fell back to its code default instead of crashing at
+    # import. That fallback must never be silent - a mistyped threshold
+    # would otherwise change the strategy's risk geometry invisibly.
+    env_warnings = env_parse_warnings()
+    if env_warnings:
+        print(color(
+            f" [config] {len(env_warnings)} environment variable(s) could not be "
+            f"parsed and fell back to code defaults:", YELLOW,
+        ))
+        for warning in env_warnings:
+            print(color(f"     {warning}", YELLOW))
+
     scaling = notional_scaling_report()
     overridden = [(n, v) for n, v, src in scaling if src == "OVERRIDDEN"]
     print(color(

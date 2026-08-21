@@ -246,6 +246,10 @@ import numpy as np
 from decimal import Decimal, ROUND_UP
 
 from config import (
+    # 2026-08-21 robust env parsing: shared with config.py so a blank or
+    # malformed variable falls back to the default here too, rather than
+    # raising ValueError at import time.
+    _env_int,
     SYMBOL,
     RUNTIME_ENV,
     DRY_RUN,
@@ -526,7 +530,7 @@ FINALIZED_CLOSE_ID_MEMORY = 64
 # cursor to pick up an open position's entry leg. A real entry leg is at most a
 # handful of account trades back; anything further means the stored floor is
 # corrupt, and rewinding to it would scan unrelated history.
-MAX_RECONCILE_REWIND_IDS = int(os.environ.get("MAX_RECONCILE_REWIND_IDS", "100000"))
+MAX_RECONCILE_REWIND_IDS = _env_int("MAX_RECONCILE_REWIND_IDS", 100000)
 
 
 # ============================================================================
