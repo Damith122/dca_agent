@@ -1364,8 +1364,31 @@ SMART_ORDERFLOW_EXIT_MIN_LOSS_USD = float(
 SMART_ORDERFLOW_EXIT_MAX_LOSS_USD = float(
     os.environ.get("SMART_ORDERFLOW_EXIT_MAX_LOSS_USD", "0.10")
 )
+# 2026-08-21 minimum-hold widening (10s -> 50s).
+#
+# Live evidence from deployment c5d71582: three of five closed trades exited
+# via orderflow_smart_exit at holds of 10.5s, 16.6s and 12.8s - i.e. within
+# seconds of this gate expiring at its old 10s value - each for a fee-net
+# loss of $0.058-$0.068 on a ~$38 notional. Round-trip fees alone are
+# ~$0.027, so those exits were realizing barely more than the cost of the
+# round trip: normal entry noise being converted into a booked loss.
+#
+# Ten seconds of orderbook imbalance is microstructure noise, not a thesis
+# being invalidated. 50s sits between the two sibling gates that already
+# exist for the slower exits - MIN_HOLD_SEC_BEFORE_EXIT (60s) and
+# SMART_EXIT_MIN_HOLD_SEC (90s) - and keeps this the fastest-reacting
+# discretionary exit while no longer firing inside the spread.
+#
+# This changes ONLY when the orderflow exit becomes eligible. Throughout the
+# window the Hard Stop, the trade-loss budget, the 1:N RR stop and Profit
+# Lock all remain fully active (they are evaluated earlier in
+# _manage_open_position, or fall through unaffected), so downside is still
+# capped at the RR ceiling - roughly 2x the micro-loss this gate used to
+# book, against the full winning distribution on the upside.
+#
+# Set back to 10 to restore the previous behaviour exactly.
 SMART_ORDERFLOW_EXIT_MIN_HOLD_SEC = float(
-    os.environ.get("SMART_ORDERFLOW_EXIT_MIN_HOLD_SEC", "10")
+    os.environ.get("SMART_ORDERFLOW_EXIT_MIN_HOLD_SEC", "50")
 )
 
 # --- 8. Safe DCA: single-step rescue order, break-even target ---------------
