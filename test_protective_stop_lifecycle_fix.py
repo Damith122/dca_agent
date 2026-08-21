@@ -67,6 +67,7 @@ import time
 
 import dca2 as bot
 import trading
+import config
 
 
 class FakeClient:
@@ -1135,9 +1136,16 @@ async def test_f8_open_position_management_never_blocked_by_entry_gate():
     m._orphan_protective_algo_ids.add(999)
     m._position_fees_accum = 0.05
     m._position_fees_reliable = True
+    # 2026-08-21: the per-trade loss budget is now DERIVED from notional
+    # (1.125% of INITIAL_ENTRY_USDT x LEVERAGE) instead of a hardcoded $0.20,
+    # so a fixed 99.80 no longer reaches it - the position still closed, but
+    # via the rr-stop, testing a different gate than this case names. Compute
+    # the price from the live budget so it stays correct at any position size.
+    budget_trigger = config.MAX_TRADE_NET_LOSS_USDT - config.MAX_TRADE_EXIT_BUFFER_USDT
+    deep_price = round(100.0 - (budget_trigger + 0.30) / 1.0, 2)   # qty=1.0, + margin for fees
     with Capture() as cap:
-        m.current_price = m.best_bid_price = m.best_ask_price = 99.80  # deep enough for the budget
-        m.prev_price = 99.80
+        m.current_price = m.best_bid_price = m.best_ask_price = deep_price
+        m.prev_price = deep_price
         await m._manage_open_position()
     out = cap.text
     assert "[trade-loss-budget] TRIGGERED" in out, out

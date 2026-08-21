@@ -269,6 +269,81 @@ INITIAL_ENTRY_USDT = float(os.environ.get("INITIAL_ENTRY_USDT", "4"))
 # notional and DCA #1 at >= $64 notional even in the worst-case
 # (size_mult=SIZE_MIN_MULT=0.5) scenario - both comfortably above $50.
 # DCA #2/#3 were already well above the minimum and remain so.
+
+# ============================================================================
+# 2026-08-21 NOTIONAL-RELATIVE RISK SCALING
+#
+# Every per-trade dollar threshold below (stop ceiling, loss budget, take
+# profit, Profit Lock arming, the orderflow micro-loss band, ...) is now
+# DERIVED from the entry notional instead of being a hardcoded dollar value.
+#
+# WHY. PnL scales with notional: the same 0.2% price move is worth $0.08 at a
+# $40 entry and $0.16 at $80. A fixed dollar threshold therefore silently
+# HALVES in percentage terms every time position size doubles - a stop that
+# was 1.1% of notional becomes 0.55%, i.e. twice as tight, without anyone
+# deciding that. Scaling INITIAL_ENTRY_USDT from 2 to 4 on 2026-08-21 required
+# ten separate manual env-var edits to keep the geometry intact, and getting
+# any one of them wrong would have silently changed the strategy. One of them
+# (the orderflow micro-loss band) would have broken outright: at $80 notional
+# a fresh position's fee-net PnL starts at about -$0.056, which fell straight
+# inside the old [-$0.10, -$0.05] exit band, so every position would have been
+# born eligible for an immediate exit.
+#
+# HOW. Each threshold is expressed as a FRACTION OF ENTRY NOTIONAL, chosen so
+# that at the current INITIAL_ENTRY_USDT=4 / LEVERAGE=20 ($80 notional) every
+# value reproduces exactly what was running before this refactor. Change
+# INITIAL_ENTRY_USDT alone and the whole risk geometry follows.
+#
+# ESCAPE HATCH. Setting the corresponding env var explicitly still wins, and
+# now prints a startup warning - so a stale Railway variable left over from
+# the manual era is visible rather than silently pinning a threshold while the
+# rest of the geometry moves around it.
+#
+# Note this scales off NOTIONAL, not wallet balance. Balance is the wrong
+# reference: it moves with every closed trade and with deposits, so a
+# balance-relative stop would drift mid-session and change meaning after every
+# win or loss. Notional is fixed for the life of a position, which is exactly
+# the horizon these thresholds govern.
+# ============================================================================
+ENTRY_NOTIONAL_USDT = INITIAL_ENTRY_USDT * LEVERAGE
+
+# Populated by _notional_scaled() below; reported at startup by dca2.py and
+# used to warn about leftover explicit overrides.
+_NOTIONAL_SCALED_RESOLVED: dict = {}
+_NOTIONAL_SCALED_OVERRIDDEN: dict = {}
+
+
+def _notional_scaled(env_var: str, fraction_of_notional: float, *, floor: float = 0.0) -> float:
+    """A per-trade dollar threshold as a fraction of the entry notional.
+
+    An explicitly-set env var always wins (and is recorded so startup can warn
+    about it). `floor` is an absolute dollar minimum for thresholds that stop
+    being meaningful below a certain size regardless of notional - it is
+    deliberately NOT scaled.
+    """
+    explicit = os.environ.get(env_var)
+    if explicit not in (None, ""):
+        try:
+            value = float(explicit)
+            _NOTIONAL_SCALED_OVERRIDDEN[env_var] = value
+            _NOTIONAL_SCALED_RESOLVED[env_var] = value
+            return value
+        except (TypeError, ValueError):
+            pass          # unparseable -> fall through to the derived value
+    value = max(floor, fraction_of_notional * ENTRY_NOTIONAL_USDT)
+    _NOTIONAL_SCALED_RESOLVED[env_var] = value
+    return value
+
+
+def notional_scaling_report() -> list:
+    """(name, value, 'derived'|'OVERRIDDEN') for every scaled threshold, for
+    the startup banner. Pure diagnostics."""
+    return [
+        (name, value, "OVERRIDDEN" if name in _NOTIONAL_SCALED_OVERRIDDEN else "derived")
+        for name, value in sorted(_NOTIONAL_SCALED_RESOLVED.items())
+    ]
+
+
 DCA_MULTIPLIER = float(os.environ.get("DCA_MULTIPLIER", "1.6"))  # reduced from 2.0 (2026-07 profitability fix) - less notional/fee blowup per DCA rung
 MAX_DCA_STEPS = int(os.environ.get("MAX_DCA_STEPS", "2"))        # reduced from 3 (2026-08 $33-account risk fix) - 3 steps required 112% of a $33 account's margin to fully cascade and produced ~45% worst-case single-trade loss; 2 steps fits within the account (~62.5% margin) and cuts worst-case loss to ~25% while keeping the final-DCA low-probability-recovery gate active at the depth where trade evidence showed it protecting against genuine trend moves
 
@@ -404,7 +479,8 @@ ENTRY_MOMENTUM_SATURATION_PCT = float(os.environ.get("ENTRY_MOMENTUM_SATURATION_
 
 # --- Profit Lock (env-configurable - 2026-08 Railway-tuning fix; values and
 # behavior are UNCHANGED, only made overridable without a code edit) --------
-PROFIT_LOCK_ACTIVATION_USDT = float(os.environ.get("PROFIT_LOCK_ACTIVATION_USDT", "0.10"))
+# 0.125% of notional -> $0.10 at $80. Arms the lock.
+PROFIT_LOCK_ACTIVATION_USDT = _notional_scaled("PROFIT_LOCK_ACTIVATION_USDT", 0.00125)
 PROFIT_LOCK_RATIO = float(os.environ.get("PROFIT_LOCK_RATIO", "0.50"))
 
 # --- 2026-08-19 Profit Lock / risk-geometry hardening (P1-P6) -----------------
@@ -492,7 +568,9 @@ SL_ATR_MULT = float(os.environ.get("SL_ATR_MULT", "1.2"))
 # ever cover its own costs, and the RR stop fired ahead of every other exit.
 # The effective stop is therefore clamped to
 # [max(SL_MIN_USD, 1.5 x round-trip fee), MAX_STOP_LOSS_USD].
-SL_MIN_USD = float(os.environ.get("SL_MIN_USD", "0.12"))
+# 0.15% of notional -> $0.12 at $80, floored at $0.05 so a very small
+# account still keeps a meaningful minimum stop.
+SL_MIN_USD = _notional_scaled("SL_MIN_USD", 0.0015, floor=0.05)
 TP_ATR_MULT = float(os.environ.get("TP_ATR_MULT", "2.5"))
 
 # P5 - Momentum-exhaustion guard. Both 2026-08-19 losses entered with
@@ -523,8 +601,13 @@ SIGNAL_DEADBAND_PCT = 0.0005
 # --- Over-trading guardrails --------------------------------------------------
 TRADE_COOLDOWN_SEC = int(os.environ.get("TRADE_COOLDOWN_SEC", "60"))
 MIN_HOLD_SEC_BEFORE_EXIT = int(os.environ.get("MIN_HOLD_SEC_BEFORE_EXIT", "60"))
-MAX_DAILY_LOSS_USDT = float(os.environ.get("MAX_DAILY_LOSS_USDT", "0.50"))
-DAILY_PROFIT_TARGET_USDT = float(os.environ.get("DAILY_PROFIT_TARGET_USDT", "0.50"))
+# 1.25% of notional -> $1.00 at $80. Deliberately just above the
+# per-trade budget (1.125%), preserving the operator's existing choice
+# that roughly one full-budget loss ends the UTC day. Raise the fraction
+# to allow a longer losing sequence.
+MAX_DAILY_LOSS_USDT = _notional_scaled("MAX_DAILY_LOSS_USDT", 0.0125)
+# 1.25% of notional -> $1.00 at $80. Symmetric with the loss lock.
+DAILY_PROFIT_TARGET_USDT = _notional_scaled("DAILY_PROFIT_TARGET_USDT", 0.0125)
 # 2026-08 fee-net daily session locks: once today's (UTC calendar day)
 # cumulative REALIZED NET PnL reaches either boundary, no NEW entries are
 # opened for the rest of that UTC day. The tracker uses Binance's actual
@@ -536,7 +619,11 @@ DAILY_PROFIT_TARGET_USDT = float(os.environ.get("DAILY_PROFIT_TARGET_USDT", "0.5
 
 # --- Fee-aware profit threshold ----------------------------------------------
 TAKER_FEE_RATE = float(os.environ.get("TAKER_FEE_RATE", "0.0005"))
-MIN_NET_PROFIT_USDT = float(os.environ.get("MIN_NET_PROFIT_USDT", "0.05"))
+# 0.0625% of notional -> $0.05 at $80. Absolute floor under the Profit
+# Lock slippage buffer and the TP gates. This is a NET figure - fees are
+# already deducted by estimate_net_pnl_usdt_executable() - so it does not
+# need to track the fee rate.
+MIN_NET_PROFIT_USDT = _notional_scaled("MIN_NET_PROFIT_USDT", 0.000625)
 
 # --- Liquidation-price sanity check -------------------------------------------
 LIQUIDATION_SANITY_MIN_RATIO = 0.2
@@ -556,8 +643,10 @@ LIQUIDATION_WARNING_BUFFER_PCT = float(os.environ.get("LIQUIDATION_WARNING_BUFFE
 # the previous behavior). Not a profitability guarantee - slippage, gaps,
 # delayed fills, and exchange outages/bans can still produce a worse result
 # than this budget targets.
-MAX_TRADE_NET_LOSS_USDT = float(os.environ.get("MAX_TRADE_NET_LOSS_USDT", "0.20"))
-MAX_TRADE_EXIT_BUFFER_USDT = float(os.environ.get("MAX_TRADE_EXIT_BUFFER_USDT", "0.05"))
+# 1.125% of notional -> $0.90 at $80. Per-trade fee-net loss budget.
+MAX_TRADE_NET_LOSS_USDT = _notional_scaled("MAX_TRADE_NET_LOSS_USDT", 0.01125)
+# 0.125% of notional -> $0.10 at $80. Subtracted from the budget above.
+MAX_TRADE_EXIT_BUFFER_USDT = _notional_scaled("MAX_TRADE_EXIT_BUFFER_USDT", 0.00125)
 
 # --- Exchange-native protective stop (2026-08 HTTP 418 IP-ban resilience) --
 # A client-side loss check (MAX_TRADE_NET_LOSS_USDT above) cannot protect an
@@ -1107,6 +1196,9 @@ __all__ = [
     "ACTIVE_SYMBOLS",
     "MAX_ACTIVE_TRADES",
     "symbol_scoped_name",
+    # 2026-08-21 notional-relative risk scaling
+    "ENTRY_NOTIONAL_USDT",
+    "notional_scaling_report",
     # 2026-08-21 tick throttling
     "TICK_MIN_INTERVAL_SEC",
     "TICK_MIN_INTERVAL_ACTIVE_SEC",
@@ -1299,8 +1391,10 @@ __all__ = [
 ENABLE_ORDERBOOK_GUARD = os.environ.get("ENABLE_ORDERBOOK_GUARD", "true").lower() != "false"
 ORDERBOOK_IMBALANCE_THRESHOLD = float(os.environ.get("ORDERBOOK_IMBALANCE_THRESHOLD", "0.20"))
 AGG_TRADE_DELTA_WINDOW_SEC = int(os.environ.get("AGG_TRADE_DELTA_WINDOW_SEC", "10"))
-MAX_STOP_LOSS_USD = float(os.environ.get("MAX_STOP_LOSS_USD", "0.20"))
-TARGET_PROFIT_USD = float(os.environ.get("TARGET_PROFIT_USD", "0.40"))
+# 1.125% of notional -> $0.90 at $80. Cap on the ATR-scaled stop.
+MAX_STOP_LOSS_USD = _notional_scaled("MAX_STOP_LOSS_USD", 0.01125)
+# 1.125% of notional -> $0.90 at $80. Reward leg of the 1:N RR envelope.
+TARGET_PROFIT_USD = _notional_scaled("TARGET_PROFIT_USD", 0.01125)
 COOL_OFF_PERIOD_MINUTES = float(os.environ.get("COOL_OFF_PERIOD_MINUTES", "15"))
 USE_POST_ONLY_LIMIT = os.environ.get("USE_POST_ONLY_LIMIT", "true").lower() != "false"
 
@@ -1364,8 +1458,13 @@ ORDERBOOK_GUARD_REQUIRES_DATA = (
 # the MIN_* values below are the inner bounds, used so a winner can be
 # banked at $0.35 the moment orderflow turns instead of insisting on the
 # full $0.40.
+# DEAD VALUE. Imported by trading.py but never read for any decision - the
+# working stop floor is SL_MIN_USD above. Retained only so the existing import
+# does not break; setting it has no effect. Safe to delete from Railway.
 MIN_STOP_LOSS_USD = float(os.environ.get("MIN_STOP_LOSS_USD", "0.15"))
-MIN_TARGET_PROFIT_USD = float(os.environ.get("MIN_TARGET_PROFIT_USD", "0.35"))
+# 0.4375% of notional -> $0.35 at $80. The orderflow-assisted TP path,
+# which produced the single best trade of 2026-08-21 (+$0.3596 on NEAR).
+MIN_TARGET_PROFIT_USD = _notional_scaled("MIN_TARGET_PROFIT_USD", 0.004375)
 ENFORCE_RISK_REWARD_USD = (
     os.environ.get("ENFORCE_RISK_REWARD_USD", "true").lower() != "false"
 )
@@ -1409,11 +1508,21 @@ SMART_ORDERFLOW_EXIT_ENABLED = (
 SMART_ORDERFLOW_EXIT_IMBALANCE = float(
     os.environ.get("SMART_ORDERFLOW_EXIT_IMBALANCE", "0.35")
 )
-SMART_ORDERFLOW_EXIT_MIN_LOSS_USD = float(
-    os.environ.get("SMART_ORDERFLOW_EXIT_MIN_LOSS_USD", "0.05")
+# 0.125% of notional -> $0.10 at $80. THE BAND FLOOR THAT MUST SCALE.
+# A fresh position's fee-net PnL starts at exactly minus the round-trip fee
+# (~0.07% of notional, measured from the live trade log). If this floor ever
+# drops below that, every position is born INSIDE the exit band with zero
+# price movement and becomes eligible for an immediate orderflow exit. At the
+# old fixed $0.05 that is precisely what the $2 -> $4 scale-up would have
+# caused ($80 notional -> $0.056 of fees > $0.05). Scaling it keeps the floor
+# a constant ~1.8x the round-trip fee at any size.
+SMART_ORDERFLOW_EXIT_MIN_LOSS_USD = _notional_scaled(
+    "SMART_ORDERFLOW_EXIT_MIN_LOSS_USD", 0.00125
 )
-SMART_ORDERFLOW_EXIT_MAX_LOSS_USD = float(
-    os.environ.get("SMART_ORDERFLOW_EXIT_MAX_LOSS_USD", "0.10")
+# 0.25% of notional -> $0.20 at $80. Keeps the band exactly 2x as wide as
+# its floor at every position size.
+SMART_ORDERFLOW_EXIT_MAX_LOSS_USD = _notional_scaled(
+    "SMART_ORDERFLOW_EXIT_MAX_LOSS_USD", 0.0025
 )
 # 2026-08-21 minimum-hold widening (10s -> 50s).
 #
@@ -1454,8 +1563,9 @@ DCA_RESCUE_SUPPORT_MIN = float(os.environ.get("DCA_RESCUE_SUPPORT_MIN", "0.10"))
 DCA_RESCUE_BREAKEVEN_ENABLED = (
     os.environ.get("DCA_RESCUE_BREAKEVEN_ENABLED", "true").lower() != "false"
 )
-DCA_RESCUE_BREAKEVEN_MIN_NET_USD = float(
-    os.environ.get("DCA_RESCUE_BREAKEVEN_MIN_NET_USD", "0.02")
+# 0.05% of notional -> $0.04 at $80.
+DCA_RESCUE_BREAKEVEN_MIN_NET_USD = _notional_scaled(
+    "DCA_RESCUE_BREAKEVEN_MIN_NET_USD", 0.0005
 )
 
 
