@@ -303,14 +303,28 @@ def test_empty_exceptions_still_identify_themselves():
         assert got.strip(), "the text must NEVER be empty - that is the whole defect"
 
     # And the call sites actually use it.
+    #
+    # 2026-08-20 multi-coin: the per-symbol pollers now tag their log label
+    # with the symbol ([risk:SOLUSDT]) so four coins' interleaved failures
+    # stay attributable. The invariant this check exists for is unchanged -
+    # every one of these sites must route its exception through _exc_text()
+    # rather than interpolating a bare {e} - so it is asserted on the
+    # _exc_text() call itself plus the label stem, not on the exact literal.
     src = open("dca2.py", encoding="utf-8").read()
-    for site in (
-        "[risk] position risk poll failed: {_exc_text(e)}",
-        "[balance] refresh failed: {_exc_text(e)}",
-        "[funding] premiumIndex poll failed (continuing without it): {_exc_text(e)}",
-        "[funding] openInterest poll failed (continuing without it): {_exc_text(e)}",
+    for stem, tail in (
+        ("[risk", "] position risk poll failed: {_exc_text(e)}"),
+        ("[balance", "] refresh failed: {_exc_text(e)}"),
+        ("[funding", "] premiumIndex poll failed (continuing without it): {_exc_text(e)}"),
+        ("[funding", "] openInterest poll failed (continuing without it): {_exc_text(e)}"),
     ):
-        assert site in src, f"call site not routed through _exc_text: {site}"
+        assert any(stem in line and tail in line for line in src.splitlines()), (
+            f"call site not routed through _exc_text: {stem}...{tail}"
+        )
+    # The actual defect: no poller may interpolate a bare {e}.
+    bare = [line.strip() for line in src.splitlines()
+            if "{e}" in line and "{_exc_text(e)}" not in line
+            and any(t in line for t in ("[risk", "[balance", "[funding"))]
+    assert not bare, f"a poller still logs a bare exception: {bare}"
     print("F3: PASS - a timeout can no longer log a blank line\n")
 
 

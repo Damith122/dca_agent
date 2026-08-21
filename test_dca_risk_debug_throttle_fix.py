@@ -22,6 +22,13 @@ normal exits active. Rapid ticks must not spam logs or place any order.
 Run directly: `python3 test_dca_risk_debug_throttle_fix.py`
 """
 import os
+# 2026-08-20 multi-coin: declare the symbol this suite actually exercises.
+# Persistence paths are now derived per-manager from its own symbol, so a
+# suite that builds SOLUSDT managers while config.SYMBOL sat at the
+# BTCUSDT default would resolve its explicit *_PATH overrides against the
+# wrong symbol. The mismatch was always latent; symbol-scoped paths
+# surface it.
+os.environ.setdefault("SYMBOL", "SOLUSDT")
 os.environ.setdefault("BINANCE_API_KEY", "test")
 os.environ.setdefault("BINANCE_API_SECRET", "test")
 os.environ.setdefault("USE_TESTNET", "true")

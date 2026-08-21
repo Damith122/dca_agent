@@ -63,6 +63,71 @@ USE_TESTNET = os.environ.get("USE_TESTNET", "true").lower() != "false"
 RUNTIME_ENV = "TESTNET" if USE_TESTNET else "LIVE"
 
 
+# ---------------------------------------------------------------------------
+# 2026-08-20 multi-coin watchlist.
+#
+# ACTIVE_SYMBOLS is the watchlist the evaluator scans. SYMBOL (above) is
+# retained unchanged as the PRIMARY symbol: it still seeds every legacy
+# module-level path constant below, so a single-symbol deployment behaves
+# exactly as it did before this change, and every existing test that reads
+# config.SYMBOL keeps working.
+#
+# Precedence: ACTIVE_SYMBOLS env var (comma-separated) > the default list.
+# SYMBOL is always forced to be a member, and always first, so the primary
+# symbol can never be silently dropped from its own watchlist by a typo in
+# the env var.
+#
+# MAX_ACTIVE_TRADES caps how many positions may be open across the WHOLE
+# watchlist at once, not per symbol. With ~$19 USDT of capital, 1 is the
+# only defensible value: each entry is INITIAL_ENTRY_USDT of margin at
+# LEVERAGE, and concurrent positions would multiply both the margin draw
+# and the correlated drawdown across coins that mostly move together.
+# ---------------------------------------------------------------------------
+def _parse_symbol_list(raw: str, primary: str) -> list:
+    """Comma-separated watchlist -> ordered, de-duplicated, upper-cased list
+    with `primary` guaranteed present and first. Blank entries are dropped."""
+    out = [primary]
+    for part in (raw or "").split(","):
+        sym = part.strip().upper()
+        if sym and sym not in out:
+            out.append(sym)
+    return out
+
+
+_DEFAULT_WATCHLIST = "SOLUSDT,BTCUSDT,ETHUSDT,NEARUSDT"
+ACTIVE_SYMBOLS = _parse_symbol_list(
+    os.environ.get("ACTIVE_SYMBOLS", _DEFAULT_WATCHLIST), SYMBOL
+)
+
+# Hard cap on simultaneously-open positions across ACTIVE_SYMBOLS. Clamped
+# to >= 1: a 0 or negative value would silently disable trading entirely,
+# which is a far more surprising outcome than falling back to 1.
+try:
+    MAX_ACTIVE_TRADES = max(1, int(os.environ.get("MAX_ACTIVE_TRADES", "1")))
+except (TypeError, ValueError):
+    MAX_ACTIVE_TRADES = 1
+
+
+def symbol_scoped_name(base_name: str, symbol: str) -> str:
+    """2026-08-20 multi-coin: the per-symbol form of
+    _symbol_scoped_default() below, taking the symbol EXPLICITLY instead of
+    reading the module-level SYMBOL global.
+
+    This is what makes multi-coin file isolation work. Each
+    MartingaleManager derives its own persistence paths through this
+    helper from its OWN self.symbol, so four managers in one process write
+    four disjoint sets of files:
+
+        brain_LIVE_SOLUSDT.pkl     dca_state_LIVE_SOLUSDT.json    ...
+        brain_LIVE_BTCUSDT.pkl     dca_state_LIVE_BTCUSDT.json    ...
+
+    The naming convention is byte-identical to what _symbol_scoped_default()
+    already produced, so files written by previous single-symbol builds are
+    picked up unchanged - there is no migration step."""
+    stem, ext = os.path.splitext(base_name)
+    return f"{stem}_{RUNTIME_ENV}_{symbol.strip().upper()}{ext}"
+
+
 def _symbol_scoped_default(base_name: str) -> str:
     """Returns an environment+symbol-suffixed variant of `base_name` for
     the ACTIVE RUNTIME_ENV and SYMBOL, with no exception for any
@@ -78,8 +143,7 @@ def _symbol_scoped_default(base_name: str) -> str:
     exactly the value they set, completely untouched by RUNTIME_ENV/SYMBOL
     (see _warn_if_explicit_path_bypasses_isolation() below for the
     accompanying safety-net warning)."""
-    stem, ext = os.path.splitext(base_name)
-    return f"{stem}_{RUNTIME_ENV}_{SYMBOL}{ext}"
+    return symbol_scoped_name(base_name, SYMBOL)
 
 
 def _warn_if_explicit_path_bypasses_isolation(env_var_name: str) -> None:
@@ -931,6 +995,10 @@ else:
 
 __all__ = [
     "SYMBOL",
+    # 2026-08-20 multi-coin watchlist
+    "ACTIVE_SYMBOLS",
+    "MAX_ACTIVE_TRADES",
+    "symbol_scoped_name",
     "USE_TESTNET",
     "DRY_RUN",
     "I_UNDERSTAND_THIS_IS_REAL_MONEY",

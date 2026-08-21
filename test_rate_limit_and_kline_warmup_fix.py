@@ -47,6 +47,13 @@ Run directly: `python3 test_rate_limit_and_kline_warmup_fix.py`
 """
 import os
 
+# 2026-08-20 multi-coin: declare the symbol this suite actually exercises.
+# Persistence paths are now derived per-manager from its own symbol, so a
+# suite that builds SOLUSDT managers while config.SYMBOL sat at the
+# BTCUSDT default would resolve its explicit *_PATH overrides against the
+# wrong symbol. The mismatch was always latent; symbol-scoped paths
+# surface it.
+os.environ.setdefault("SYMBOL", "SOLUSDT")
 os.environ.setdefault("BINANCE_API_KEY", "test")
 os.environ.setdefault("BINANCE_API_SECRET", "test")
 os.environ.setdefault("USE_TESTNET", "true")
@@ -564,8 +571,14 @@ def test_main_wires_the_warm_up_before_the_stream():
     print("=== test_main_wires_the_warm_up_before_the_stream ===")
 
     source = open("dca2.py", encoding="utf-8").read()
+    # 2026-08-20 multi-coin: the per-symbol startup sequence moved from
+    # main()'s body into setup_symbol(), and the consumers are now scheduled
+    # in a loop over the watchlist - so the literals changed. The ORDERING
+    # invariant this test exists for is unchanged and still checked below:
+    # seed candles -> reconcile against the exchange -> hand over to the
+    # websocket stream.
     warmup_at = source.index("await warm_up_candles_from_klines(client, manager)")
-    consumers_at = source.index("market_data_consumer(manager),")
+    consumers_at = source.index("market_data_consumer(m),")
     sync_at = source.index('await initialize_sync(client, manager, context="startup")')
 
     print(f"TEST 13: warm_up@{warmup_at} initialize_sync@{sync_at} consumers@{consumers_at}")

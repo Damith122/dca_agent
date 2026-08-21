@@ -135,6 +135,9 @@ from websockets.exceptions import ConnectionClosed
 
 from config import (
     SYMBOL,
+    # 2026-08-20 multi-coin watchlist
+    ACTIVE_SYMBOLS,
+    MAX_ACTIVE_TRADES,
     USE_TESTNET,
     DRY_RUN,
     I_UNDERSTAND_THIS_IS_REAL_MONEY,
@@ -406,6 +409,9 @@ from exchange import BinanceApiError, RestClient, SymbolFilters, fetch_symbol_fi
 # ============================================================================
 
 from trading import (
+    # 2026-08-20 multi-coin
+    PortfolioCoordinator,
+    resolve_symbol_paths,
     Candle,
     CandleAggregator,
     RegimeReading,
@@ -469,16 +475,19 @@ async def load_dca_state(manager: MartingaleManager) -> None:
 
     data: Optional[dict] = None
     try:
-        if os.path.exists(DCA_STATE_PATH):
-            with open(DCA_STATE_PATH, "r", encoding="utf-8") as f:
+        # 2026-08-20 multi-coin: read THIS manager's own snapshot, not the
+        # primary symbol's. With four managers the module-level constant
+        # would have restored the primary's DCA state onto all four.
+        if os.path.exists(manager.paths["dca_state"]):
+            with open(manager.paths["dca_state"], "r", encoding="utf-8") as f:
                 data = json.load(f)
     except Exception as e:  # noqa: BLE001 - corrupt/missing local file must not block startup
-        print(color(f"[dca-state] could not read local {DCA_STATE_PATH}: {e}", YELLOW))
+        print(color(f"[dca-state] could not read local {manager.paths['dca_state']}: {e}", YELLOW))
         data = None
 
     if data is None:
         try:
-            raw = await manager.github_sync.download(path=GITHUB_DCA_STATE_PATH)
+            raw = await manager.github_sync.download(path=manager.paths["github_dca_state"])
             if raw:
                 data = json.loads(raw.decode("utf-8"))
         except Exception as e:  # noqa: BLE001 - restore must never block startup
@@ -668,15 +677,15 @@ async def funding_oi_poller(client: RestClient, manager: MartingaleManager) -> N
             await client.wait_out_cooldown_silently()
             continue
         try:
-            premium = await client.get_premium_index(SYMBOL)
+            premium = await client.get_premium_index(manager.symbol)
             manager.funding_rate = float(premium.get("lastFundingRate", 0) or 0)
         except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-            print(color(f"[funding] premiumIndex poll failed (continuing without it): {_exc_text(e)}", YELLOW))
+            print(color(f"[funding:{manager.symbol}] premiumIndex poll failed (continuing without it): {_exc_text(e)}", YELLOW))
         try:
-            oi = await client.get_open_interest(SYMBOL)
+            oi = await client.get_open_interest(manager.symbol)
             manager.open_interest = float(oi.get("openInterest", 0) or 0)
         except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-            print(color(f"[funding] openInterest poll failed (continuing without it): {_exc_text(e)}", YELLOW))
+            print(color(f"[funding:{manager.symbol}] openInterest poll failed (continuing without it): {_exc_text(e)}", YELLOW))
         # 2026-08 HTTP 429 fix: jittered so this poller never lines up with
         # the balance/positionRisk pollers on the same wall-clock tick.
         await asyncio.sleep(jittered_interval(FUNDING_OI_POLL_SEC))
@@ -746,7 +755,7 @@ async def position_risk_poller(client: RestClient, manager: MartingaleManager) -
             await client.wait_out_cooldown_silently()
             continue
         try:
-            rows = await client.get_position_risk(SYMBOL)
+            rows = await client.get_position_risk(manager.symbol)
             row = next((r for r in rows if float(r.get("positionAmt", 0)) != 0), None)
             if row:
                 mark_price = float(row.get("markPrice", 0) or 0)
@@ -792,7 +801,7 @@ async def position_risk_poller(client: RestClient, manager: MartingaleManager) -
                 manager.liquidation_price = None
             await initialize_sync(client, manager, context="periodic poll", rows=rows)
         except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-            print(color(f"[risk] position risk poll failed: {_exc_text(e)}", RED))
+            print(color(f"[risk:{manager.symbol}] position risk poll failed: {_exc_text(e)}", RED))
         await asyncio.sleep(jittered_interval(_position_risk_interval(manager)))
 
 
@@ -854,12 +863,149 @@ async def status_loop(manager: MartingaleManager, interval_sec: int = 20) -> Non
 # ============================================================================
 
 
+async def setup_symbol(
+    client: RestClient, symbol: str, portfolio: "PortfolioCoordinator"
+) -> MartingaleManager:
+    """2026-08-20 multi-coin: everything that used to happen inline in main()
+    for the one SYMBOL, now parameterised so it can run once per watchlist
+    entry. The body is the original startup sequence verbatim - same calls,
+    same order, same comments - with SYMBOL replaced by the `symbol`
+    argument and each log line prefixed with the symbol so four interleaved
+    startups stay readable.
+
+    Ordering is load-bearing and unchanged: brain -> CSV restore ->
+    accounting rebuild -> cursor -> DCA snapshot -> initialize_sync ->
+    protective-stop reconciliation. See the inline comments for why.
+    """
+    filters = await retry_with_backoff(
+        fetch_symbol_filters, client, symbol, label="fetch_symbol_filters"
+    )
+    print(color(
+        f"[setup] {symbol} filters: tick={filters.tick_size} step={filters.step_size} "
+        f"minQty={filters.min_qty} minNotional={filters.min_notional}", GRAY
+    ))
+
+    # Cross 40x / DCA sizing sanity check: confirm every one of the 5
+    # martingale steps clears the exchange's minimum notional up front.
+    # Step 0 (the initial entry) is ALWAYS exactly INITIAL_ENTRY_USDT -
+    # it is never confidence/risk/regime-scaled - so it's checked as-is.
+    # DCA steps 1-5 CAN be scaled down by confidence sizing at runtime
+    # (see confidence_size_multiplier / notional_for_step), so those are
+    # checked at their worst case (SIZE_MIN_MULT) to make sure a
+    # low-confidence DCA add can never silently fall below min_notional.
+    for step in range(MAX_DCA_STEPS + 1):
+        margin = INITIAL_ENTRY_USDT if step == 0 else INITIAL_ENTRY_USDT * (DCA_MULTIPLIER ** step)
+        if step > 0:
+            margin *= SIZE_MIN_MULT  # worst case (smallest allowed) DCA add size
+        step_notional = margin * LEVERAGE
+        ok = step_notional >= filters.min_notional
+        label = "INITIAL" if step == 0 else f"DCA #{step} (min size)"
+        print(color(
+            f"[setup]   [{symbol}] {label}: margin=${margin:.2f} notional=${step_notional:.2f} "
+            f"{'OK' if ok else 'BELOW MIN_NOTIONAL - will be skipped at runtime!'}",
+            GRAY if ok else RED,
+        ))
+
+    if not DRY_RUN:
+        await retry_with_backoff(client.set_leverage, symbol, LEVERAGE, label="set_leverage")
+        await retry_with_backoff(client.set_margin_type, symbol, MARGIN_TYPE, label="set_margin_type")
+        print(color(f"[setup] [{symbol}] leverage set to {LEVERAGE}x, margin type {MARGIN_TYPE}", GRAY))
+    else:
+        print(color(
+            f"[setup] [{symbol}] [DRY RUN] would set leverage={LEVERAGE}x, marginType={MARGIN_TYPE}", GRAY
+        ))
+
+    manager = MartingaleManager(client, symbol, filters, LEVERAGE, portfolio=portfolio)
+
+    if not DRY_RUN:
+        balances = await retry_with_backoff(client.get_balance, label="get_balance")
+        usdt = next((b for b in balances if b["asset"] == "USDT"), None)
+        manager.available_balance = float(usdt["availableBalance"]) if usdt else 0.0
+    else:
+        manager.available_balance = 500.0
+    print(color(f"[setup] [{symbol}] available balance: {manager.available_balance:.2f} USDT", GRAY))
+
+    # 2026-08 instant warm-up fix: ONE REST call to GET /fapi/v1/klines
+    # seeds the candle buffer with the last KLINE_WARMUP_LIMIT closed 1m
+    # candles, so ATR / RSI / EMA / regime are valid within seconds of
+    # boot instead of after ~an hour of the live tick stream building 57
+    # candles by itself ("[entry-skip] startup warm-up: insufficient
+    # market history (candles=5/57)"). Runs BEFORE the first
+    # on_book_ticker() below and before the websocket consumers start, so
+    # the live stream simply continues the series from the seeded history
+    # - only fully-closed historical candles are seeded, the in-progress
+    # bucket is always owned by the live stream (see
+    # CandleAggregator.prime_from_klines). Best-effort: a failure here
+    # just restores the old stream-only warm-up, it never blocks startup.
+    await warm_up_candles_from_klines(client, manager)
+
+    book = await retry_with_backoff(client.get_book_ticker, symbol, label="get_book_ticker")
+    bid, ask = float(book["bidPrice"]), float(book["askPrice"])
+    manager.on_book_ticker(bid, ask, float(book.get("bidQty", 0) or 0), float(book.get("askQty", 0) or 0))
+    print(color(f"[setup] [{symbol}] current price: {manager.current_price:.2f}", GRAY))
+
+    try:
+        premium = await client.get_premium_index(symbol)
+        manager.funding_rate = float(premium.get("lastFundingRate", 0) or 0)
+        print(color(f"[setup] [{symbol}] current funding rate: {manager.funding_rate:.6f}", GRAY))
+    except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+        print(color(f"[setup] could not fetch initial funding rate (continuing without it): {_exc_text(e)}", YELLOW))
+
+    # Persistent Adaptive Learning: local brain snapshot -> GitHub -> fresh model.
+    await manager.load_or_init_brain()
+    # Same GitHub session as the brain - restores trades_log.jsonl /
+    # trades_log.csv / performance_stats.csv so trade history and
+    # analytics survive an ephemeral restart exactly like brain.pkl does.
+    await manager.restore_csv_logs_from_github()
+    # 2026-08 restart-safe accounting fix: rebuilds trade_count /
+    # realized_pnl_total / daily_realized_pnl (and
+    # _daily_loss_tracker_date) from the trades_log JSONL just restored
+    # above - MUST run after restore_csv_logs_from_github() (so it
+    # reads restored history, not an empty fresh file) and before
+    # load_trade_sync_cursor()/reconcile_trade_history_from_exchange()
+    # ever gets a chance to run, so anything reconciliation goes on to
+    # recover afterward is simply added on top of this base (see that
+    # method's own docstring in trading.py for why this can never
+    # double-count). Pure bookkeeping restore only - does not touch
+    # DCA/position state, Brain V2, or any trading decision.
+    await manager.restore_runtime_accounting_from_history()
+    # Restores the trade-log reconciliation cursor (see
+    # reconcile_trade_history_from_exchange) the same way, so a Railway
+    # restart resumes catching up on Binance trade history from where
+    # it left off instead of re-scanning (or missing) anything.
+    await manager.load_trade_sync_cursor()
+    # Restores a persisted DCA/position state snapshot (local disk, then
+    # GitHub - see DCA_STATE_PATH / GITHUB_DCA_STATE_PATH) so an
+    # in-progress DCA position survives an ephemeral restart instead of
+    # starting flat. MUST run before initialize_sync() below, so that
+    # initialize_sync()'s own exchange-vs-local reconciliation (unchanged)
+    # has this rebuilt local state to compare against.
+    await load_dca_state(manager)
+
+    await initialize_sync(client, manager, context="startup")
+    # item 6: exchange-native protective stop reconciliation - MUST run
+    # after initialize_sync() (needs the authoritative post-reconcile
+    # side/qty/avg_entry_price) and before the long-running consumer
+    # loops start, so an OPEN position recovered above is never left
+    # believing it's protected without this process actually having
+    # confirmed that against Binance's own open orders.
+    await reconcile_protective_stop_on_startup(client, manager)
+    return manager
+
+
 async def main() -> None:
     enforce_safety_gates()
 
     print(color("=" * 78, CYAN))
     print(color(" Martingale DCA Scalper - Binance USD-M Futures  [Brain V2]", BOLD))
     print(color(f" Symbol: {SYMBOL}   Testnet: {USE_TESTNET}   Dry-run: {DRY_RUN}", GRAY))
+    # 2026-08-20 multi-coin: make the watchlist and the portfolio cap the
+    # first thing visible in a deploy log, so which coins are live and how
+    # many can trade at once is never in doubt.
+    print(color(
+        f" Watchlist: {', '.join(ACTIVE_SYMBOLS)}   "
+        f"MAX_ACTIVE_TRADES: {MAX_ACTIVE_TRADES} (across ALL symbols)", BOLD,
+    ))
     if USE_TESTNET:
         print(color(
             " *** TESTNET market data is thin/illiquid - bid/ask (and therefore "
@@ -911,137 +1057,123 @@ async def main() -> None:
     print(color("=" * 78, CYAN))
 
     client = RestClient(API_KEY, API_SECRET, REST_BASE)
+    # 2026-08-20 multi-coin: `managers` is the watchlist registry, SYMBOL ->
+    # manager. `manager` remains bound to the PRIMARY symbol's manager so
+    # every pre-existing reference below (and the shutdown block) is
+    # unchanged for a single-symbol deployment.
+    managers: Dict[str, MartingaleManager] = {}
     manager: Optional[MartingaleManager] = None
+    portfolio = PortfolioCoordinator(MAX_ACTIVE_TRADES)
 
     try:
         await retry_with_backoff(client.start, label="REST client startup / time sync")
 
-        filters = await retry_with_backoff(
-            fetch_symbol_filters, client, SYMBOL, label="fetch_symbol_filters"
-        )
+        # ------------------------------------------------------------------
+        # 2026-08-20 multi-coin: run the original per-symbol startup once per
+        # watchlist entry, sequentially. Sequential and not gathered on
+        # purpose: each symbol's startup issues a burst of signed REST calls
+        # (filters, leverage, margin type, balance, klines, bookTicker,
+        # positionRisk, userTrades), and firing four bursts concurrently is
+        # exactly the pattern that earned this bot its HTTP 429 ban earlier.
+        # Startup cost is a few seconds per symbol, paid once.
+        #
+        # A symbol that fails to start up is SKIPPED, not fatal - one bad
+        # ticker in the watchlist must not stop the other three from
+        # trading.
+        # ------------------------------------------------------------------
+        for sym in ACTIVE_SYMBOLS:
+            try:
+                managers[sym] = await setup_symbol(client, sym, portfolio)
+            except Exception as e:  # noqa: BLE001 - one symbol must not sink the watchlist
+                print(color(
+                    f"[setup] {sym} FAILED to initialise ({_exc_text(e)}) - it is excluded "
+                    f"from this run; the remaining watchlist symbols continue.", RED,
+                ))
+        if not managers:
+            raise RuntimeError(
+                "no watchlist symbol initialised successfully - refusing to run blind"
+            )
+        # The primary symbol's manager backs every pre-existing single-manager
+        # reference below (the shutdown block in particular). If the primary
+        # itself failed to start, fall back to any survivor.
+        manager = managers.get(SYMBOL) or next(iter(managers.values()))
         print(color(
-            f"[setup] {SYMBOL} filters: tick={filters.tick_size} step={filters.step_size} "
-            f"minQty={filters.min_qty} minNotional={filters.min_notional}", GRAY
+            f"[setup] watchlist ready: {', '.join(managers)}  |  "
+            f"MAX_ACTIVE_TRADES={MAX_ACTIVE_TRADES} (portfolio-wide)", CYAN,
         ))
-
-        # Cross 40x / DCA sizing sanity check: confirm every one of the 5
-        # martingale steps clears the exchange's minimum notional up front.
-        # Step 0 (the initial entry) is ALWAYS exactly INITIAL_ENTRY_USDT -
-        # it is never confidence/risk/regime-scaled - so it's checked as-is.
-        # DCA steps 1-5 CAN be scaled down by confidence sizing at runtime
-        # (see confidence_size_multiplier / notional_for_step), so those are
-        # checked at their worst case (SIZE_MIN_MULT) to make sure a
-        # low-confidence DCA add can never silently fall below min_notional.
-        for step in range(MAX_DCA_STEPS + 1):
-            margin = INITIAL_ENTRY_USDT if step == 0 else INITIAL_ENTRY_USDT * (DCA_MULTIPLIER ** step)
-            if step > 0:
-                margin *= SIZE_MIN_MULT  # worst case (smallest allowed) DCA add size
-            step_notional = margin * LEVERAGE
-            ok = step_notional >= filters.min_notional
-            label = "INITIAL" if step == 0 else f"DCA #{step} (min size)"
+        # 2026-08-20 multi-coin: a symbol whose exchange minimum notional is
+        # above this bot's entry size can never place an order - every
+        # attempt would be rejected. The per-step check inside setup_symbol()
+        # already prints that per symbol, but with four coins scrolling past
+        # it is easy to miss, so restate it once, loudly, as a single list.
+        # This is a CONFIGURATION problem, not a runtime error: the symbol
+        # stays in the watchlist and keeps learning, it just cannot trade
+        # until INITIAL_ENTRY_USDT x LEVERAGE clears its minimum.
+        entry_notional = INITIAL_ENTRY_USDT * LEVERAGE
+        untradable = [
+            (m.symbol, m.filters.min_notional)
+            for m in managers.values()
+            if entry_notional < m.filters.min_notional
+        ]
+        if untradable:
+            detail = ", ".join(f"{sym} needs ${mn:.2f}" for sym, mn in untradable)
             print(color(
-                f"[setup]   {label}: margin=${margin:.2f} notional=${step_notional:.2f} "
-                f"{'OK' if ok else 'BELOW MIN_NOTIONAL - will be skipped at runtime!'}",
-                GRAY if ok else RED,
+                f"[setup] *** {len(untradable)} WATCHLIST SYMBOL(S) CANNOT TRADE at the "
+                f"current size: entry notional is ${entry_notional:.2f} "
+                f"(INITIAL_ENTRY_USDT=${INITIAL_ENTRY_USDT} x {LEVERAGE}x) but {detail}. "
+                f"They will evaluate and learn but never open a position. Raise "
+                f"INITIAL_ENTRY_USDT/LEVERAGE or drop them from ACTIVE_SYMBOLS. ***", RED,
             ))
 
-        if not DRY_RUN:
-            await retry_with_backoff(client.set_leverage, SYMBOL, LEVERAGE, label="set_leverage")
-            await retry_with_backoff(client.set_margin_type, SYMBOL, MARGIN_TYPE, label="set_margin_type")
-            print(color(f"[setup] leverage set to {LEVERAGE}x, margin type {MARGIN_TYPE}", GRAY))
-        else:
-            print(color(
-                f"[setup] [DRY RUN] would set leverage={LEVERAGE}x, marginType={MARGIN_TYPE}", GRAY
-            ))
-
-        manager = MartingaleManager(client, SYMBOL, filters, LEVERAGE)
-
-        if not DRY_RUN:
-            balances = await retry_with_backoff(client.get_balance, label="get_balance")
-            usdt = next((b for b in balances if b["asset"] == "USDT"), None)
-            manager.available_balance = float(usdt["availableBalance"]) if usdt else 0.0
-        else:
-            manager.available_balance = 500.0
-        print(color(f"[setup] available balance: {manager.available_balance:.2f} USDT", GRAY))
-
-        # 2026-08 instant warm-up fix: ONE REST call to GET /fapi/v1/klines
-        # seeds the candle buffer with the last KLINE_WARMUP_LIMIT closed 1m
-        # candles, so ATR / RSI / EMA / regime are valid within seconds of
-        # boot instead of after ~an hour of the live tick stream building 57
-        # candles by itself ("[entry-skip] startup warm-up: insufficient
-        # market history (candles=5/57)"). Runs BEFORE the first
-        # on_book_ticker() below and before the websocket consumers start, so
-        # the live stream simply continues the series from the seeded history
-        # - only fully-closed historical candles are seeded, the in-progress
-        # bucket is always owned by the live stream (see
-        # CandleAggregator.prime_from_klines). Best-effort: a failure here
-        # just restores the old stream-only warm-up, it never blocks startup.
-        await warm_up_candles_from_klines(client, manager)
-
-        book = await retry_with_backoff(client.get_book_ticker, SYMBOL, label="get_book_ticker")
-        bid, ask = float(book["bidPrice"]), float(book["askPrice"])
-        manager.on_book_ticker(bid, ask, float(book.get("bidQty", 0) or 0), float(book.get("askQty", 0) or 0))
-        print(color(f"[setup] current price: {manager.current_price:.2f}", GRAY))
-
-        try:
-            premium = await client.get_premium_index(SYMBOL)
-            manager.funding_rate = float(premium.get("lastFundingRate", 0) or 0)
-            print(color(f"[setup] current funding rate: {manager.funding_rate:.6f}", GRAY))
-        except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-            print(color(f"[setup] could not fetch initial funding rate (continuing without it): {_exc_text(e)}", YELLOW))
-
-        # Persistent Adaptive Learning: local brain snapshot -> GitHub -> fresh model.
-        await manager.load_or_init_brain()
-        # Same GitHub session as the brain - restores trades_log.jsonl /
-        # trades_log.csv / performance_stats.csv so trade history and
-        # analytics survive an ephemeral restart exactly like brain.pkl does.
-        await manager.restore_csv_logs_from_github()
-        # 2026-08 restart-safe accounting fix: rebuilds trade_count /
-        # realized_pnl_total / daily_realized_pnl (and
-        # _daily_loss_tracker_date) from the trades_log JSONL just restored
-        # above - MUST run after restore_csv_logs_from_github() (so it
-        # reads restored history, not an empty fresh file) and before
-        # load_trade_sync_cursor()/reconcile_trade_history_from_exchange()
-        # ever gets a chance to run, so anything reconciliation goes on to
-        # recover afterward is simply added on top of this base (see that
-        # method's own docstring in trading.py for why this can never
-        # double-count). Pure bookkeeping restore only - does not touch
-        # DCA/position state, Brain V2, or any trading decision.
-        await manager.restore_runtime_accounting_from_history()
-        # Restores the trade-log reconciliation cursor (see
-        # reconcile_trade_history_from_exchange) the same way, so a Railway
-        # restart resumes catching up on Binance trade history from where
-        # it left off instead of re-scanning (or missing) anything.
-        await manager.load_trade_sync_cursor()
-        # Restores a persisted DCA/position state snapshot (local disk, then
-        # GitHub - see DCA_STATE_PATH / GITHUB_DCA_STATE_PATH) so an
-        # in-progress DCA position survives an ephemeral restart instead of
-        # starting flat. MUST run before initialize_sync() below, so that
-        # initialize_sync()'s own exchange-vs-local reconciliation (unchanged)
-        # has this rebuilt local state to compare against.
-        await load_dca_state(manager)
-
-        await initialize_sync(client, manager, context="startup")
-        # item 6: exchange-native protective stop reconciliation - MUST run
-        # after initialize_sync() (needs the authoritative post-reconcile
-        # side/qty/avg_entry_price) and before the long-running consumer
-        # loops start, so an OPEN position recovered above is never left
-        # believing it's protected without this process actually having
-        # confirmed that against Binance's own open orders.
-        await reconcile_protective_stop_on_startup(client, manager)
-
-        await asyncio.gather(
-            market_data_consumer(manager),
-            userdata_consumer(client, manager),
+        # ------------------------------------------------------------------
+        # Per-symbol loops are scheduled once per manager. Account-wide loops
+        # are scheduled EXACTLY ONCE for the whole process:
+        #   - listen_key_keepalive: one listenKey per account, not per symbol.
+        #   - userdata_consumer:    one account-wide stream, demuxed by symbol
+        #                           (see websocket.py). Four connections would
+        #                           each carry all four symbols' events anyway.
+        #   - balance_refresher:    USDT balance is account-wide; polling it
+        #                           once per symbol would be 4x the REST cost
+        #                           for the same number.
+        # ------------------------------------------------------------------
+        tasks = [
             listen_key_keepalive(client),
+            userdata_consumer(client, manager, managers=managers),
             balance_refresher(client, manager),
-            position_risk_poller(client, manager),
-            funding_oi_poller(client, manager),
-            status_loop(manager),
-            brain_sync_loop(manager),
-            stats_export_loop(manager),
-        )
+        ]
+        for m in managers.values():
+            tasks.extend([
+                market_data_consumer(m),
+                position_risk_poller(client, m),
+                funding_oi_poller(client, m),
+                status_loop(m),
+                brain_sync_loop(m),
+                stats_export_loop(m),
+            ])
+        await asyncio.gather(*tasks)
     finally:
+        # 2026-08-20 multi-coin: flush EVERY manager, not just the primary -
+        # otherwise three of four coins would lose their final brain
+        # snapshot, stats export and trade-log push on every restart. Each
+        # step is individually guarded exactly as before, so one symbol
+        # failing to flush never stops the others.
+        for _m in list(managers.values()):
+            if _m is manager:
+                continue
+            for _step, _label in (
+                (lambda: _m.persist_brain(reason="shutdown"), "brain persist"),
+                (lambda: _m.sync_trade_log_to_github(), "trade-log sync"),
+                (lambda: _m.sync_performance_stats_to_github(), "stats sync"),
+                (lambda: _m.github_sync.close(), "sync cleanup"),
+            ):
+                try:
+                    await _step()
+                except Exception as e:  # noqa: BLE001 - shutdown is best-effort
+                    print(color(f"[shutdown] {_m.symbol} {_label} failed: {_exc_text(e)}", YELLOW))
+            try:
+                _m.perf_stats.export()
+            except Exception:  # noqa: BLE001 - never block shutdown on stats export
+                pass
         if manager is not None:
             try:
                 await manager.persist_brain(reason="shutdown")
