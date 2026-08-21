@@ -138,6 +138,9 @@ from config import (
     # 2026-08-20 multi-coin watchlist
     ACTIVE_SYMBOLS,
     MAX_ACTIVE_TRADES,
+    # 2026-08-21 notional-relative risk scaling
+    ENTRY_NOTIONAL_USDT,
+    notional_scaling_report,
     USE_TESTNET,
     DRY_RUN,
     I_UNDERSTAND_THIS_IS_REAL_MONEY,
@@ -1032,6 +1035,30 @@ async def main() -> None:
         f" Daily fee-net locks (UTC): profit=+${DAILY_PROFIT_TARGET_USDT:.2f}  "
         f"loss=-${MAX_DAILY_LOSS_USDT:.2f}  (new entries only)", GRAY,
     ))
+    # 2026-08-21 notional-relative risk scaling: print what every dollar
+    # threshold resolved to and, critically, which ones an env var is still
+    # pinning. A leftover explicit override does not scale with
+    # INITIAL_ENTRY_USDT, so it silently changes the strategy's geometry the
+    # next time position size moves - it must not be invisible.
+    scaling = notional_scaling_report()
+    overridden = [(n, v) for n, v, src in scaling if src == "OVERRIDDEN"]
+    print(color(
+        f" Risk scaling: every dollar threshold is derived from the entry notional "
+        f"(${ENTRY_NOTIONAL_USDT:.2f} = ${INITIAL_ENTRY_USDT} x {LEVERAGE}x). "
+        f"{len(scaling) - len(overridden)}/{len(scaling)} derived.", GRAY,
+    ))
+    for name, value, src in scaling:
+        print(color(
+            f"     {name:36} ${value:>8.4f}  {src}",
+            YELLOW if src == "OVERRIDDEN" else GRAY,
+        ))
+    if overridden:
+        print(color(
+            f" *** {len(overridden)} RISK THRESHOLD(S) ARE PINNED BY AN ENV VAR and will NOT "
+            f"scale if INITIAL_ENTRY_USDT changes: "
+            f"{', '.join(n for n, _ in overridden)}. Remove them to restore automatic "
+            f"scaling. ***", RED,
+        ))
     # 2026-08 rate-limit + warm-up fixes: surface both cadences up front, so a
     # Live log makes it obvious which REST budget and warm-up path is in play.
     print(color(

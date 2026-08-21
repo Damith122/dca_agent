@@ -86,7 +86,11 @@ def make_manager():
     return bot.MartingaleManager(client=None, symbol="SOLUSDT", filters=filters, leverage=20)
 
 
-def open_long_with_flipped_book(age_sec, net_target=-0.07):
+def open_long_with_flipped_book(age_sec, net_target=-0.15):
+    # 2026-08-21: net_target moved -0.07 -> -0.15. The orderflow micro-loss
+    # band is now derived from notional (0.125%-0.25%), so at this fixture's
+    # ~$79 notional it is [-$0.20, -$0.10]; -0.07 sits ABOVE the band and no
+    # longer triggers. -0.15 is its midpoint.
     """A LONG whose book has flipped hard against it and whose fee-net PnL
     sits inside the micro-loss band - i.e. every orderflow-exit condition is
     met EXCEPT possibly the minimum hold."""

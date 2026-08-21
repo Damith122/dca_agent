@@ -4116,8 +4116,21 @@ class MartingaleManager:
         )
 
     def rr_ratio(self) -> float:
-        """Realized reward:risk of the configured envelope, for logging."""
-        return safe_div(TARGET_PROFIT_USD, MAX_STOP_LOSS_USD, 0.0)
+        """Reward:risk actually in force right now, for logging.
+
+        2026-08-21: was TARGET_PROFIT_USD / MAX_STOP_LOSS_USD, i.e. the
+        reward leg over the stop CAP. That was misleading, because the cap
+        almost never binds - the working stop is atr_scaled_stop_loss_usd(),
+        which at $80 notional and the observed 0.09-0.42% ATR band sits
+        between $0.12 and $0.40 while the cap sits at $0.90. The old formula
+        printed "1:1 envelope" when the real ratio was 2:1 to 7:1.
+
+        Now reports TARGET_PROFIT_USD over the stop that would actually be
+        applied to this position, falling back to the cap when no position is
+        open (flat, warm-up) so the number is still meaningful in a startup
+        banner. Logging only - no decision reads this."""
+        effective_stop = self.rr_stop_loss_usd() if self.position.total_qty > 0 else MAX_STOP_LOSS_USD
+        return safe_div(TARGET_PROFIT_USD, effective_stop, 0.0)
 
     def _position_notional_usdt(self) -> float:
         """Current position notional (avg entry x qty), 0.0 when flat."""
