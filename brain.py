@@ -261,6 +261,23 @@ class LiquidityFlowGuard:
 # ============================================================================
 
 
+# ---------------------------------------------------------------------------
+# Shared classifier hyperparameters (2026-08-21 saturation fix). Kept in one
+# place so the three log-loss heads can never drift apart again - it was
+# exactly such a drift (regressors given eta0=0.01, classifiers left on the
+# alpha-derived "optimal" schedule) that produced the divergence.
+# ---------------------------------------------------------------------------
+_CLASSIFIER_KW = dict(
+    loss="log_loss", penalty="l2", alpha=1e-5,
+    learning_rate="constant", eta0=0.01, warm_start=True,
+)
+
+# A healthy head of this shape keeps |coef| well under 1. A diverged one runs
+# to double digits and beyond. 5.0 sits far above the former and far below the
+# latter, so it separates the two without catching a merely opinionated model.
+SATURATED_COEF_ABS = 5.0
+
+
 class RunningNormalizer:
     """Welford online mean/variance normalizer, one instance per model head
     (kept separate from the feature vector itself so features stay in their
@@ -337,18 +354,31 @@ class BrainV2:
             loss="huber", penalty="l2", alpha=1e-5,
             learning_rate="invscaling", eta0=0.01, power_t=0.25, warm_start=True,
         )
-        self.noise_model = SGDClassifier(
-            loss="log_loss", penalty="l2", alpha=1e-5,
-            learning_rate="optimal", warm_start=True,
-        )
-        self.success_model = SGDClassifier(
-            loss="log_loss", penalty="l2", alpha=1e-5,
-            learning_rate="optimal", warm_start=True,
-        )
-        self.tp_hit_model = SGDClassifier(
-            loss="log_loss", penalty="l2", alpha=1e-5,
-            learning_rate="optimal", warm_start=True,
-        )
+        # 2026-08-21 saturation fix. All three classifiers previously used
+        # learning_rate="optimal" with no eta0. For log_loss, sklearn derives
+        # that schedule from alpha alone:
+        #
+        #     typw = sqrt(1/sqrt(alpha));  eta0 = typw;  t0 = 1/(eta0*alpha)
+        #     eta(t) = 1 / (alpha * (t + t0))
+        #
+        # At alpha=1e-5 that is eta(1) = 17.78 - 1778x the 0.01 the two
+        # REGRESSORS above were explicitly given, and still 0.099 after a
+        # million updates. On normalized features that diverges almost
+        # immediately: weights grow without bound and predict_proba collapses
+        # onto 0.0/1.0. The live tp_hit head was emitting probabilities around
+        # 1e-200 for exactly this reason.
+        #
+        # The tell that it was divergence rather than confidence: measured on
+        # synthetic data with a known signal, the "optimal" schedule scored
+        # AUC 0.614 with an IDENTICAL outcome rate in its top and bottom
+        # deciles (0.0050 vs 0.0050) - its extreme probabilities carried no
+        # information at all. A constant eta0=0.01 scored AUC 0.703 and
+        # separated those deciles 0.0000 vs 0.0300.
+        #
+        # Matching the regressors' eta0 keeps every head on one schedule.
+        self.noise_model = SGDClassifier(**_CLASSIFIER_KW)
+        self.success_model = SGDClassifier(**_CLASSIFIER_KW)
+        self.tp_hit_model = SGDClassifier(**_CLASSIFIER_KW)
 
         self.norm = RunningNormalizer(n_features)
 
@@ -383,6 +413,8 @@ class BrainV2:
         self.noise_samples = 0
         self.success_samples = 0
         self.tp_hit_samples = 0
+        # positive-label count, for the base rate the veto threshold scales to
+        self.tp_hit_positives = 0
         self._noise_classes_seen: set = set()
         self._success_classes_seen: set = set()
         self._tp_hit_classes_seen: set = set()
@@ -521,6 +553,8 @@ class BrainV2:
         self.tp_hit_model.partial_fit(xn, [1 if tp_was_hit else 0], classes=classes)
         self.tp_hit_fitted = True
         self.tp_hit_samples += 1
+        if tp_was_hit:
+            self.tp_hit_positives += 1
         self._tp_hit_classes_seen.add(1 if tp_was_hit else 0)
 
     def learn_quality(self, x: np.ndarray, reward: float) -> None:
@@ -536,6 +570,65 @@ class BrainV2:
 
     # -- persistence ------------------------------------------------------------
 
+    # -- saturation detection & head reset (2026-08-21) ---------------------
+    #
+    # Correcting the learning rate above only governs FUTURE updates. Every
+    # brain.pkl already in circulation carries weights that diverged under
+    # the old schedule, and log-loss gradients are bounded, so a diverged head
+    # would take millions of corrective samples to crawl back - it cannot
+    # recover in practice. Such a head has to be retrained from scratch.
+    #
+    # These heads are cheap to rebuild: they learn once per tick, so a reset
+    # head is back to a reliable state within minutes of live data, whereas
+    # leaving it in place keeps feeding the strategy a meaningless number.
+
+    _CLASSIFIER_HEADS = ("noise", "success", "tp_hit")
+
+    def _head_is_saturated(self, name: str) -> bool:
+        model = getattr(self, f"{name}_model", None)
+        coef = getattr(model, "coef_", None)
+        if coef is None:
+            return False
+        try:
+            peak = float(np.max(np.abs(coef)))
+        except (TypeError, ValueError):
+            return False
+        return np.isfinite(peak) and peak >= SATURATED_COEF_ABS
+
+    def reset_head(self, name: str) -> None:
+        """Rebuild one classifier head from zero, clearing its weights and
+        every counter that gates its reliability, so it must earn READY again
+        rather than inheriting the old head's standing."""
+        setattr(self, f"{name}_model", SGDClassifier(**_CLASSIFIER_KW))
+        setattr(self, f"{name}_fitted", False)
+        setattr(self, f"{name}_samples", 0)
+        setattr(self, f"_{name}_classes_seen", set())
+        if name == "tp_hit":
+            self.tp_hit_positives = 0
+
+    def reset_saturated_heads(self) -> list:
+        """Reset every classifier head whose weights diverged. Returns the
+        names reset, so startup can report it rather than silently discarding
+        learned state."""
+        reset = []
+        for name in self._CLASSIFIER_HEADS:
+            if self._head_is_saturated(name):
+                peak = float(np.max(np.abs(getattr(self, f"{name}_model").coef_)))
+                self.reset_head(name)
+                reset.append((name, peak))
+        return reset
+
+    def tp_hit_base_rate(self) -> float:
+        """Observed positive rate of the tp_hit label. The label asks whether
+        price moved at least TAKE_PROFIT_PCT within LABEL_HORIZON_TICKS, which
+        is rare, so a well-calibrated head's output is SMALL by construction -
+        a healthy model tops out near a few percent. Any threshold applied to
+        that probability has to be expressed relative to this rate; a fixed
+        absolute floor would reject every prediction the head can produce."""
+        if self.tp_hit_samples <= 0:
+            return 0.0
+        return self.tp_hit_positives / float(self.tp_hit_samples)
+
     def to_state(self) -> dict:
         return {
             # 2026-08 entry-quality audit fix: version bumped 2 -> 3 to
@@ -546,7 +639,7 @@ class BrainV2:
             # never silently wiped by this change - only a genuinely
             # unreadable/corrupt/wrong-n_features snapshot falls back to a
             # fresh Brain, exactly as before.
-            "version": 3,
+            "version": 4,
             "n_features": self.n_features,
             "warmup_updates": self.warmup_updates,
             "trend_model": self.trend_model, "quality_model": self.quality_model,
@@ -561,6 +654,7 @@ class BrainV2:
             "noise_samples": self.noise_samples,
             "success_samples": self.success_samples,
             "tp_hit_samples": self.tp_hit_samples,
+            "tp_hit_positives": self.tp_hit_positives,
             "noise_classes_seen": sorted(self._noise_classes_seen),
             "success_classes_seen": sorted(self._success_classes_seen),
             "tp_hit_classes_seen": sorted(self._tp_hit_classes_seen),
@@ -594,6 +688,7 @@ class BrainV2:
         self.noise_samples = int(state.get("noise_samples", 0))
         self.success_samples = int(state.get("success_samples", 0))
         self.tp_hit_samples = int(state.get("tp_hit_samples", 0))
+        self.tp_hit_positives = int(state.get("tp_hit_positives", 0))
         self._noise_classes_seen = set(state.get("noise_classes_seen", []))
         self._success_classes_seen = set(state.get("success_classes_seen", []))
         self._tp_hit_classes_seen = set(state.get("tp_hit_classes_seen", []))
@@ -618,7 +713,7 @@ class BrainV2:
         brain = cls(n_features, warmup_updates)
         try:
             state = pickle.loads(data)
-            if state.get("version") not in (2, 3) or state.get("n_features") != n_features:
+            if state.get("version") not in (2, 3, 4) or state.get("n_features") != n_features:
                 print(color(
                     f"[brain] snapshot incompatible (version={state.get('version')}, "
                     f"n_features={state.get('n_features')}, expected {n_features}) - "
@@ -626,6 +721,19 @@ class BrainV2:
                 ))
                 return brain
             brain.load_state(state)
+            # 2026-08-21: a snapshot written under the old "optimal" learning
+            # rate carries diverged classifier weights. Correcting the
+            # schedule does not repair them, so any head still saturated is
+            # rebuilt here - loudly, because this discards learned state.
+            for head_name, peak in brain.reset_saturated_heads():
+                print(color(
+                    f"[brain] {head_name} head reset: |coef| peaked at {peak:.1f} "
+                    f"(>= {SATURATED_COEF_ABS}), which means it diverged under the "
+                    f"old learning rate rather than learned anything. Its "
+                    f"probabilities carried no information, so it starts fresh "
+                    f"under the corrected schedule and reports a neutral 0.5 "
+                    f"until it is reliable again.", YELLOW,
+                ))
             if state.get("version") == 2:
                 print(color(
                     "[brain] migrated version-2 snapshot to version-3 (added per-head "

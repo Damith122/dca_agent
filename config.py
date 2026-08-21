@@ -730,10 +730,34 @@ TP_ATR_MULT = _env_float("TP_ATR_MULT", 2.5)
 # sit in the near-zero bucket (NEAR at 7.8e-44, +$0.1331) - so this filter
 # would have cost that trade. Set TP_HIT_VETO_ENABLED=false to disable.
 # ============================================================================
+# 2026-08-21: default flipped to OFF. The head this veto reads had diverged
+# under the old learning rate (see brain.py) and was emitting ~1e-200 for
+# every setup, so leaving the veto on by default would halt trading outright
+# on any deployment that has not yet set the variable. It should be turned
+# back on deliberately, once the rebuilt head has reached READY and its
+# probabilities have been observed to be sane.
 TP_HIT_VETO_ENABLED = (
-    _env_bool("TP_HIT_VETO_ENABLED", True)
+    _env_bool("TP_HIT_VETO_ENABLED", False)
 )
-TP_HIT_VETO_MIN_PROB = _env_float("TP_HIT_VETO_MIN_PROB", 0.10)
+# The tp_hit label asks whether price moved at least TAKE_PROFIT_PCT within
+# LABEL_HORIZON_TICKS - a rare event, so a CORRECTLY calibrated head produces
+# small numbers by construction. Measured on synthetic data at a 0.5% base
+# rate, a healthy head's output topped out at 0.091 across every sample. A
+# fixed 0.10 floor would therefore have vetoed 100% of entries even with a
+# perfectly good model: the old default was unreachable, not merely strict.
+#
+# The threshold is now a FRACTION OF THE OBSERVED BASE RATE, so it means
+# "materially worse than a randomly chosen moment" and stays meaningful
+# whatever the label's natural frequency turns out to be per symbol.
+TP_HIT_VETO_BASE_RATE_RATIO = _env_float("TP_HIT_VETO_BASE_RATE_RATIO", 0.5)
+
+# Absolute floor, kept only as an escape hatch. Left at 0.0 the veto is
+# purely base-rate-relative; set it above 0 to reinstate a hard cutoff.
+TP_HIT_VETO_MIN_PROB = _env_float("TP_HIT_VETO_MIN_PROB", 0.0)
+
+# The base rate is only trustworthy once enough labels have accumulated.
+# Below this the veto stands down entirely rather than acting on noise.
+TP_HIT_VETO_MIN_SAMPLES = _env_int("TP_HIT_VETO_MIN_SAMPLES", 5000)
 
 MOMENTUM_EXHAUSTION_GUARD_ENABLED = _env_bool("MOMENTUM_EXHAUSTION_GUARD_ENABLED", True)
 MOMENTUM_EXHAUSTION_MAGNITUDE = _env_float("MOMENTUM_EXHAUSTION_MAGNITUDE", 1.0)
@@ -1353,6 +1377,8 @@ __all__ = [
     # 2026-08-21 tp_hit probability veto
     "TP_HIT_VETO_ENABLED",
     "TP_HIT_VETO_MIN_PROB",
+    "TP_HIT_VETO_BASE_RATE_RATIO",
+    "TP_HIT_VETO_MIN_SAMPLES",
     # 2026-08-21 tick throttling
     "TICK_MIN_INTERVAL_SEC",
     "TICK_MIN_INTERVAL_ACTIVE_SEC",
