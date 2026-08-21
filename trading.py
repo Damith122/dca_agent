@@ -375,6 +375,12 @@ from config import (
     MAX_ACTIVE_TRADES,
     symbol_scoped_name,
     # ------------------------------------------------------------------
+    # 2026-08-21 tick throttling.
+    # ------------------------------------------------------------------
+    TICK_MIN_INTERVAL_SEC,
+    TICK_MIN_INTERVAL_ACTIVE_SEC,
+    TICK_THROTTLE_LOG_INTERVAL_SEC,
+    # ------------------------------------------------------------------
     # 2026-08 high-frequency orderflow upgrade (appended config block -
     # see the banner at the bottom of config.py). Every name below is
     # NEW; not one pre-existing import above was removed or renamed.
@@ -2208,6 +2214,16 @@ class MartingaleManager:
         # one symbol, one position, gate always open for itself.
         self.portfolio = portfolio if portfolio is not None else PortfolioCoordinator()
         self._last_portfolio_block_log_ts: float = 0.0
+        # 2026-08-21 tick throttling, these four fields only. Per-instance,
+        # so each watchlist symbol throttles on its own clock - a busy book
+        # decimates hard while a quiet one is barely affected.
+        # _last_tick_run_ts: when the decision cycle last actually RAN.
+        # _ticks_seen / _ticks_run: counters behind the periodic efficiency
+        #   line; they only ever feed that log, never a trading decision.
+        self._last_tick_run_ts: float = 0.0
+        self._ticks_seen: int = 0
+        self._ticks_run: int = 0
+        self._last_tick_throttle_log_ts: float = 0.0
 
         self.position = PositionState()
         # 2026-08 position_sync_ready startup gate: starts False on every
@@ -4762,14 +4778,102 @@ class MartingaleManager:
         This also ADOPTS a slot for a position this process never opened -
         one recovered by initialize_sync() after a restart - so a restart
         mid-trade does not let a second symbol open alongside it."""
-        live = self.position.status in ("OPEN", "ENTERING", "DCA_PENDING", "CLOSING")
-        if live:
+        # Shares _position_is_active() with the tick throttle, so the two
+        # can never disagree about what "live" means.
+        if self._position_is_active():
             self.portfolio.confirm(self.symbol)
         elif self.portfolio.holds_slot(self.symbol):
             self.portfolio.release(self.symbol)
 
+    def _position_is_active(self) -> bool:
+        """True while this symbol has anything live on the exchange - an open
+        position or an order in flight. Selects the tighter tick interval."""
+        return self.position.status in ("OPEN", "ENTERING", "DCA_PENDING", "CLOSING")
+
+    def _tick_throttle_interval(self) -> float:
+        """Minimum seconds between decision cycles for this symbol right now.
+
+        Tighter while a position is live (stop-loss, Profit Lock, trailing,
+        DCA and Profit Lock's peak sampling all run in that state) than while
+        FLAT (where the only work is entry scanning off 1-minute candles)."""
+        return (
+            TICK_MIN_INTERVAL_ACTIVE_SEC if self._position_is_active()
+            else TICK_MIN_INTERVAL_SEC
+        )
+
+    def _should_run_tick(self, now: float) -> bool:
+        """2026-08-21 tick throttling. Decides whether THIS bookTicker message
+        gets a full decision cycle.
+
+        Decimation, not queueing: a skipped tick is dropped outright, and the
+        next one that passes reads whatever the latest price/orderbook is -
+        on_book_ticker() has already recorded every message. Nothing is
+        buffered, so the throttle can never build a backlog or act on stale
+        data.
+
+        An interval of 0 disables the throttle entirely and restores the
+        previous run-on-every-message behaviour."""
+        interval = self._tick_throttle_interval()
+        if interval <= 0:
+            return True
+        # The first tick after startup, and the first after any gap longer
+        # than the interval (a websocket reconnect, a quiet book), always
+        # runs - the gate is elapsed-time based, never a fixed cadence.
+        if (now - self._last_tick_run_ts) < interval:
+            return False
+        self._last_tick_run_ts = now
+        return True
+
+    def _maybe_log_tick_throttle(self, now: float) -> None:
+        """Periodic per-symbol efficiency line, so the saturation fix is
+        verifiable from the deploy log instead of inferred. Pure diagnostics."""
+        if TICK_THROTTLE_LOG_INTERVAL_SEC <= 0 or self._ticks_seen <= 0:
+            return
+        if (now - self._last_tick_throttle_log_ts) < TICK_THROTTLE_LOG_INTERVAL_SEC:
+            return
+        # Skip the very first window: _last_tick_throttle_log_ts starts at 0,
+        # so it would otherwise fire immediately with a meaningless sample.
+        # The counters are deliberately NOT reset here - they start at 0 in
+        # __init__ and this branch runs on the first tick, so zeroing them
+        # would only discard that tick and make _ticks_seen mean "seen since
+        # the window after the first one" instead of "seen since the last
+        # log".
+        if self._last_tick_throttle_log_ts == 0.0:
+            self._last_tick_throttle_log_ts = now
+            return
+        window = now - self._last_tick_throttle_log_ts
+        seen, ran = self._ticks_seen, self._ticks_run
+        skipped_pct = 100.0 * (seen - ran) / seen
+        print(color(
+            f"{now_str()} [tick-throttle] {self.symbol}: {seen} bookTicker msg(s) in "
+            f"{window:.0f}s ({seen / window:.0f}/s) -> {ran} decision cycle(s) "
+            f"({ran / window:.1f}/s), {skipped_pct:.0f}% decimated.", GRAY,
+        ))
+        self._last_tick_throttle_log_ts = now
+        self._ticks_seen = self._ticks_run = 0
+
     async def on_price_tick(self) -> None:
+        # 2026-08-21 tick throttling. Everything below this gate is the
+        # expensive decision cycle - feature build, regime evaluation, Brain
+        # V2 inference, risk scoring and open-position management. Running it
+        # on every bookTicker message saturated the single asyncio event loop
+        # once the watchlist grew to four symbols, which starved the
+        # websocket keepalive and got the busiest socket closed with 1011
+        # every 60-100s. See TICK_MIN_INTERVAL_SEC in config.py.
+        #
+        # _sync_portfolio_slot() is deliberately OUTSIDE the gate: it is a
+        # couple of dict operations, and it is what releases this symbol's
+        # portfolio slot when a position closes. Throttling it would delay
+        # every OTHER symbol's ability to open by up to one interval, for no
+        # CPU saving worth having.
+        now = time.time()
         self._sync_portfolio_slot()
+        self._ticks_seen += 1
+        self._maybe_log_tick_throttle(now)
+        if not self._should_run_tick(now):
+            return
+        self._ticks_run += 1
+
         await self._sweep_orphan_protective_stops()
         # 2026-08 post-only (maker) entry execution: a GTX limit order can
         # legitimately rest unfilled forever if price walks away from it.

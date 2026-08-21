@@ -108,6 +108,63 @@ except (TypeError, ValueError):
     MAX_ACTIVE_TRADES = 1
 
 
+# ---------------------------------------------------------------------------
+# 2026-08-21 tick throttling (CPU saturation / websocket keepalive fix).
+#
+# Every bookTicker message used to drive a full on_price_tick() decision
+# cycle - feature build, regime evaluation, Brain V2 inference, risk scoring.
+# bookTicker is event-driven, so a busy book (ETHUSDT) fires it hundreds of
+# times a second, and with a four-symbol watchlist that saturated the single
+# asyncio event loop: Railway showed ~0.8-1.1 CPU cores steady, which for a
+# single-threaded loop is effectively maxed. The starved loop then failed to
+# service its own websocket keepalive pongs, and Binance closed the busiest
+# socket with 1011 every 60-100s (25 reconnects in 36 minutes on ETHUSDT
+# bookTicker, vs 3-4 on the quiet ones - the reconnect count tracked message
+# rate almost exactly).
+#
+# The fix is decimation, not queueing: on_book_ticker() still records EVERY
+# message (price and orderbook stay perfectly current - that part is cheap
+# arithmetic), while the expensive decision cycle runs at most once per
+# interval and simply reads the latest state when it does run. No tick is
+# buffered and no price update is lost.
+#
+# Two intervals, because the two states have genuinely different needs:
+#
+#   TICK_MIN_INTERVAL_SEC (FLAT, default 250ms) - the only work here is entry
+#     scanning, and entry scoring is driven by 1-minute candles. Evaluating a
+#     1m-candle-based signal 200x/second buys nothing. This is also where the
+#     load actually is: with MAX_ACTIVE_TRADES=1, at least three of four
+#     symbols are FLAT at any moment.
+#
+#   TICK_MIN_INTERVAL_ACTIVE_SEC (position live, default 100ms) - stop-loss,
+#     Profit Lock, trailing and DCA all run here, plus Profit Lock's peak
+#     sampling. 10Hz is still far finer than the 100-500ms REST round-trip
+#     needed to act on any of them, and the exchange-native STOP_MARKET algo
+#     order remains the server-side backstop regardless of this loop.
+#
+# Set either to 0 to disable throttling for that state and restore the
+# previous every-message behaviour exactly.
+# ---------------------------------------------------------------------------
+def _clamped_tick_interval(env_var: str, default: float) -> float:
+    """Parse a tick interval, clamped to [0, 1] seconds. 0 disables the
+    throttle; anything above 1s is refused because it would start to delay
+    risk exits meaningfully rather than just decimating idle scans."""
+    try:
+        value = float(os.environ.get(env_var, default))
+    except (TypeError, ValueError):
+        return default
+    if value < 0:
+        return default
+    return min(value, 1.0)
+
+
+TICK_MIN_INTERVAL_SEC = _clamped_tick_interval("TICK_MIN_INTERVAL_SEC", 0.25)
+TICK_MIN_INTERVAL_ACTIVE_SEC = _clamped_tick_interval("TICK_MIN_INTERVAL_ACTIVE_SEC", 0.10)
+# How often each symbol reports its own tick-throttle efficiency, so the
+# saturation fix is verifiable from the deploy log rather than inferred.
+TICK_THROTTLE_LOG_INTERVAL_SEC = 300.0
+
+
 def symbol_scoped_name(base_name: str, symbol: str) -> str:
     """2026-08-20 multi-coin: the per-symbol form of
     _symbol_scoped_default() below, taking the symbol EXPLICITLY instead of
@@ -999,6 +1056,10 @@ __all__ = [
     "ACTIVE_SYMBOLS",
     "MAX_ACTIVE_TRADES",
     "symbol_scoped_name",
+    # 2026-08-21 tick throttling
+    "TICK_MIN_INTERVAL_SEC",
+    "TICK_MIN_INTERVAL_ACTIVE_SEC",
+    "TICK_THROTTLE_LOG_INTERVAL_SEC",
     "USE_TESTNET",
     "DRY_RUN",
     "I_UNDERSTAND_THIS_IS_REAL_MONEY",
