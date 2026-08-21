@@ -578,6 +578,51 @@ TP_ATR_MULT = float(os.environ.get("TP_ATR_MULT", "2.5"))
 #   (+105,041 and +96,810) - i.e. the bot bought the top of a vertical move and
 #   immediately mean-reverted. Saturated momentum plus extreme one-sided flow is
 #   treated as LATE-ENTRY risk, not confirmation.
+# ============================================================================
+# 2026-08-21 TP-HIT PROBABILITY VETO
+#
+# Brain V2's tp_hit head predicts whether a trade will reach take-profit. Its
+# output turned out to be the single sharpest divider in the live record.
+# Across 18 closed trades on 2026-08-21 (ETH + NEAR):
+#
+#   tp_hit_prob ~0 (<1e-20)   10 trades   1/10 wins (10%)   net -$1.5461
+#   tp_hit_prob 0.5            7 trades   2/7  wins (29%)   net -$0.1467
+#   tp_hit_prob 1.0            1 trade    1/1  wins (100%)  net +$0.3596
+#
+# EVERY dollar of the drawdown sits in the near-zero bucket. All six of ETH's
+# post-scale-up losses were in it (1.9e-52, 1.1e-46, 6.9e-23, 7.5e-48,
+# 1.0e-21, 2.9e-46) and all six lost. The head carries only 30% of
+# ConfidenceEngine's blend, which was not enough to stop entries clearing the
+# composite threshold by as little as 0.004.
+#
+# WHY A FLOOR OF 0.10 IS SAFE. brain.py returns EXACTLY 0.5 whenever the head
+# is not fitted or not reliable:
+#
+#     tp_hit_prob = (float(self.tp_hit_model.predict_proba(xn)[0][1])
+#                    if (self.tp_hit_fitted and tp_hit_reliable) else 0.5)
+#
+# so an untrained or unreliable head can never be vetoed by a floor below 0.5.
+# The veto ALSO checks head_readiness()["tp_hit"] == "READY" explicitly rather
+# than relying on that coincidence. The observed values are strongly bimodal -
+# either 0.5/1.0 or below 1e-20 - so anything in (0, 0.5) separates them
+# identically; 0.10 is chosen as an order of magnitude above the observed
+# near-zero cluster while leaving room for a genuinely uncertain 0.15-0.49
+# reading to still trade.
+#
+# SCOPE. Entry gating ONLY, on the same footing as the regime / dead-market /
+# counter-momentum / momentum-exhaustion guards: it can only ever REJECT a
+# trade the old code would have taken. Exits, DCA, Profit Lock, Hard Stop and
+# every open-position path are untouched.
+#
+# CAVEAT worth keeping in view: 18 trades is a small sample, and one WIN did
+# sit in the near-zero bucket (NEAR at 7.8e-44, +$0.1331) - so this filter
+# would have cost that trade. Set TP_HIT_VETO_ENABLED=false to disable.
+# ============================================================================
+TP_HIT_VETO_ENABLED = (
+    os.environ.get("TP_HIT_VETO_ENABLED", "true").lower() != "false"
+)
+TP_HIT_VETO_MIN_PROB = float(os.environ.get("TP_HIT_VETO_MIN_PROB", "0.10"))
+
 MOMENTUM_EXHAUSTION_GUARD_ENABLED = os.environ.get(
     "MOMENTUM_EXHAUSTION_GUARD_ENABLED", "true"
 ).lower() != "false"
@@ -1199,6 +1244,9 @@ __all__ = [
     # 2026-08-21 notional-relative risk scaling
     "ENTRY_NOTIONAL_USDT",
     "notional_scaling_report",
+    # 2026-08-21 tp_hit probability veto
+    "TP_HIT_VETO_ENABLED",
+    "TP_HIT_VETO_MIN_PROB",
     # 2026-08-21 tick throttling
     "TICK_MIN_INTERVAL_SEC",
     "TICK_MIN_INTERVAL_ACTIVE_SEC",

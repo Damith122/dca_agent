@@ -381,6 +381,11 @@ from config import (
     TICK_MIN_INTERVAL_ACTIVE_SEC,
     TICK_THROTTLE_LOG_INTERVAL_SEC,
     # ------------------------------------------------------------------
+    # 2026-08-21 tp_hit probability veto.
+    # ------------------------------------------------------------------
+    TP_HIT_VETO_ENABLED,
+    TP_HIT_VETO_MIN_PROB,
+    # ------------------------------------------------------------------
     # 2026-08 high-frequency orderflow upgrade (appended config block -
     # see the banner at the bottom of config.py). Every name below is
     # NEW; not one pre-existing import above was removed or renamed.
@@ -1400,8 +1405,40 @@ class EntryEngineV2:
         )
         components["momentum_exhausted"] = momentum_exhausted
 
+        # --- 2026-08-21 TP-HIT PROBABILITY VETO --------------------------------
+        # Brain V2's tp_hit head predicts whether this trade will reach
+        # take-profit. In the live record it is the sharpest single divider
+        # there is: across 18 closed trades on 2026-08-21, the bucket with
+        # tp_hit_prob below 1e-20 went 1/10 for -$1.5461, and carried the
+        # ENTIRE drawdown. All six of ETH's post-scale-up losses sat in it.
+        #
+        # The head already feeds ConfidenceEngine at 30% weight, but that only
+        # moved entry_confidence from ~0.64 to ~0.50 - not enough to stop
+        # entries clearing the composite threshold by as little as 0.004. This
+        # promotes it to a hard veto, on exactly the same footing as the
+        # regime / dead-market / counter-momentum / momentum-exhaustion gates:
+        # it can only ever REJECT a trade the old code would have taken, and
+        # it touches nothing outside entry selection.
+        #
+        # Gated on the head being READY. brain.py already returns exactly 0.5
+        # for an unfitted or unreliable head, so a floor below 0.5 could not
+        # fire on one anyway - but the readiness check is explicit so the
+        # intent does not depend on that coincidence, and so a symbol whose
+        # tp_hit head has never seen both outcome classes (i.e. has never once
+        # hit TP) is never blocked from trading by a head that cannot yet have
+        # an opinion.
+        tp_hit_head_ready = (brain_readiness or {}).get("tp_hit") == "READY"
+        tp_hit_veto = bool(
+            TP_HIT_VETO_ENABLED
+            and tp_hit_head_ready
+            and conf.tp_hit_probability < TP_HIT_VETO_MIN_PROB
+        )
+        components["tp_hit_veto"] = tp_hit_veto
+        components["tp_hit_head_ready"] = tp_hit_head_ready
+
         technical_ok = (
-            (not regime_blocked) and score >= active_threshold and not momentum_exhausted
+            (not regime_blocked) and score >= active_threshold
+            and not momentum_exhausted and not tp_hit_veto
         )
         components["technical_signal"] = technical_ok
         # The three confirmation factors, all required.
@@ -1422,6 +1459,13 @@ class EntryEngineV2:
                 f"momentum_exhausted: magnitude {momentum_magnitude:.4f} saturated with "
                 f"flow_delta {trade_delta:+.2f} (>= {MOMENTUM_EXHAUSTION_FLOW_DELTA:.0f}) - "
                 f"late entry into an exhausted move"
+            )
+        elif tp_hit_veto:
+            rejection_reason = (
+                f"tp_hit_veto: Brain V2's take-profit head (READY) puts the chance of "
+                f"reaching TP at {conf.tp_hit_probability:.2e}, below the "
+                f"{TP_HIT_VETO_MIN_PROB:.2f} floor - skipping rather than paying the "
+                f"round trip on a trade the model says will not get there"
             )
         elif not technical_ok:
             rejection_reason = f"score {score:.4f} below threshold {active_threshold:.4f}"
@@ -1452,6 +1496,7 @@ class EntryEngineV2:
                 f"risk_score={components['risk_score']:.4f} "
                 f"quality_pred={conf.quality_pred:+.4f} "
                 f"success_p={conf.success_probability:.4f} tp_hit_p={conf.tp_hit_probability:.4f} "
+                f"tp_hit_veto={tp_hit_veto} "
                 f"final_score={score:.4f} threshold={active_threshold:.4f} "
                 f"decision={rejection_reason} "
                 f"ob_imbalance={liquidity['imbalance']:+.4f} "
