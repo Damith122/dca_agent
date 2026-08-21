@@ -389,6 +389,8 @@ from config import (
     # ------------------------------------------------------------------
     TP_HIT_VETO_ENABLED,
     TP_HIT_VETO_MIN_PROB,
+    TP_HIT_VETO_BASE_RATE_RATIO,
+    TP_HIT_VETO_MIN_SAMPLES,
     # ------------------------------------------------------------------
     # 2026-08 high-frequency orderflow upgrade (appended config block -
     # see the banner at the bottom of config.py). Every name below is
@@ -1196,6 +1198,11 @@ class EntryEngineV2:
         momentum: float,
         features: np.ndarray,
         brain_readiness: Optional[dict] = None,
+        # 2026-08-21: the tp_hit label's natural frequency, used to scale the
+        # veto threshold. Passed in rather than read off a global so the
+        # engine stays testable and each symbol uses its own rate.
+        tp_hit_base_rate: float = 0.0,
+        tp_hit_samples: int = 0,
         orderflow: Optional[dict] = None,
         imbalance_threshold: Optional[float] = None,
         support_min: Optional[float] = None,
@@ -1432,13 +1439,37 @@ class EntryEngineV2:
         # hit TP) is never blocked from trading by a head that cannot yet have
         # an opinion.
         tp_hit_head_ready = (brain_readiness or {}).get("tp_hit") == "READY"
+
+        # 2026-08-21 calibration fix. The threshold is a fraction of the
+        # label's OBSERVED base rate, not an absolute probability. The label
+        # ("did price move TAKE_PROFIT_PCT within LABEL_HORIZON_TICKS") is
+        # rare, so a correctly calibrated head's output is small by
+        # construction - a healthy head measured on synthetic data never
+        # exceeded 0.091. Against the old fixed 0.10 floor that model would
+        # have been vetoed on every single sample. Scaling to the base rate
+        # asks the meaningful question instead: is this setup materially
+        # worse than an arbitrary moment in this market?
+        #
+        # The veto stands down until enough labels exist for the base rate to
+        # mean anything, so a freshly reset head cannot block trading while it
+        # relearns.
+        tp_hit_base_rate = max(0.0, float(tp_hit_base_rate))
+        tp_hit_threshold = TP_HIT_VETO_BASE_RATE_RATIO * tp_hit_base_rate
+        if TP_HIT_VETO_MIN_PROB > 0.0:
+            tp_hit_threshold = max(tp_hit_threshold, TP_HIT_VETO_MIN_PROB)
+        tp_hit_base_rate_ready = (
+            tp_hit_samples >= TP_HIT_VETO_MIN_SAMPLES and tp_hit_threshold > 0.0
+        )
         tp_hit_veto = bool(
             TP_HIT_VETO_ENABLED
             and tp_hit_head_ready
-            and conf.tp_hit_probability < TP_HIT_VETO_MIN_PROB
+            and tp_hit_base_rate_ready
+            and conf.tp_hit_probability < tp_hit_threshold
         )
         components["tp_hit_veto"] = tp_hit_veto
         components["tp_hit_head_ready"] = tp_hit_head_ready
+        components["tp_hit_threshold"] = tp_hit_threshold
+        components["tp_hit_base_rate"] = tp_hit_base_rate
 
         technical_ok = (
             (not regime_blocked) and score >= active_threshold
@@ -1468,8 +1499,10 @@ class EntryEngineV2:
             rejection_reason = (
                 f"tp_hit_veto: Brain V2's take-profit head (READY) puts the chance of "
                 f"reaching TP at {conf.tp_hit_probability:.2e}, below the "
-                f"{TP_HIT_VETO_MIN_PROB:.2f} floor - skipping rather than paying the "
-                f"round trip on a trade the model says will not get there"
+                f"{tp_hit_threshold:.2e} threshold "
+                f"({TP_HIT_VETO_BASE_RATE_RATIO:g} x the {tp_hit_base_rate:.2e} base "
+                f"rate over {tp_hit_samples} labels) - skipping rather than paying the "
+                f"round trip on a trade the model rates worse than an arbitrary moment"
             )
         elif not technical_ok:
             rejection_reason = f"score {score:.4f} below threshold {active_threshold:.4f}"
@@ -1500,7 +1533,8 @@ class EntryEngineV2:
                 f"risk_score={components['risk_score']:.4f} "
                 f"quality_pred={conf.quality_pred:+.4f} "
                 f"success_p={conf.success_probability:.4f} tp_hit_p={conf.tp_hit_probability:.4f} "
-                f"tp_hit_veto={tp_hit_veto} "
+                f"tp_hit_veto={tp_hit_veto} tp_hit_thr={tp_hit_threshold:.3e} "
+                f"tp_hit_base_rate={tp_hit_base_rate:.3e} "
                 f"final_score={score:.4f} threshold={active_threshold:.4f} "
                 f"decision={rejection_reason} "
                 f"ob_imbalance={liquidity['imbalance']:+.4f} "
@@ -5230,6 +5264,8 @@ class MartingaleManager:
             decision = self.entry_engine.evaluate(
                 self.last_confidence, self.last_regime, volume_z, momentum, features,
                 brain_readiness=self.brain.head_readiness(),
+                tp_hit_base_rate=self.brain.tp_hit_base_rate(),
+                tp_hit_samples=self.brain.tp_hit_samples,
                 orderflow=orderflow_now,
                 imbalance_threshold=self.entry_imbalance_threshold(),
                 support_min=self.entry_support_min(),

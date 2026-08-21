@@ -20,7 +20,27 @@ composite threshold by as little as 0.004 (ETH 14:03, score 0.6337 vs 0.63).
 
 THE FIX
 --------------------------------------------------------------------------
-tp_hit_prob below TP_HIT_VETO_MIN_PROB (0.10) is now a HARD VETO, on the same
+UPDATE 2026-08-21 (later): the head that produces these probabilities was
+found to have DIVERGED, not learned. All three SGDClassifier heads used
+learning_rate="optimal" with no eta0, which at alpha=1e-5 starts at eta=17.78
+- 1778x the 0.01 the two regressors were explicitly given. Weights grew
+without bound and predict_proba collapsed onto 0/1, which is where the 1e-200
+readings come from. Measured on synthetic data with a known signal, that
+schedule scored AUC 0.614 with an IDENTICAL outcome rate in its top and
+bottom deciles: its extreme probabilities carried no information whatsoever.
+See test_brain_saturation_fix.py.
+
+Two consequences for this suite:
+  * TP_HIT_VETO_ENABLED now defaults to FALSE. Left on, it would halt
+    trading outright against a head whose output means nothing.
+  * The threshold is no longer an absolute probability. A correctly
+    calibrated head tops out near 0.09 on a label this rare, so the old 0.10
+    floor was unreachable - it would have vetoed 100% of entries even with a
+    perfect model. It is now TP_HIT_VETO_BASE_RATE_RATIO x the observed base
+    rate. The cases below pass base_rate=0.20 so the effective cutoff is
+    still 0.10 and the historical expectations remain meaningful.
+
+tp_hit_prob below the veto threshold is a HARD VETO, on the same
 footing as the regime / dead-market / counter-momentum / momentum-exhaustion
 guards: it can only ever REJECT a trade the old code would have taken, and it
 touches nothing outside entry selection.
@@ -123,25 +143,48 @@ NOT_READY = {"tp_hit": "UNRELIABLE", "success": "READY", "trend": "READY", "nois
 WARMING = {"tp_hit": "WARMING_UP", "success": "READY", "trend": "READY", "noise": "READY"}
 
 
-def decide(tp_hit_prob, readiness=READY, side="LONG", momentum=0.004):
+# The veto threshold is TP_HIT_VETO_BASE_RATE_RATIO x base_rate. With the
+# default ratio of 0.5, a base rate of 0.20 reproduces the 0.10 cutoff these
+# cases were originally written against, so the historical expectations below
+# stay meaningful under the new base-rate-relative model.
+BASE_RATE_FOR_010 = 0.20
+ENOUGH_LABELS = 10 * config.TP_HIT_VETO_MIN_SAMPLES
+
+
+def decide(tp_hit_prob, readiness=READY, side="LONG", momentum=0.004,
+           base_rate=BASE_RATE_FOR_010, samples=ENOUGH_LABELS):
     engine = trading.EntryEngineV2()
     engine._last_log_ts = 9e18          # suppress the throttled debug line
     return engine.evaluate(
         conf_with(tp_hit_prob, side), tradeable_regime(), volume_z=2.0,
         momentum=momentum, features=[0.0] * 34,
         brain_readiness=readiness, orderflow=good_flow(side),
+        tp_hit_base_rate=base_rate, tp_hit_samples=samples,
     )
 
 
 # ===========================================================================
 print("\n[1] Config surface")
 # ===========================================================================
-check("TP_HIT_VETO_ENABLED defaults on", config.TP_HIT_VETO_ENABLED is True)
-check("TP_HIT_VETO_MIN_PROB is 0.10", config.TP_HIT_VETO_MIN_PROB == 0.10,
+# 2026-08-21: the default is now OFF. The head this veto reads had diverged
+# and was emitting ~1e-200 for every setup, so defaulting it on would halt
+# trading outright on any deployment that has not set the variable.
+check("TP_HIT_VETO_ENABLED defaults OFF after the saturation finding",
+      config.TP_HIT_VETO_ENABLED is False)
+check("the threshold is base-rate-relative by default",
+      config.TP_HIT_VETO_BASE_RATE_RATIO == 0.5,
+      f"got {config.TP_HIT_VETO_BASE_RATE_RATIO}")
+check("the absolute floor is disabled by default",
+      config.TP_HIT_VETO_MIN_PROB == 0.0,
       f"got {config.TP_HIT_VETO_MIN_PROB}")
-check("the floor sits below the neutral 0.5 an unreliable head returns",
-      config.TP_HIT_VETO_MIN_PROB < 0.5,
-      "a floor >= 0.5 would veto every unreliable head")
+check("a ratio of 0.5 means 'half as likely as an arbitrary moment'",
+      0.0 < config.TP_HIT_VETO_BASE_RATE_RATIO < 1.0)
+check("the base rate must be established before the veto acts",
+      config.TP_HIT_VETO_MIN_SAMPLES >= 1000)
+
+# Every behavioural case below exercises the veto's LOGIC, so it is forced on
+# explicitly rather than relying on the shipped default.
+trading.TP_HIT_VETO_ENABLED = True
 
 # ===========================================================================
 print("\n[2] A control trade with a healthy tp_hit_prob is NOT vetoed")
@@ -245,13 +288,37 @@ try:
 finally:
     trading.TP_HIT_VETO_ENABLED = orig
 
-orig_floor = trading.TP_HIT_VETO_MIN_PROB
+orig_floor = trading.TP_HIT_VETO_BASE_RATE_RATIO
 try:
-    trading.TP_HIT_VETO_MIN_PROB = 0.40
-    check("raising the floor to 0.40 vetoes more", decide(0.30).components["tp_hit_veto"] is True)
-    check("...but still never the neutral 0.5", decide(0.5).components["tp_hit_veto"] is False)
+    # The ratio scales the threshold: threshold = ratio x base_rate. At the
+    # 0.20 base rate these cases use, the default 0.5 gives 0.10, so a
+    # tp_hit_prob of 0.15 passes. Raising the ratio to 0.90 lifts the
+    # threshold to 0.18 and the same setup is now blocked.
+    trading.TP_HIT_VETO_BASE_RATE_RATIO = 0.90
+    check("raising the ratio raises the threshold and vetoes more",
+          decide(0.15).components["tp_hit_veto"] is True)
+    check("...and the threshold is exactly ratio x base rate",
+          abs(decide(0.15).components["tp_hit_threshold"] - 0.18) < 1e-9)
+    trading.TP_HIT_VETO_BASE_RATE_RATIO = 0.10
+    check("lowering the ratio lowers the threshold and vetoes less",
+          decide(0.15).components["tp_hit_veto"] is False)
 finally:
-    trading.TP_HIT_VETO_MIN_PROB = orig_floor
+    trading.TP_HIT_VETO_BASE_RATE_RATIO = orig_floor
+
+# The base rate itself moves the threshold, which is the whole point: the
+# same probability can be fine in one market and poor in another.
+check("a rarer label lowers the bar",
+      decide(0.02, base_rate=0.01).components["tp_hit_veto"] is False)
+check("...while the same probability fails against a common label",
+      decide(0.02, base_rate=0.50).components["tp_hit_veto"] is True)
+check("the veto stands down until enough labels exist",
+      decide(1e-300, samples=config.TP_HIT_VETO_MIN_SAMPLES - 1)
+      .components["tp_hit_veto"] is False)
+check("...and engages once they do",
+      decide(1e-300, samples=config.TP_HIT_VETO_MIN_SAMPLES)
+      .components["tp_hit_veto"] is True)
+check("a zero base rate can never veto",
+      decide(0.0, base_rate=0.0).components["tp_hit_veto"] is False)
 
 # ===========================================================================
 print("\n[8] Scope: it can only ever REJECT, never accept")
