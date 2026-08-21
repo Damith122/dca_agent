@@ -423,7 +423,58 @@ PROFIT_LOCK_MIN_AGE_SEC = float(os.environ.get("PROFIT_LOCK_MIN_AGE_SEC", "4.0")
 #   one second of movement was worth $0.11 - more than twice the whole buffer.
 #   The floor is now max(MIN_NET_PROFIT_USDT, mult * atr_pct * notional), so it
 #   grows with volatility. At 0.5 x 0.333% x $79 that is ~$0.13.
-PROFIT_LOCK_SLIPPAGE_ATR_MULT = float(os.environ.get("PROFIT_LOCK_SLIPPAGE_ATR_MULT", "0.5"))
+# 2026-08-21 P2 RECALIBRATION: 0.5 -> 0.25.
+#
+# THE MECHANIC. Profit Lock closes only when
+#     slippage_floor <= net <= peak x PROFIT_LOCK_RATIO
+# so the trigger is a WINDOW, and its width is
+#     peak x PROFIT_LOCK_RATIO - slippage_floor
+# When the floor is large relative to half the peak that window collapses,
+# and once the floor exceeds the locked level it closes entirely.
+#
+# WHAT PRODUCTION SHOWED (NEAR, 2026-08-20). Peak $0.1411 -> locked $0.0706,
+# floor $0.0643 at atr 0.336%. That is a trigger window just $0.0063 wide -
+# price had to land inside six-tenths of a cent. It did not; then ATR rose to
+# 0.372%, the floor became $0.0712 > the $0.0706 locked level, and the window
+# shut completely:
+#
+#   [profit-lock] HOLDING - executable net $+0.0572 is at/below the locked
+#   level $+0.0706 but under the vol-aware fee-safe floor $0.0643 ...
+#   "closing here would likely realize a loss after slippage"
+#
+# The trade later closed at EXACTLY +$0.0572. The slippage never materialised;
+# the buffer blocked a valid exit and a $0.1411 peak decayed to $0.0572.
+#
+# THE HONEST TRADE-OFF. P2 chose 0.5 because of the 2026-08-19 15:28 incident,
+# where a close estimated at +$0.1125 executable REALIZED -$0.0170 - $0.13 lost
+# between decision and fill (0.16% of notional, about 0.5 ATR, which is exactly
+# where 0.5 came from). Only a multiplier of ~0.43 or above still blocks that
+# close, so ANY meaningful reduction re-opens that scenario. This is a
+# calibration choice between two documented failure modes, not a clean bug fix:
+#
+#   too high -> the trigger window collapses and good exits are refused (NEAR)
+#   too low  -> a fast tape can turn an estimated profit into a realized loss (15:28)
+#
+# WHY 0.25 IS DEFENSIBLE NOW. Three things changed since 15:28 that were not
+# true when 0.5 was chosen:
+#   - P1 replaced the mid/taker-taker estimator with
+#     estimate_net_pnl_usdt_executable(), which prices the exit at the
+#     executable side of the book and uses actual accrued commission. The
+#     spread is now priced in BEFORE this buffer is applied, so part of what
+#     0.5 was covering is already accounted for.
+#   - The 2026-08-21 tick throttle took the event loop from ~0.8-1.1 CPU cores
+#     (saturated, single-threaded) to ~0.31, and eliminated the websocket
+#     starvation that came with it. Decision-to-fill latency in the 15:28
+#     window was inflated by that saturation.
+#   - The 50s orderflow minimum-hold means positions are no longer being
+#     churned in the first seconds, when the tape is most hostile.
+#
+# At 0.25 the NEAR window widens from $0.0063 to $0.021 - 3.3x - while the
+# buffer still scales with volatility and MIN_NET_PROFIT_USDT remains the
+# absolute floor underneath. Set back to 0.5 to restore the previous
+# behaviour exactly; raise toward 0.43+ to re-block the 15:28 scenario at the
+# cost of the narrow window returning.
+PROFIT_LOCK_SLIPPAGE_ATR_MULT = float(os.environ.get("PROFIT_LOCK_SLIPPAGE_ATR_MULT", "0.25"))
 
 # P4 - ATR-scaled risk geometry. Fixed-dollar thresholds on a fixed notional are
 #   INVERSELY proportional to volatility in ATR terms, which is why the same

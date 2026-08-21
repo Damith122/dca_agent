@@ -159,25 +159,46 @@ def test_fee_safe_floor_scales_with_volatility():
 
     m = open_the_1528_long(make_manager(), atr_pct=0.003326)
     live_floor = m._profit_lock_min_net_floor()
-    expected = config.PROFIT_LOCK_SLIPPAGE_ATR_MULT * 0.003326 * (82.43 * 0.96)
+    notional = 82.43 * 0.96
+    expected = max(
+        config.MIN_NET_PROFIT_USDT,
+        config.PROFIT_LOCK_SLIPPAGE_ATR_MULT * 0.003326 * notional,
+    )
 
     print(f"P2: flat MIN_NET_PROFIT_USDT = {config.MIN_NET_PROFIT_USDT:.4f}")
     print(f"P2: vol-aware floor @ atr 0.333% = {live_floor:.4f}")
 
+    # The floor is max(flat, ATR term) - assert the composition, not just the
+    # ATR term, so this stays correct in either regime.
     assert abs(live_floor - expected) < 1e-9
     assert live_floor > config.MIN_NET_PROFIT_USDT, (
-        "at 0.33% ATR the floor must exceed the old flat $0.05 buffer"
+        "at 0.33% ATR on this notional the ATR term must still dominate the "
+        "flat $0.05 buffer"
     )
-    # At the incident's decision moment the position was really worth +0.1125
-    # on the executable basis (the old estimator reported +0.0936). Both are
-    # below the new floor, so the close is blocked either way.
-    assert 0.1125 < live_floor, (
-        f"the incident's decision-moment value (+0.1125 executable / +0.0936 as "
-        f"logged) must be BELOW the new floor ({live_floor:.4f}) - otherwise the "
-        f"same close happens again"
+
+    # 2026-08-21 RECALIBRATION (0.5 -> 0.25). This assertion USED to require
+    # that the 15:28 close be blocked outright. It no longer can be: only a
+    # multiplier of ~0.43+ blocks it, and 0.5 was fitted to this single
+    # incident, which is what collapsed Profit Lock's trigger window in
+    # production (NEAR 2026-08-20: a $0.0063-wide window that then shut
+    # entirely as ATR rose). See config.py for the full trade-off.
+    #
+    # What P2 still guarantees, and what this now asserts, is the property
+    # that actually matters: the floor SCALES WITH VOLATILITY, so a violent
+    # tape demands a larger buffer than a calm one. The 15:28 close is now
+    # governed by P1's executable estimator plus the tick throttle that
+    # removed the event-loop saturation inflating decision-to-fill latency.
+    calm = open_the_1528_long(make_manager(), atr_pct=0.001)
+    assert calm._profit_lock_min_net_floor() < live_floor, (
+        "a calm tape must demand a SMALLER buffer than a violent one - that "
+        "volatility-awareness is P2's core property and is unchanged"
     )
-    print(f"P2: incident decision (+0.1125 exec / +0.0936 logged) < floor "
-          f"{live_floor:.4f} -> would NOT close")
+    print(f"P2: floor scales with vol: atr 0.100% -> "
+          f"{calm._profit_lock_min_net_floor():.4f}, atr 0.333% -> {live_floor:.4f}")
+    print(f"P2: NOTE - at the recalibrated {config.PROFIT_LOCK_SLIPPAGE_ATR_MULT} "
+          f"multiplier the 15:28 decision value (+0.1125) is ABOVE the floor "
+          f"({live_floor:.4f}), i.e. that close is no longer blocked by this "
+          f"guard alone. Deliberate - see config.py.")
 
     # A quiet tape falls back to the flat floor rather than guessing.
     quiet = open_the_1528_long(make_manager(), atr_pct=0.0)
@@ -260,19 +281,39 @@ async def test_the_1528_close_no_longer_happens():
     assert exec_a > locked, "P1 alone lifts the value back above the locked level"
     assert not closed_a
 
-    # (b) Slightly lower - now genuinely AT/below the locked level, but still
-    #     under the vol-aware floor. This is the branch P2 exists for.
+    # (b) Slightly lower - genuinely AT/below the locked level.
+    #
+    # 2026-08-21 RECALIBRATION (0.5 -> 0.25). Under the old multiplier this
+    # price sat below the vol-aware floor and was HELD. It no longer is: the
+    # floor moved from $0.1316 to $0.0658 and this state now closes at a
+    # genuinely positive net. That is the deliberate cost of widening Profit
+    # Lock's trigger window, which had collapsed to $0.0063 in production
+    # (NEAR, 2026-08-20) and then shut entirely as ATR rose. See config.py.
     m_b, closed_b, log_b = await run_at(82.57, 82.58, "at locked level")
     exec_b = m_b.estimate_net_pnl_usdt_executable()
     floor_b = m_b._profit_lock_min_net_floor()
     print(f"(b) at locked level: executable={exec_b:+.4f} <= locked={locked:+.4f}, "
           f"floor={floor_b:.4f} -> closes={len(closed_b)}")
     assert 0 < exec_b <= locked, "fixture must sit in the trigger band"
-    assert exec_b < floor_b, "and below the vol-aware floor"
-    assert not closed_b, (
-        "this is the state that closed live for a realized loss - P2 must hold it"
+    assert exec_b > floor_b, (
+        "at the recalibrated multiplier this price is now ABOVE the floor - if "
+        "it is not, the recalibration did not take effect"
     )
-    assert "HOLDING" in log_b, "and it must say why it held"
+    assert len(closed_b) == 1 and exec_b > 0, (
+        "the recalibrated guard closes this state, and only at a positive net"
+    )
+
+    # (b2) The guard is NOT switched off. A thinner net - still positive, but
+    #      under the recalibrated floor - must still be held. This is the
+    #      property P2 exists for and it is unchanged.
+    m_b2, closed_b2, log_b2 = await run_at(82.55, 82.56, "below the new floor")
+    exec_b2 = m_b2.estimate_net_pnl_usdt_executable()
+    floor_b2 = m_b2._profit_lock_min_net_floor()
+    print(f"(b2) below new floor: executable={exec_b2:+.4f} <= locked={locked:+.4f}, "
+          f"floor={floor_b2:.4f} -> closes={len(closed_b2)}")
+    assert 0 < exec_b2 < floor_b2, "fixture must be positive but under the floor"
+    assert not closed_b2, "P2 must still hold a net too thin to survive slippage"
+    assert "HOLDING" in log_b2, "and it must say why it held"
 
     # (c) The actual FILL price. On the executable basis the position is already
     #     net-NEGATIVE here, so Profit Lock is out of the picture entirely.
@@ -283,7 +324,8 @@ async def test_the_1528_close_no_longer_happens():
     assert exec_c < 0
     assert not closed_c, "a net-negative position must never be closed by Profit Lock"
 
-    print("P1+2+3: PASS - none of the incident's three prices closes the trade\n")
+    print("P1+2+3: PASS - the decision price and the fill price still never close;\n"
+          "        the recalibrated floor still holds anything too thin to survive slippage\n")
 
 
 # ============================================================================

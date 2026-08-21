@@ -7528,14 +7528,43 @@ class MartingaleManager:
                     )
                     return
                 if unrealized_pnl_usdt <= locked_profit and self._should_log_profit_lock_peak_update():
-                    print(color(
-                        f"{now_str()} [profit-lock] HOLDING - executable net "
-                        f"${unrealized_pnl_usdt:+.4f} is at/below the locked level "
-                        f"${locked_profit:+.4f} but under the vol-aware fee-safe floor "
-                        f"${slippage_floor:.4f} (atr%={self.last_regime.atr_pct*100:.3f}); closing "
-                        f"here would likely realize a loss after slippage. Hard Stop / Smart Exit "
-                        f"remain active.", GRAY,
-                    ))
+                    # 2026-08-21: say WHY it is holding, and in particular
+                    # whether the geometry makes this lock unfirable at the
+                    # current peak rather than merely not-yet-firing.
+                    #
+                    # Profit Lock can only ever close when
+                    #     locked_profit >= slippage_floor
+                    # and since locked_profit is peak x PROFIT_LOCK_RATIO, that
+                    # is a condition on the PEAK, not on the current PnL. When
+                    # the peak is too small the lock will never fire no matter
+                    # how price moves, and the old message - which only ever
+                    # said "under the fee-safe floor" - gave no way to tell that
+                    # apart from an ordinary hold. That is exactly what happened
+                    # on the live NEAR trade: a $0.1411 peak against a $0.0706
+                    # locked level and a $0.0643-$0.0712 floor, oscillating, with
+                    # the lock structurally unable to act.
+                    structurally_unfirable = locked_profit < slippage_floor
+                    if structurally_unfirable:
+                        needed_peak = safe_div(slippage_floor, PROFIT_LOCK_RATIO, 0.0)
+                        print(color(
+                            f"{now_str()} [profit-lock] HOLDING (UNFIRABLE AT THIS PEAK) - "
+                            f"executable net ${unrealized_pnl_usdt:+.4f} is at/below the locked "
+                            f"level ${locked_profit:+.4f}, but that locked level is itself below "
+                            f"the fee-safe floor ${slippage_floor:.4f} "
+                            f"(atr%={self.last_regime.atr_pct*100:.3f}), so this lock CANNOT close "
+                            f"at any price until the peak exceeds ${needed_peak:.4f} "
+                            f"(currently ${p.peak_unrealized_pnl:+.4f}). Hard Stop / RR stop / "
+                            f"Smart Exit remain active.", YELLOW,
+                        ))
+                    else:
+                        print(color(
+                            f"{now_str()} [profit-lock] HOLDING - executable net "
+                            f"${unrealized_pnl_usdt:+.4f} is at/below the locked level "
+                            f"${locked_profit:+.4f} but under the vol-aware fee-safe floor "
+                            f"${slippage_floor:.4f} (atr%={self.last_regime.atr_pct*100:.3f}); closing "
+                            f"here would likely realize a loss after slippage. Hard Stop / Smart Exit "
+                            f"remain active.", GRAY,
+                        ))
 
         # --- Max Hold Time Protection (scalping-bot safety net) --------------------
         # This is a scalping bot; positions are meant to resolve in minutes,
