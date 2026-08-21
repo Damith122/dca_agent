@@ -369,6 +369,12 @@ from config import (
     DCA_STATE_PATH,
     GITHUB_DCA_STATE_PATH,
     # ------------------------------------------------------------------
+    # 2026-08-20 multi-coin watchlist.
+    # ------------------------------------------------------------------
+    ACTIVE_SYMBOLS,
+    MAX_ACTIVE_TRADES,
+    symbol_scoped_name,
+    # ------------------------------------------------------------------
     # 2026-08 high-frequency orderflow upgrade (appended config block -
     # see the banner at the bottom of config.py). Every name below is
     # NEW; not one pre-existing import above was removed or renamed.
@@ -2056,12 +2062,152 @@ class PositionState:
     protection_last_retry_ts: float = 0.0
 
 
+# ============================================================================
+# 2026-08-20 MULTI-COIN ARCHITECTURE
+#
+# Two pieces live here:
+#   resolve_symbol_paths()  - per-symbol persistence paths (file isolation)
+#   PortfolioCoordinator    - the MAX_ACTIVE_TRADES cap across the watchlist
+# ============================================================================
+
+# Which config env var (if any) can explicitly override each logical path.
+# An explicit override is honoured for the PRIMARY symbol only - one hard
+# coded path cannot be shared by four symbols without re-mixing exactly the
+# state this isolation exists to keep apart.
+_PATH_SPEC = {
+    "trade_log_json":  ("trades_log.jsonl",           "TRADE_LOG_JSON_PATH",           TRADE_LOG_JSON_PATH),
+    "trade_log_csv":   ("trades_log.csv",             "TRADE_LOG_CSV_PATH",            TRADE_LOG_CSV_PATH),
+    "stats_json":      ("performance_stats.json",     "STATS_JSON_PATH",               STATS_JSON_PATH),
+    "stats_csv":       ("performance_stats.csv",      "STATS_CSV_PATH",                STATS_CSV_PATH),
+    "brain_local":     ("brain.pkl",                  "BRAIN_LOCAL_PATH",              BRAIN_LOCAL_PATH),
+    "github_brain":    ("brain.pkl",                  "GITHUB_BRAIN_PATH",             GITHUB_BRAIN_PATH),
+    "dca_state":       ("dca_state.json",             "DCA_STATE_PATH",                DCA_STATE_PATH),
+    "github_dca_state":("dca_state.json",             "GITHUB_DCA_STATE_PATH",         GITHUB_DCA_STATE_PATH),
+    "trade_cursor":    ("trade_sync_cursor.json",     "TRADE_SYNC_CURSOR_PATH",        TRADE_SYNC_CURSOR_PATH),
+    "github_cursor":   ("trade_sync_cursor.json",     "GITHUB_TRADE_SYNC_CURSOR_PATH", GITHUB_TRADE_SYNC_CURSOR_PATH),
+    "github_trades_csv":  ("trades_log.csv",          "GITHUB_TRADES_LOG_CSV_PATH",    GITHUB_TRADES_LOG_CSV_PATH),
+    "github_trades_json": ("trades_log.jsonl",        "GITHUB_TRADES_LOG_JSON_PATH",   GITHUB_TRADES_LOG_JSON_PATH),
+    "github_stats_csv":   ("performance_stats.csv",   "GITHUB_STATS_CSV_PATH",         GITHUB_STATS_CSV_PATH),
+}
+
+
+def resolve_symbol_paths(symbol: str) -> Dict[str, str]:
+    """Every persistence path for ONE symbol, keyed by logical name.
+
+    For the primary SYMBOL this returns exactly what the module-level config
+    constants already hold - including any explicit operator override - so a
+    single-symbol deployment is bit-for-bit unchanged. For any OTHER symbol
+    in the watchlist the name is always computed from the symbol, so an
+    explicit override set for the primary can never leak across coins.
+
+    The generated names match the existing convention exactly:
+        brain_LIVE_SOLUSDT.pkl, dca_state_LIVE_BTCUSDT.json, ...
+    so files written by earlier single-symbol builds are read unchanged.
+    """
+    symbol = symbol.strip().upper()
+    is_primary = symbol == SYMBOL.strip().upper()
+    out: Dict[str, str] = {}
+    for key, (base, env_var, primary_value) in _PATH_SPEC.items():
+        if is_primary:
+            # Preserves an explicit env override AND the GitHub-side
+            # directory prefix the config layer applies to remote paths.
+            out[key] = primary_value
+            continue
+        scoped = symbol_scoped_name(base, symbol)
+        if key.startswith("github_"):
+            # Remote paths keep whatever directory the primary's remote path
+            # lives in, so all coins land side by side in the same folder.
+            prefix = os.path.dirname(primary_value)
+            scoped = os.path.join(prefix, scoped) if prefix else scoped
+        out[key] = scoped
+    return out
+
+
+class PortfolioCoordinator:
+    """2026-08-20 multi-coin: enforces MAX_ACTIVE_TRADES across the whole
+    watchlist. One instance is shared by every MartingaleManager.
+
+    WHY A RESERVATION AND NOT JUST A COUNT
+    ----------------------------------------------------------------------
+    Counting managers whose status == "OPEN" is not enough. Opening a
+    position is not instantaneous: open_position() awaits on order
+    placement, and until that fill comes back the manager is ENTERING, not
+    OPEN. Two symbols ticking in the same window would each look at a
+    portfolio of zero OPEN positions, both pass the gate, and both fire -
+    producing MAX_ACTIVE_TRADES + 1 positions on a $19 account.
+
+    So a slot is claimed SYNCHRONOUSLY, before the first await of the entry
+    path, and released when the position finally goes flat (or when the
+    entry attempt fails). asyncio runs one coroutine at a time between
+    awaits, so a check-and-set with no await between them is atomic - that
+    is exactly what try_reserve() is.
+    """
+
+    def __init__(self, max_active: int = MAX_ACTIVE_TRADES):
+        self.max_active = max(1, int(max_active))
+        # symbol -> why it holds the slot ("reserved" then "open")
+        self._slots: Dict[str, str] = {}
+
+    # --- queries ------------------------------------------------------
+    def active_count(self) -> int:
+        return len(self._slots)
+
+    def holders(self) -> list:
+        return sorted(self._slots)
+
+    def holds_slot(self, symbol: str) -> bool:
+        return symbol in self._slots
+
+    def has_capacity(self, symbol: str) -> bool:
+        """True if `symbol` could open now. A symbol that already holds a
+        slot always has capacity for its own position (DCA adds, re-entry
+        after a partial close) - the cap is on distinct concurrent
+        positions, not on order count."""
+        return symbol in self._slots or len(self._slots) < self.max_active
+
+    # --- mutations ----------------------------------------------------
+    def try_reserve(self, symbol: str) -> bool:
+        """Atomically claim a slot. MUST be called before the first await of
+        an entry. Returns False when the portfolio is already full."""
+        if symbol in self._slots:
+            return True
+        if len(self._slots) >= self.max_active:
+            return False
+        self._slots[symbol] = "reserved"
+        return True
+
+    def confirm(self, symbol: str) -> None:
+        """Promote a reservation to a live position. Idempotent, and will
+        also adopt a slot for a position discovered by startup
+        reconciliation that this process never reserved."""
+        self._slots[symbol] = "open"
+
+    def release(self, symbol: str) -> None:
+        """Give the slot back - on close, or on a failed/abandoned entry.
+        Idempotent, so a double release is harmless."""
+        self._slots.pop(symbol, None)
+
+
 class MartingaleManager:
-    def __init__(self, client: RestClient, symbol: str, filters: SymbolFilters, leverage: int):
+    def __init__(
+        self,
+        client: RestClient,
+        symbol: str,
+        filters: SymbolFilters,
+        leverage: int,
+        portfolio: Optional["PortfolioCoordinator"] = None,
+    ):
         self.client = client
         self.symbol = symbol
         self.filters = filters
         self.leverage = leverage
+        # 2026-08-20 multi-coin: the MAX_ACTIVE_TRADES gate, shared by every
+        # manager in the process. Defaults to a private single-slot
+        # coordinator so a manager constructed on its own (every existing
+        # test does this) behaves exactly as it did before multi-coin -
+        # one symbol, one position, gate always open for itself.
+        self.portfolio = portfolio if portfolio is not None else PortfolioCoordinator()
+        self._last_portfolio_block_log_ts: float = 0.0
 
         self.position = PositionState()
         # 2026-08 position_sync_ready startup gate: starts False on every
@@ -2203,8 +2349,40 @@ class MartingaleManager:
         self.confidence_engine = ConfidenceEngine()
         self.entry_engine = EntryEngineV2()
         self.reward_calc = RewardCalculator()
-        self.trade_logger = TradeLogger()
-        self.perf_stats = PerformanceStats(self.trade_logger, symbol=self.symbol)
+
+        # ------------------------------------------------------------------
+        # 2026-08-20 multi-coin file isolation.
+        #
+        # Every persistence path this manager touches is now derived from
+        # THIS instance's self.symbol instead of being read off the
+        # module-level config constants, which are frozen at import time to
+        # the single primary SYMBOL. Without this, four managers in one
+        # process would all read and write the primary symbol's brain, DCA
+        # state, cursor, trade log and stats - silently interleaving four
+        # coins' state into one set of files.
+        #
+        # For the primary symbol these resolve to exactly the same filenames
+        # as before (symbol_scoped_name() is the same function that computed
+        # the config defaults), so an existing deployment picks its files up
+        # unchanged with no migration.
+        #
+        # The one deliberate exception is an operator-set explicit path env
+        # var: those still win for the PRIMARY symbol only, because an
+        # explicit single path cannot be meaningfully shared by four
+        # symbols. config._warn_if_explicit_path_bypasses_isolation()
+        # already warns at startup when one is set.
+        # ------------------------------------------------------------------
+        self.paths = resolve_symbol_paths(self.symbol)
+
+        self.trade_logger = TradeLogger(
+            json_path=self.paths['trade_log_json'], csv_path=self.paths['trade_log_csv']
+        )
+        self.perf_stats = PerformanceStats(
+            self.trade_logger,
+            json_path=self.paths['stats_json'],
+            csv_path=self.paths['stats_csv'],
+            symbol=self.symbol,
+        )
 
         self._feature_buffer: Deque[Tuple[float, np.ndarray, float]] = deque(
             maxlen=LABEL_HORIZON_TICKS + 1
@@ -2224,8 +2402,14 @@ class MartingaleManager:
         self.recent_trade_timestamps: deque[float] = deque(maxlen=RECENT_TRADE_WINDOW)
 
         # --- Cloud-Sync Brain --------------------------------------------
+        # 2026-08-20 multi-coin: the sync client's DEFAULT path is this
+        # symbol's own brain. Every other upload/download already passes an
+        # explicit per-file path, and GithubBrainSync keeps its sha cache
+        # keyed per path with one global upload lock, so a single client per
+        # manager pushes four coins' files without racing for the branch
+        # HEAD. See github_sync.py.
         self.github_sync = GithubBrainSync(
-            GITHUB_TOKEN, GITHUB_REPO, GITHUB_BRAIN_PATH, GITHUB_BRANCH
+            GITHUB_TOKEN, GITHUB_REPO, self.paths['github_brain'], GITHUB_BRANCH
         )
         self._brain_dirty = False
         self.last_brain_sync_ts: Optional[float] = None
@@ -2500,6 +2684,17 @@ class MartingaleManager:
             return True
         return False
 
+    def _should_log_portfolio_block(self, interval_sec: float = 300.0) -> bool:
+        """2026-08-20 multi-coin: throttles the MAX_ACTIVE_TRADES skip line.
+        With 4 symbols ticking several times a second, an unthrottled log
+        would bury every other line in the deploy log while one trade runs.
+        Five minutes is enough to prove the gate is working without noise."""
+        now = time.time()
+        if now - self._last_portfolio_block_log_ts >= interval_sec:
+            self._last_portfolio_block_log_ts = now
+            return True
+        return False
+
     def _should_log_continuous_trading(self, interval_sec: float = 3600.0) -> bool:
         now = time.time()
         if now - self._last_continuous_trading_log_ts >= interval_sec:
@@ -2533,11 +2728,11 @@ class MartingaleManager:
         # from the logs rather than inferred later.
         print(color(
             f"{now_str()} [symbol] environment={RUNTIME_ENV} SYMBOL={self.symbol} | "
-            f"brain={BRAIN_LOCAL_PATH} | "
-            f"dca={DCA_STATE_PATH} | "
-            f"cursor={TRADE_SYNC_CURSOR_PATH} | "
-            f"trades={TRADE_LOG_CSV_PATH}/{TRADE_LOG_JSON_PATH} | "
-            f"stats={STATS_CSV_PATH}/{STATS_JSON_PATH}", MAGENTA,
+            f"brain={self.paths['brain_local']} | "
+            f"dca={self.paths['dca_state']} | "
+            f"cursor={self.paths['trade_cursor']} | "
+            f"trades={self.paths['trade_log_csv']}/{self.paths['trade_log_json']} | "
+            f"stats={self.paths['stats_csv']}/{self.paths['stats_json']}", MAGENTA,
         ))
         # Start (or reuse) the single shared GitHub session up front, so it's
         # available for the CSV log/stats restore that runs right after this,
@@ -2568,13 +2763,13 @@ class MartingaleManager:
         # its compatibility checks here.
         local_brain: Optional[BrainV2] = None
         local_updates: Optional[int] = None
-        if os.path.exists(BRAIN_LOCAL_PATH):
+        if os.path.exists(self.paths['brain_local']):
             local_data: Optional[bytes] = None
             try:
-                with open(BRAIN_LOCAL_PATH, "rb") as f:
+                with open(self.paths['brain_local'], "rb") as f:
                     local_data = f.read()
             except Exception as e:  # noqa: BLE001 - a local read failure must not block startup
-                print(color(f"[brain] could not read local {BRAIN_LOCAL_PATH} ({e}) - treating as unavailable.", YELLOW))
+                print(color(f"[brain] could not read local {self.paths['brain_local']} ({e}) - treating as unavailable.", YELLOW))
             if local_data:
                 local_brain = BrainV2.from_bytes(local_data, N_FEATURES_V2, BRAIN2_WARMUP_UPDATES)
                 local_updates = local_brain.update_count
@@ -2595,7 +2790,7 @@ class MartingaleManager:
 
         def _cache_locally(data: bytes) -> None:
             try:
-                with open(BRAIN_LOCAL_PATH, "wb") as f:
+                with open(self.paths['brain_local'], "wb") as f:
                     f.write(data)
             except Exception as e:  # noqa: BLE001 - disk write failure shouldn't block using the brain
                 print(color(f"[brain] could not cache selected brain snapshot to disk: {e}", YELLOW))
@@ -2663,12 +2858,12 @@ class MartingaleManager:
             ))
             try:
                 data = self.brain.to_bytes()
-                tmp_path = f"{BRAIN_LOCAL_PATH}.tmp"
+                tmp_path = f"{self.paths['brain_local']}.tmp"
                 with open(tmp_path, "wb") as f:
                     f.write(data)
-                os.replace(tmp_path, BRAIN_LOCAL_PATH)
+                os.replace(tmp_path, self.paths['brain_local'])
             except Exception as e:  # noqa: BLE001
-                print(color(f"[brain] failed to write {BRAIN_LOCAL_PATH} locally: {e}", RED))
+                print(color(f"[brain] failed to write {self.paths['brain_local']} locally: {e}", RED))
             return
 
         try:
@@ -2678,12 +2873,12 @@ class MartingaleManager:
             return
 
         try:
-            tmp_path = f"{BRAIN_LOCAL_PATH}.tmp"
+            tmp_path = f"{self.paths['brain_local']}.tmp"
             with open(tmp_path, "wb") as f:
                 f.write(data)
-            os.replace(tmp_path, BRAIN_LOCAL_PATH)  # atomic on POSIX - never a half-written file
+            os.replace(tmp_path, self.paths['brain_local'])  # atomic on POSIX - never a half-written file
         except Exception as e:  # noqa: BLE001
-            print(color(f"[brain] failed to write {BRAIN_LOCAL_PATH} locally: {e}", RED))
+            print(color(f"[brain] failed to write {self.paths['brain_local']} locally: {e}", RED))
 
         try:
             pushed = await self.github_sync.upload(
@@ -2883,7 +3078,7 @@ class MartingaleManager:
         """Persists the DCA/position snapshot both locally and to GitHub.
 
         2026-08 DCA-state GitHub persistence fix: previously this only wrote
-        DCA_STATE_PATH locally. On a Railway redeploy (or any host that
+        self.paths['dca_state'] locally. On a Railway redeploy (or any host that
         doesn't guarantee filesystem persistence across restarts), that
         local file - and with it dca_step, last_dca_price,
         profit_lock_active, peak_unrealized_pnl, opened_at, and any pending
@@ -2911,10 +3106,10 @@ class MartingaleManager:
         step_label = f"{self.position.dca_step}/{MAX_DCA_STEPS}" if payload_override is None else "FLAT"
         try:
             payload = json.dumps(payload_dict).encode("utf-8")
-            tmp_path = f"{DCA_STATE_PATH}.tmp"
+            tmp_path = f"{self.paths['dca_state']}.tmp"
             with open(tmp_path, "wb") as f:
                 f.write(payload)
-            os.replace(tmp_path, DCA_STATE_PATH)  # atomic on POSIX - never a half-written file
+            os.replace(tmp_path, self.paths['dca_state'])  # atomic on POSIX - never a half-written file
             print(color(f"{now_str()} [dca-state] saved local snapshot step={step_label}", GRAY))
         except Exception as e:  # noqa: BLE001 - snapshot persistence must never crash the trading loop
             print(color(f"[dca-state] failed to save snapshot ({reason}): {e}", YELLOW))
@@ -2923,7 +3118,7 @@ class MartingaleManager:
         try:
             pushed = await self.github_sync.upload(
                 payload, message=f"dca-state sync: {reason} (step={step_label})",
-                path=GITHUB_DCA_STATE_PATH,
+                path=self.paths['github_dca_state'],
             )
             if pushed:
                 print(color(f"{now_str()} [dca-state] pushed snapshot to GitHub step={step_label}", MAGENTA))
@@ -2964,8 +3159,8 @@ class MartingaleManager:
         bytes can come from.
         """
         try:
-            if os.path.exists(DCA_STATE_PATH):
-                with open(DCA_STATE_PATH, "r", encoding="utf-8") as f:
+            if os.path.exists(self.paths['dca_state']):
+                with open(self.paths['dca_state'], "r", encoding="utf-8") as f:
                     data = json.load(f)
                     data["_snapshot_source"] = "local"
                     return data
@@ -2973,7 +3168,7 @@ class MartingaleManager:
             print(color(f"[dca-state] failed to read local snapshot: {e}", YELLOW))
 
         try:
-            raw = await self.github_sync.download(path=GITHUB_DCA_STATE_PATH)
+            raw = await self.github_sync.download(path=self.paths['github_dca_state'])
             if raw:
                 print(color(f"{now_str()} [dca-state] local snapshot missing - using GitHub backup", MAGENTA))
                 data = json.loads(raw.decode("utf-8"))
@@ -2991,8 +3186,8 @@ class MartingaleManager:
 
     async def delete_dca_state(self, reason: str) -> None:
         try:
-            if os.path.exists(DCA_STATE_PATH):
-                os.remove(DCA_STATE_PATH)
+            if os.path.exists(self.paths['dca_state']):
+                os.remove(self.paths['dca_state'])
                 print(color(f"[dca-state] snapshot deleted ({reason}).", GRAY))
         except Exception as e:  # noqa: BLE001 - deletion failure must never crash the trading loop
             print(color(f"[dca-state] failed to delete snapshot: {e}", YELLOW))
@@ -3027,9 +3222,9 @@ class MartingaleManager:
         PerformanceStats already create the file with proper headers
         automatically on their first natural write (unchanged behavior)."""
         for local_path, remote_path, label in (
-            (TRADE_LOG_CSV_PATH, GITHUB_TRADES_LOG_CSV_PATH, os.path.basename(TRADE_LOG_CSV_PATH)),
-            (STATS_CSV_PATH, GITHUB_STATS_CSV_PATH, os.path.basename(STATS_CSV_PATH)),
-            (TRADE_LOG_JSON_PATH, GITHUB_TRADES_LOG_JSON_PATH, os.path.basename(TRADE_LOG_JSON_PATH)),
+            (self.paths['trade_log_csv'], self.paths['github_trades_csv'], os.path.basename(self.paths['trade_log_csv'])),
+            (self.paths['stats_csv'], self.paths['github_stats_csv'], os.path.basename(self.paths['stats_csv'])),
+            (self.paths['trade_log_json'], self.paths['github_trades_json'], os.path.basename(self.paths['trade_log_json'])),
         ):
             if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
                 continue  # local copy already present - don't clobber it
@@ -3053,9 +3248,9 @@ class MartingaleManager:
         self.trade_logger.mark_header_present()
         # Seed the dedup hashes with whatever is on disk now, so a restored-
         # but-unchanged file isn't immediately re-uploaded for no reason.
-        self._last_synced_csv_hash[GITHUB_TRADES_LOG_CSV_PATH] = self._file_sha256(TRADE_LOG_CSV_PATH)
-        self._last_synced_csv_hash[GITHUB_STATS_CSV_PATH] = self._file_sha256(STATS_CSV_PATH)
-        self._last_synced_csv_hash[GITHUB_TRADES_LOG_JSON_PATH] = self._file_sha256(TRADE_LOG_JSON_PATH)
+        self._last_synced_csv_hash[self.paths['github_trades_csv']] = self._file_sha256(self.paths['trade_log_csv'])
+        self._last_synced_csv_hash[self.paths['github_stats_csv']] = self._file_sha256(self.paths['stats_csv'])
+        self._last_synced_csv_hash[self.paths['github_trades_json']] = self._file_sha256(self.paths['trade_log_json'])
 
     # -- Restart-safe runtime accounting restoration --------------------------
     # Root cause fixed here: TradeLogger.load_all() / restore_csv_logs_from_github()
@@ -3219,11 +3414,11 @@ class MartingaleManager:
             print(color(f"[csv-sync] unexpected error pushing {label} (bot keeps trading): {e}", RED))
 
     async def sync_trade_log_to_github(self) -> None:
-        await self._sync_csv_to_github(TRADE_LOG_CSV_PATH, GITHUB_TRADES_LOG_CSV_PATH, os.path.basename(TRADE_LOG_CSV_PATH))
-        await self._sync_csv_to_github(TRADE_LOG_JSON_PATH, GITHUB_TRADES_LOG_JSON_PATH, os.path.basename(TRADE_LOG_JSON_PATH))
+        await self._sync_csv_to_github(self.paths['trade_log_csv'], self.paths['github_trades_csv'], os.path.basename(self.paths['trade_log_csv']))
+        await self._sync_csv_to_github(self.paths['trade_log_json'], self.paths['github_trades_json'], os.path.basename(self.paths['trade_log_json']))
 
     async def sync_performance_stats_to_github(self) -> None:
-        await self._sync_csv_to_github(STATS_CSV_PATH, GITHUB_STATS_CSV_PATH, os.path.basename(STATS_CSV_PATH))
+        await self._sync_csv_to_github(self.paths['stats_csv'], self.paths['github_stats_csv'], os.path.basename(self.paths['stats_csv']))
 
     # -- Trade-log reconciliation (Binance is the source of truth) -----------
     # Root-cause fix for trades that go missing from trades_log.jsonl/csv:
@@ -3249,14 +3444,14 @@ class MartingaleManager:
         reconcile_trade_history_from_exchange() treats that as a signal to
         seed forward from *now* rather than guess at history."""
         try:
-            if os.path.exists(TRADE_SYNC_CURSOR_PATH):
-                with open(TRADE_SYNC_CURSOR_PATH, "r", encoding="utf-8") as f:
+            if os.path.exists(self.paths['trade_cursor']):
+                with open(self.paths['trade_cursor'], "r", encoding="utf-8") as f:
                     self._trade_sync_cursor = int(json.load(f).get("last_trade_id", 0) or 0)
                     return
         except Exception as e:  # noqa: BLE001 - corrupt/missing local file must not block startup
             print(color(f"[reconcile] could not read local trade-sync cursor: {e}", YELLOW))
         try:
-            data = await self.github_sync.download(path=GITHUB_TRADE_SYNC_CURSOR_PATH)
+            data = await self.github_sync.download(path=self.paths['github_cursor'])
             if data:
                 self._trade_sync_cursor = int(json.loads(data.decode("utf-8")).get("last_trade_id", 0) or 0)
                 print(color(
@@ -3277,16 +3472,16 @@ class MartingaleManager:
         self._trade_sync_cursor = trade_id
         payload = json.dumps({"last_trade_id": trade_id}).encode("utf-8")
         try:
-            tmp_path = f"{TRADE_SYNC_CURSOR_PATH}.tmp"
+            tmp_path = f"{self.paths['trade_cursor']}.tmp"
             with open(tmp_path, "wb") as f:
                 f.write(payload)
-            os.replace(tmp_path, TRADE_SYNC_CURSOR_PATH)
+            os.replace(tmp_path, self.paths['trade_cursor'])
         except Exception as e:  # noqa: BLE001
             print(color(f"[reconcile] failed to write trade-sync cursor locally: {e}", YELLOW))
         try:
             await self.github_sync.upload(
                 payload, message=f"trade-sync cursor: {reason} (id={trade_id})",
-                path=GITHUB_TRADE_SYNC_CURSOR_PATH,
+                path=self.paths['github_cursor'],
             )
         except Exception as e:  # noqa: BLE001 - belt-and-suspenders; upload() already catches internally
             print(color(f"[reconcile] unexpected error pushing trade-sync cursor: {e}", RED))
@@ -4551,7 +4746,30 @@ class MartingaleManager:
             ))
             await reconcile_protective_stop_on_startup(self.client, self)
 
+    def _sync_portfolio_slot(self) -> None:
+        """2026-08-20 multi-coin: reconcile this symbol's portfolio slot with
+        its ACTUAL position status, every tick.
+
+        try_reserve() in _place_step_order() closes the entry race, but a
+        slot also has to be given back on every path a position can end -
+        a normal TP/SL close, a Profit Lock exit, a startup reconciliation
+        that finds the position already gone, a liquidation. Rather than
+        hooking each of those individually in a file this size (and risking
+        one being missed, which would wedge the portfolio permanently), the
+        slot is simply derived from the one fact that is always true:
+        whether this manager currently has a live position.
+
+        This also ADOPTS a slot for a position this process never opened -
+        one recovered by initialize_sync() after a restart - so a restart
+        mid-trade does not let a second symbol open alongside it."""
+        live = self.position.status in ("OPEN", "ENTERING", "DCA_PENDING", "CLOSING")
+        if live:
+            self.portfolio.confirm(self.symbol)
+        elif self.portfolio.holds_slot(self.symbol):
+            self.portfolio.release(self.symbol)
+
     async def on_price_tick(self) -> None:
+        self._sync_portfolio_slot()
         await self._sweep_orphan_protective_stops()
         # 2026-08 post-only (maker) entry execution: a GTX limit order can
         # legitimately rest unfilled forever if price walks away from it.
@@ -4582,6 +4800,26 @@ class MartingaleManager:
 
         if self.position.status == "FLAT":
             if time.time() - self.last_trade_action_ts < TRADE_COOLDOWN_SEC:
+                return
+
+            # 2026-08-20 multi-coin MAX_ACTIVE_TRADES gate (entry gating
+            # ONLY - same scope as every other gate in this chain: an
+            # already-open position on THIS symbol still DCAs, still runs
+            # every risk exit, and Brain learning is untouched). While
+            # another symbol in the watchlist holds the portfolio's only
+            # slot, this symbol keeps evaluating the market and keeps
+            # learning, but may not open. It is deliberately placed FIRST
+            # among the entry gates: it is the cheapest check and the one
+            # most likely to be blocking, so it short-circuits the rest.
+            if not self.portfolio.has_capacity(self.symbol):
+                if self._should_log_portfolio_block():
+                    held = ", ".join(self.portfolio.holders())
+                    print(color(
+                        f"{now_str()} [entry-skip] portfolio is at MAX_ACTIVE_TRADES="
+                        f"{self.portfolio.max_active} (held by: {held}) - {self.symbol} keeps "
+                        f"evaluating and learning but will not open until a slot frees up.",
+                        GRAY,
+                    ))
                 return
 
             # 2026-08 dynamic post-loss cool-off (entry gating ONLY -
@@ -5261,6 +5499,21 @@ class MartingaleManager:
         prior_status = self.position.status
         prior_side = self.position.side
         prior_pending_ts = self.position.pending_order_ts
+        # 2026-08-20 multi-coin: claim the portfolio slot HERE - synchronously,
+        # in the same uninterrupted block that flips status to ENTERING, and
+        # before the first await of the submission below. asyncio cannot
+        # interleave another symbol's coroutine between the check and the set,
+        # so two symbols can never both believe the portfolio was empty. A
+        # step-0 entry that cannot claim a slot is abandoned before anything
+        # is placed; DCA adds on an already-held position always succeed
+        # (has_capacity/try_reserve return True for a symbol already holding).
+        if not self.portfolio.try_reserve(self.symbol):
+            print(color(
+                f"{now_str()} [entry-skip] {self.symbol} lost the race for the last "
+                f"portfolio slot (MAX_ACTIVE_TRADES={self.portfolio.max_active}, held by: "
+                f"{', '.join(self.portfolio.holders())}) - no order submitted.", YELLOW,
+            ))
+            return
         self.position.status = "ENTERING" if step == 0 else "DCA_PENDING"
         self.position.side = side_signal
         self.position.pending_order_ts = time.time()
@@ -5313,6 +5566,13 @@ class MartingaleManager:
             self.position.status = prior_status
             self.position.side = prior_side
             self.position.pending_order_ts = prior_pending_ts
+            # 2026-08-20 multi-coin: the reservation taken above must go back
+            # if this was a fresh entry that never made it onto the exchange -
+            # otherwise a rejected order would hold the portfolio's only slot
+            # forever. Reverting to FLAT is the proof nothing is live. A DCA
+            # add reverts to OPEN and legitimately keeps its slot.
+            if prior_status == "FLAT":
+                self.portfolio.release(self.symbol)
             # 2026-08 post-only: nothing is resting on the exchange after a
             # rejected/failed submission, so clear the watchdog tracking too.
             self._post_only_order_id = None

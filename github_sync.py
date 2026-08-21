@@ -97,6 +97,21 @@ class GithubBrainSync:
     in `_last_sha` (keyed by path), since the Contents API requires the
     current sha of THAT file to update it."""
 
+    # 2026-08-20 multi-coin: (repo, branch) -> the one lock every instance
+    # targeting that branch must serialize through. Keyed rather than a
+    # single flat lock so two clients pointed at DIFFERENT branches (as some
+    # tests do) never block each other.
+    _UPLOAD_LOCKS: dict = {}
+
+    @classmethod
+    def _shared_upload_lock(cls, repo: str, branch: str) -> asyncio.Lock:
+        key = (repo, branch)
+        lock = cls._UPLOAD_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            cls._UPLOAD_LOCKS[key] = lock
+        return lock
+
     def __init__(self, token: str, repo: str, path: str, branch: str):
         self.token = token
         self.repo = repo
@@ -122,7 +137,16 @@ class GithubBrainSync:
         # to DIFFERENT files (e.g. brain.pkl + trades_log.csv) on the same
         # branch can still race for that HEAD and 409, even with correct
         # per-file shas. A per-path lock alone can't prevent that.
-        self._upload_lock = asyncio.Lock()
+        #
+        # 2026-08-20 multi-coin: the lock is now shared PER (repo, branch)
+        # across every instance in the process, not per instance. Each
+        # MartingaleManager owns its own GithubBrainSync, so with a
+        # four-symbol watchlist a per-instance lock left four clients free
+        # to PUT concurrently against the same branch HEAD - reintroducing
+        # exactly the 409 storm this lock exists to prevent, only now
+        # between coins instead of between files. The lock's contract is a
+        # property of the BRANCH, so that is what it is keyed on.
+        self._upload_lock = self._shared_upload_lock(repo, branch)
 
     async def start(self) -> None:
         if not self.enabled:

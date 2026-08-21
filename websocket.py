@@ -61,7 +61,7 @@ import sys
 import time
 from collections import deque
 from datetime import datetime, timezone
-from typing import Deque, List, Optional, Sequence, Tuple
+from typing import Deque, Dict, List, Optional, Sequence, Tuple
 
 import aiohttp
 import websockets
@@ -532,22 +532,32 @@ async def market_data_consumer(manager: MartingaleManager) -> None:
     simply carries the extra stream in the same subscription list - with
     aggTrade kept last so the combined URL's existing shape is unchanged
     apart from the added stream."""
-    depth_stream = depth_stream_name(SYMBOL)
+    # 2026-08-20 multi-coin: every stream URL and every log label is derived
+    # from THIS manager's symbol instead of the module-level SYMBOL global.
+    # With one market_data_consumer() scheduled per watchlist symbol, using
+    # the global would have subscribed all four managers to the primary
+    # symbol's feed - four copies of one coin's prices, and no data at all
+    # for the other three.
+    sym = manager.symbol.upper()
+    low = sym.lower()
+    depth_stream = depth_stream_name(sym)
     if USE_TESTNET:
         book_stream = (
-            f"{SYMBOL.lower()}@bookTicker/{depth_stream}/{SYMBOL.lower()}@aggTrade"
+            f"{low}@bookTicker/{depth_stream}/{low}@aggTrade"
         )
         url = f"{WS_MARKET_BASE}/stream?streams={book_stream}"
-        await _run_single_market_stream(manager, url, label="testnet-combined", stream_suffix="both")
+        await _run_single_market_stream(
+            manager, url, label=f"testnet-combined:{sym}", stream_suffix="both"
+        )
         return
 
-    public_url = f"{WS_MARKET_BASE}/public/stream?streams={SYMBOL.lower()}@bookTicker"
+    public_url = f"{WS_MARKET_BASE}/public/stream?streams={low}@bookTicker"
     depth_url = f"{WS_MARKET_BASE}/public/stream?streams={depth_stream}"
-    market_url = f"{WS_MARKET_BASE}/market/stream?streams={SYMBOL.lower()}@aggTrade"
+    market_url = f"{WS_MARKET_BASE}/market/stream?streams={low}@aggTrade"
     await asyncio.gather(
-        _run_single_market_stream(manager, public_url, label="public/bookTicker", stream_suffix="bookTicker"),
-        _run_single_market_stream(manager, depth_url, label="public/depth", stream_suffix="depth"),
-        _run_single_market_stream(manager, market_url, label="market/aggTrade", stream_suffix="aggTrade"),
+        _run_single_market_stream(manager, public_url, label=f"public/bookTicker:{sym}", stream_suffix="bookTicker"),
+        _run_single_market_stream(manager, depth_url, label=f"public/depth:{sym}", stream_suffix="depth"),
+        _run_single_market_stream(manager, market_url, label=f"market/aggTrade:{sym}", stream_suffix="aggTrade"),
     )
 
 
@@ -556,7 +566,83 @@ async def market_data_consumer(manager: MartingaleManager) -> None:
 # ============================================================================
 
 
-async def userdata_consumer(client: RestClient, manager: MartingaleManager) -> None:
+def _event_symbol(event: dict) -> Optional[str]:
+    """2026-08-20 multi-coin: which symbol a user-data event belongs to.
+
+    The user-data stream is ACCOUNT-wide - one listenKey carries the fills
+    of every symbol the account trades. Single-symbol builds could ignore
+    that, because there was only ever one manager to hand an event to. With
+    a watchlist, handing a BTCUSDT fill to the SOLUSDT manager would corrupt
+    that manager's position state and could close or DCA the wrong coin, so
+    every routed event MUST be attributed first.
+
+    Returns the upper-cased symbol, or None when the event carries no symbol
+    (which is treated as "broadcast", never as "guess")."""
+    for container in (event.get("o"), event.get("a"), event):
+        if isinstance(container, dict):
+            sym = container.get("s")
+            if isinstance(sym, str) and sym.strip():
+                return sym.strip().upper()
+    # ALGO_UPDATE nests its payload under a vendor-specific key; scan one
+    # level for any dict carrying a plausible symbol rather than assuming a
+    # single shape (the same tolerance _extract_algo_fields() applies).
+    for value in event.values():
+        if isinstance(value, dict):
+            sym = value.get("s") or value.get("symbol")
+            if isinstance(sym, str) and sym.strip():
+                return sym.strip().upper()
+    return None
+
+
+async def userdata_consumer(
+    client: RestClient,
+    manager: MartingaleManager,
+    managers: Optional[Dict[str, MartingaleManager]] = None,
+) -> None:
+    """2026-08-20 multi-coin: `managers` maps SYMBOL -> manager. When given,
+    exactly ONE account-wide user-data connection is opened for the whole
+    watchlist and each event is routed to the manager that owns its symbol.
+    When omitted the behaviour is byte-for-byte what it was before: every
+    event goes to `manager` with no filtering.
+
+    One connection, not one per symbol: the listenKey is per-ACCOUNT, so
+    four connections would each receive all four symbols' events and each
+    need the same demux anyway - while quadrupling the reconnect churn and
+    the keepalive REST load that this bot has already had to fight."""
+    # _targets: everyone who should see a BROADCAST event (ACCOUNT_UPDATE).
+    # _route(): the single owner of a symbol-attributed event, or None when
+    # the event belongs to a symbol this process does not trade.
+    _registry: Dict[str, MartingaleManager] = (
+        {k.strip().upper(): v for k, v in managers.items()} if managers else {}
+    )
+    _targets = list(_registry.values()) if _registry else [manager]
+    _unrouted_warned: set = set()
+
+    def _route(event: dict) -> Optional[MartingaleManager]:
+        if not _registry:
+            return manager          # single-symbol: unchanged, no filtering
+        sym = _event_symbol(event)
+        if sym is None:
+            # No symbol on the event: attribute it to nobody rather than
+            # guessing. Guessing here would apply one coin's fill to another
+            # coin's position.
+            print(color(
+                f"{now_str()} [user-ws] event carries no symbol - not routed "
+                f"(watchlist: {', '.join(sorted(_registry))})", YELLOW,
+            ))
+            return None
+        target = _registry.get(sym)
+        if target is None and sym not in _unrouted_warned:
+            # A real, legitimate case: the account traded this symbol
+            # manually or from another process. Log once per symbol, then
+            # stay quiet - it is not an error and must not flood the log.
+            _unrouted_warned.add(sym)
+            print(color(
+                f"{now_str()} [user-ws] ignoring event for {sym} - not in this bot's "
+                f"watchlist ({', '.join(sorted(_registry))}). Logged once per symbol.", GRAY,
+            ))
+        return target
+
     backoff = 1.0
     while True:
         # 2026-08 HTTP 418/429 cooldown-survival fix (this check only -
@@ -641,10 +727,13 @@ async def userdata_consumer(client: RestClient, manager: MartingaleManager) -> N
                                 if str(order.get("X", "")).upper() == "FILLED":
                                     print(color(
                                         f"{now_str()} [user-ws] ORDER_TRADE_UPDATE received "
-                                        f"order_id={order.get('i')} status=FILLED",
+                                        f"order_id={order.get('i')} status=FILLED"
+                                        + (f" symbol={_event_symbol(event)}" if managers else ""),
                                         CYAN,
                                     ))
-                                await manager.handle_order_update(event)
+                                target = _route(event)
+                                if target is not None:
+                                    await target.handle_order_update(event)
                             elif etype == "ALGO_UPDATE":
                                 # 2026-08 Algo-Service migration: lifecycle of
                                 # the exchange-native protective stop. One
@@ -652,9 +741,13 @@ async def userdata_consumer(client: RestClient, manager: MartingaleManager) -> N
                                 # no API key), then the same conservative
                                 # handler the REST recovery path uses.
                                 print(color(
-                                    f"{now_str()} [user-ws] ALGO_UPDATE received", CYAN,
+                                    f"{now_str()} [user-ws] ALGO_UPDATE received"
+                                    + (f" symbol={_event_symbol(event)}" if managers else ""),
+                                    CYAN,
                                 ))
-                                await manager.handle_algo_update(event)
+                                target = _route(event)
+                                if target is not None:
+                                    await target.handle_algo_update(event)
                             elif etype == "ACCOUNT_UPDATE":
                                 # 2026-08 HTTP 429 REST rate-limit fix -
                                 # websocket-first state tracking. The balance
@@ -668,13 +761,22 @@ async def userdata_consumer(client: RestClient, manager: MartingaleManager) -> N
                                 # getattr-guarded so any manager stub without
                                 # the new method still gets the original
                                 # inline balance behavior.
-                                on_account_update = getattr(manager, "on_account_update", None)
-                                if callable(on_account_update):
-                                    on_account_update(event)
-                                else:
-                                    for b in event.get("a", {}).get("B", []):
-                                        if b.get("a") == "USDT":
-                                            manager.available_balance = float(b.get("cw") or b.get("wb") or 0)
+                                # ACCOUNT_UPDATE is the one event that is
+                                # BROADCAST rather than routed. Its balance
+                                # array is account-wide (every manager needs
+                                # it), and its position array carries one row
+                                # per symbol - MartingaleManager.on_account_update()
+                                # already skips rows whose "s" is not its own
+                                # symbol, so every manager takes exactly the
+                                # balance plus its own position and nothing else.
+                                for _m in _targets:
+                                    on_account_update = getattr(_m, "on_account_update", None)
+                                    if callable(on_account_update):
+                                        on_account_update(event)
+                                    else:
+                                        for b in event.get("a", {}).get("B", []):
+                                            if b.get("a") == "USDT":
+                                                _m.available_balance = float(b.get("cw") or b.get("wb") or 0)
                         except Exception as e:  # noqa: BLE001 - one bad message must not kill the socket
                             print(color(f"[user-ws] error processing message, skipping: {e}", RED))
                 finally:
