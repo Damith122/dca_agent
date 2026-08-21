@@ -34,3 +34,10 @@ trades_log.csv
 trades_log.jsonl
 performance_stats.csv
 performance_stats.json
+
+# Delivery artifacts built for handoff, not source. The ZIP only repackages
+# files that are already tracked, and the bundle carries this repository's
+# own history - committing either one would nest the repo inside itself and
+# grow the tree on every handoff.
+*.zip
+*.bundle
