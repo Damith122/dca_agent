@@ -5265,7 +5265,9 @@ class MartingaleManager:
                 self.last_confidence, self.last_regime, volume_z, momentum, features,
                 brain_readiness=self.brain.head_readiness(),
                 tp_hit_base_rate=self.brain.tp_hit_base_rate(),
-                tp_hit_samples=self.brain.tp_hit_samples,
+                # the base-rate WINDOW, not the lifetime sample count - the
+                # gate must count the same labels the rate was measured over
+                tp_hit_samples=self.brain.tp_hit_labeled_samples,
                 orderflow=orderflow_now,
                 imbalance_threshold=self.entry_imbalance_threshold(),
                 support_min=self.entry_support_min(),

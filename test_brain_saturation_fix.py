@@ -189,6 +189,7 @@ check("the fixture sits below the |coef| screen",
 legacy = b.to_state()
 legacy["version"] = 3
 legacy.pop("tp_hit_positives", None)
+legacy.pop("tp_hit_labeled_samples", None)   # neither field existed at v3
 mig = brain.BrainV2.from_bytes(
     __import__("pickle").dumps(legacy), brain.N_FEATURES_V2, 50)
 check("a pre-v4 head is rebuilt anyway - it trained under the bad schedule",
@@ -212,7 +213,51 @@ check("...and keeps a real base rate",
       abs(kept4.tp_hit_base_rate() - 134/400) < 0.01,
       f"got {kept4.tp_hit_base_rate():.4f}")
 
-print("\n[7] Older snapshots still load")
+print("\n[7] The base rate is measured over a consistent window")
+# The live regression: a v4 snapshot re-saved by the previous build carried
+# 27.6M lifetime samples but positives counted over only a few hours, giving
+# 2.134e-06 against ~5e-04 on every other symbol - understated ~250x. Keying
+# the migration on the format version missed it, because the snapshot was
+# legitimately version 4.
+legacy4 = brain.BrainV2()
+for i in range(50):
+    legacy4.learn_tp_hit(x, i % 5 == 0)
+st = legacy4.to_state()
+st["tp_hit_samples"] = 27_600_000      # lifetime count from the old format
+st["tp_hit_positives"] = 59            # counted over an unknown, shorter span
+st.pop("tp_hit_labeled_samples", None) # the field that did not exist yet
+check("the fixture is version 4, so a version test would let it through",
+      st["version"] == 4)
+mig4 = brain.BrainV2.from_bytes(
+    __import__("pickle").dumps(st), brain.N_FEATURES_V2, 50)
+check("a v4 snapshot WITHOUT the window field is still rebuilt",
+      mig4.tp_hit_fitted is False)
+check("...the mismatched lifetime count is discarded",
+      mig4.tp_hit_samples == 0)
+check("...and the orphaned positive count with it",
+      mig4.tp_hit_positives == 0 and mig4.tp_hit_labeled_samples == 0)
+check("...so no 250x-understated rate can survive",
+      mig4.tp_hit_base_rate() == 0.0)
+
+# The counters must stay locked together from then on.
+b = brain.BrainV2()
+for i in range(1000):
+    b.learn_tp_hit(x, i % 8 == 0)
+check("labeled_samples tracks every label seen", b.tp_hit_labeled_samples == 1000)
+check("positives is a strict subset", b.tp_hit_positives == 125)
+check("the base rate is positives over the window",
+      abs(b.tp_hit_base_rate() - 0.125) < 1e-9)
+rt = brain.BrainV2.from_bytes(b.to_bytes(), brain.N_FEATURES_V2, 50)
+check("the window survives a round trip",
+      rt.tp_hit_labeled_samples == 1000 and rt.tp_hit_positives == 125)
+check("...preserving the rate exactly",
+      abs(rt.tp_hit_base_rate() - 0.125) < 1e-9)
+b.reset_head("tp_hit")
+check("a reset clears the whole window, not just the weights",
+      b.tp_hit_labeled_samples == 0 and b.tp_hit_positives == 0
+      and b.tp_hit_base_rate() == 0.0)
+
+print("\n[8] Older snapshots still load")
 state = b.to_state()
 check("the format is versioned 4", state["version"] == 4)
 for older in (2, 3):
