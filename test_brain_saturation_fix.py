@@ -97,10 +97,16 @@ new_m, new_p = train(learning_rate="constant", eta0=0.01)
 old_peak = float(np.max(np.abs(old_m.coef_)))
 new_peak = float(np.max(np.abs(new_m.coef_)))
 
-check("the old schedule drives |coef| into the saturated range",
-      old_peak >= brain.SATURATED_COEF_ABS, f"peak={old_peak:.1f}")
-check("the corrected schedule stays far below it",
-      new_peak < brain.SATURATED_COEF_ABS, f"peak={new_peak:.1f}")
+# The screen is deliberately insensitive now (see SATURATED_COEF_ABS): legacy
+# snapshots are caught by the exact missing-field test, so this only has to
+# catch runaway. What matters here is the RATIO between the two schedules.
+check("the old schedule drives |coef| far above the corrected one",
+      old_peak > new_peak * 5, f"old={old_peak:.1f} new={new_peak:.1f}")
+check("a healthy head stays well under the runaway threshold",
+      new_peak < brain.SATURATED_COEF_ABS / 10, f"peak={new_peak:.1f}")
+check("the threshold clears what a healthy head reached live (5.5)",
+      brain.SATURATED_COEF_ABS > 5.5 * 5)
+
 check("the old schedule emits absurd probabilities",
       old_p.min() < 1e-10, f"min={old_p.min():.2e}")
 check("the corrected schedule keeps probabilities in a usable range",
@@ -114,14 +120,14 @@ for i in range(60):
     b.learn_tp_hit(x, i % 5 == 0)
 check("a freshly trained head is not flagged", not b._head_is_saturated("tp_hit"))
 
-b.tp_hit_model.coef_ = b.tp_hit_model.coef_ * 0 + 40.0
-check("a diverged head IS flagged", b._head_is_saturated("tp_hit"))
+b.tp_hit_model.coef_ = b.tp_hit_model.coef_ * 0 + 400.0
+check("a runaway head IS flagged", b._head_is_saturated("tp_hit"))
 
 reset = b.reset_saturated_heads()
 check("reset_saturated_heads reports what it reset",
       [n for n, _ in reset] == ["tp_hit"], f"got {reset}")
 check("...including the peak that condemned it",
-      reset and abs(reset[0][1] - 40.0) < 1e-9)
+      reset and abs(reset[0][1] - 400.0) < 1e-9)
 check("the head is unfitted afterwards", b.tp_hit_fitted is False)
 check("...its sample counter is cleared", b.tp_hit_samples == 0)
 check("...its positive counter is cleared", b.tp_hit_positives == 0)
@@ -130,14 +136,25 @@ check("...and it must earn READY again",
 check("a healthy head is left alone",
       brain.BrainV2().reset_saturated_heads() == [])
 
+# The live regression: a head relearning correctly reached 5.5 in ten minutes
+# and the old 5.0 screen destroyed it on the next restart.
+live = brain.BrainV2()
+for i in range(60):
+    live.learn_tp_hit(x, i % 5 == 0)
+live.tp_hit_model.coef_ = live.tp_hit_model.coef_ * 0 + 5.5
+check("a head at the live 5.5 peak is NOT destroyed",
+      not live._head_is_saturated("tp_hit"))
+check("...so early relearning survives a restart",
+      live.reset_saturated_heads() == [])
+
 
 print("\n[4] A diverged snapshot is repaired on load, not inherited")
 b = brain.BrainV2()
 for i in range(60):
     b.learn_tp_hit(x, i % 5 == 0)
     b.learn_noise(x, i % 3 == 0)
-b.tp_hit_model.coef_ = b.tp_hit_model.coef_ * 0 + 40.0
-b.noise_model.coef_ = b.noise_model.coef_ * 0 + 60.0
+b.tp_hit_model.coef_ = b.tp_hit_model.coef_ * 0 + 400.0
+b.noise_model.coef_ = b.noise_model.coef_ * 0 + 600.0
 blob = b.to_bytes()
 
 restored = brain.BrainV2.from_bytes(blob, brain.N_FEATURES_V2, 50)

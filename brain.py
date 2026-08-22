@@ -272,10 +272,26 @@ _CLASSIFIER_KW = dict(
     learning_rate="constant", eta0=0.01, warm_start=True,
 )
 
-# A healthy head of this shape keeps |coef| well under 1. A diverged one runs
-# to double digits and beyond. 5.0 sits far above the former and far below the
-# latter, so it separates the two without catching a merely opinionated model.
-SATURATED_COEF_ABS = 5.0
+# 2026-08-22, revised against live data. The first value (5.0) was calibrated
+# on synthetic features, where a healthy head settled near |coef| 0.6 and a
+# diverged one ran to 14+. Real market features are far less well-behaved: a
+# head rebuilt at 05:17 and relearning correctly under the corrected schedule
+# reached 5.5 within ten minutes, and was destroyed by its own screen on the
+# next restart - while emitting a perfectly healthy spread of probabilities
+# (0.0001 / 0.5852 / 0.9006 across symbols, not the pinned extremes that
+# define divergence).
+#
+# Left at 5.0 this becomes self-defeating: any restart during early relearning
+# wipes the head, so it can never accumulate enough samples to become
+# reliable.
+#
+# The screen no longer needs to be sensitive. Every snapshot predating the
+# fix is now caught definitively by the missing base-rate-window field, which
+# is an exact test rather than a heuristic. All this threshold has to catch is
+# NEW runaway under the corrected schedule, so it is set well clear of what a
+# healthy head reaches. Observed diverged peaks under the old schedule ran to
+# 52, 111, 133 and 387, so genuine divergence remains comfortably visible.
+SATURATED_COEF_ABS = 100.0
 
 
 class RunningNormalizer:
