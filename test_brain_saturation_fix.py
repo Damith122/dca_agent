@@ -174,7 +174,45 @@ check("the positive count survives a save/load round trip",
 check("...so the base rate does too",
       abs(rt.tp_hit_base_rate() - 0.25) < 1e-9)
 
-print("\n[6] Older snapshots still load")
+print("\n[6] A pre-v4 snapshot is rebuilt even when |coef| looks fine")
+# Found in live data: ETH's tp_hit head escaped the |coef| screen (it had
+# drifted less far than the others), so it kept 27.6M restored samples while
+# tp_hit_positives - absent from the older format - defaulted to 0. Base rate
+# is positives/samples, so mixing the two windows pinned it at exactly 0.0,
+# which silently disabled the veto for that symbol with no way to recover.
+b = brain.BrainV2()
+for i in range(400):
+    b.learn_tp_hit(x, i % 3 == 0)
+b.tp_hit_model.coef_ = b.tp_hit_model.coef_ * 0 + 2.0     # under SATURATED_COEF_ABS
+check("the fixture sits below the |coef| screen",
+      not b._head_is_saturated("tp_hit"))
+legacy = b.to_state()
+legacy["version"] = 3
+legacy.pop("tp_hit_positives", None)
+mig = brain.BrainV2.from_bytes(
+    __import__("pickle").dumps(legacy), brain.N_FEATURES_V2, 50)
+check("a pre-v4 head is rebuilt anyway - it trained under the bad schedule",
+      mig.tp_hit_fitted is False)
+check("...its sample counter restarts with it", mig.tp_hit_samples == 0)
+check("...so samples and positives share one window",
+      mig.tp_hit_samples == 0 and mig.tp_hit_positives == 0)
+check("...and the base rate is not pinned at a false zero over 400 samples",
+      mig.tp_hit_base_rate() == 0.0 and mig.tp_hit_samples == 0)
+check("noise and success are rebuilt on the same grounds",
+      mig.noise_fitted is False and mig.success_fitted is False)
+
+# A version-4 snapshot is already on the corrected schedule and must survive.
+healthy4 = brain.BrainV2()
+for i in range(400):
+    healthy4.learn_tp_hit(x, i % 3 == 0)
+kept4 = brain.BrainV2.from_bytes(healthy4.to_bytes(), brain.N_FEATURES_V2, 50)
+check("a version-4 snapshot is NOT rebuilt",
+      kept4.tp_hit_fitted is True and kept4.tp_hit_samples == 400)
+check("...and keeps a real base rate",
+      abs(kept4.tp_hit_base_rate() - 134/400) < 0.01,
+      f"got {kept4.tp_hit_base_rate():.4f}")
+
+print("\n[7] Older snapshots still load")
 state = b.to_state()
 check("the format is versioned 4", state["version"] == 4)
 for older in (2, 3):

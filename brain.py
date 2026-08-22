@@ -721,6 +721,35 @@ class BrainV2:
                 ))
                 return brain
             brain.load_state(state)
+            # 2026-08-21 (second pass, from live data): ANY snapshot written
+            # before version 4 had its classifier heads trained under the
+            # divergent "optimal" schedule, so none of their weights can be
+            # trusted - regardless of where |coef| happens to sit right now.
+            # A head that drifted only as far as 4.9 is not healthy, it is
+            # merely less far gone, and the |coef| screen below would wave it
+            # through.
+            #
+            # It also fixes a counter-window bug that screen created. A head
+            # that escaped the reset kept its restored tp_hit_samples (27.6M
+            # on the live ETH brain) while tp_hit_positives, absent from the
+            # older format, defaulted to 0. Base rate is positives/samples,
+            # so measuring the two over different windows pinned it at
+            # exactly 0.0 and silently disabled the veto for that symbol -
+            # and it could not recover, since new positives would be diluted
+            # by 27.6M historical samples that were never counted.
+            #
+            # Resetting all three together puts weights and both counters on
+            # one consistent window.
+            if state.get("version", 0) < 4:
+                for head_name in brain._CLASSIFIER_HEADS:
+                    brain.reset_head(head_name)
+                print(color(
+                    f"[brain] version-{state.get('version')} snapshot: rebuilt the "
+                    f"noise/success/tp_hit heads. They were trained under the old "
+                    f"divergent learning rate, and their sample counters predate "
+                    f"positive-label tracking, so both the weights and the base "
+                    f"rate restart from a clean window.", YELLOW,
+                ))
             # 2026-08-21: a snapshot written under the old "optimal" learning
             # rate carries diverged classifier weights. Correcting the
             # schedule does not repair them, so any head still saturated is
