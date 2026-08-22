@@ -53,11 +53,20 @@ class Capture:
 
 def clean_live_like_conf(side="SHORT"):
     # Mirrors the clean Live entry snapshot closely enough to recreate the
-    # old failure: moderate composite confidence, saturated trend direction,
-    # low risk, and enough volume/momentum for the old abs(momentum) score to
-    # cross the 0.60 SIDEWAYS threshold.
+    # old failure: saturated trend direction, low risk, and enough
+    # volume/momentum for the old abs(momentum) score to cross the SIDEWAYS
+    # threshold.
+    #
+    # 2026-08-22: confidence_score raised 0.34 -> 0.58 when
+    # SIDEWAYS_ENTRY_SCORE_THRESHOLD moved to 0.68. This is a PRECONDITION of
+    # the tests below ("this setup was strong enough to be eligible at all"),
+    # not their subject - the subject is the counter-momentum guard. 0.58 is
+    # not invented: it is the brain_confidence of the strongest SIDEWAYS entry
+    # actually accepted live (06:31:59, composite 0.7074), so the fixture still
+    # represents a real, reachable setup rather than a synthetic one tuned to
+    # pass.
     return trading.ConfidenceReading(
-        confidence_score=0.34,
+        confidence_score=0.58,
         trend_confidence=1.0,
         trend_direction=side,
         success_probability=1.0,

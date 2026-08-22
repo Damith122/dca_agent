@@ -671,23 +671,62 @@ def test_recalibrated_gates_reject_the_losing_streak():
             f"floor - this is the gate that let all three dead-tape trades through"
         )
 
-    # The raised score bar is the SECONDARY filter: at 0.63 it rejects the two
-    # marginal entries (0.6021, 0.6093) while still allowing the strongest one
-    # (0.6251). That is deliberate - the SIDEWAYS composite is structurally
-    # capped at 0.6358 (volatility_fit 0.40, regime_fit 0.50), so a bar above
-    # that would disable SIDEWAYS trading rather than filter it. The ATR floor
-    # above is what actually blocks all three.
+    # The raised score bar is the SECONDARY filter; the ATR floor above is what
+    # actually blocks all three of these.
+    #
+    # 2026-08-22 CORRECTION. This previously asserted the threshold stay <=
+    # 0.6358, described as the regime's "structural maximum composite score".
+    # That figure was wrong. It assumed brain_confidence sat at its typical
+    # ~0.25; it is a scored component, not a constant. The real ceiling, with
+    # SIDEWAYS's genuine caps (volatility_fit 0.40, regime_fit 0.50) and every
+    # other term at its maximum, is:
+    #
+    #     0.3(bc) + 0.2(trend) + 0.12(vol) + 0.1*0.40 + 0.13(mom) + 0.1*0.50
+    #       - 0.05*risk   ->   0.84 at bc = 1.0
+    #
+    # Live data settles it: a SIDEWAYS entry was accepted at composite 0.7074
+    # on 2026-08-22 06:31:59 (brain_confidence 0.5828), well above the
+    # "structural maximum" this assertion claimed was unreachable. Recomputing
+    # the formula with that snapshot's components reproduces 0.7078, confirming
+    # the ceiling is 0.84 and not 0.6358.
+    #
+    # The invariant worth keeping is the real one - the bar must filter, not
+    # act as an off-switch - so it is now checked against the true ceiling and
+    # against a score observed live.
     blocked_by_score = sum(1 for _, _, sc in streak if sc < config.SIDEWAYS_ENTRY_SCORE_THRESHOLD)
     print(f"TEST 10: {blocked_by_score}/3 also blocked by the raised SIDEWAYS score bar")
     assert blocked_by_score >= 2, "the two marginal entries must fail the raised bar"
-    assert config.SIDEWAYS_ENTRY_SCORE_THRESHOLD <= 0.6358, (
-        "the SIDEWAYS threshold must stay at or below the regime's structural "
-        "maximum composite score (0.6358) - above it, no SIDEWAYS entry can ever "
-        "qualify and the bar becomes an off-switch instead of a filter"
+
+    weights = trading.ENTRY_WEIGHTS
+    sideways_caps = {"volatility_fit": 0.40, "regime_fit": 0.50}
+    structural_max = sum(
+        w * sideways_caps.get(k, 1.0)
+        for k, w in weights.items()
+        if k != "risk_score"
+    )
+    assert abs(structural_max - 0.84) < 1e-9, (
+        f"SIDEWAYS structural ceiling recomputed as {structural_max:.4f}; the "
+        f"assertion below is calibrated against 0.84"
+    )
+    assert config.SIDEWAYS_ENTRY_SCORE_THRESHOLD < structural_max, (
+        f"the SIDEWAYS threshold ({config.SIDEWAYS_ENTRY_SCORE_THRESHOLD}) must stay "
+        f"below the regime's structural maximum composite score "
+        f"({structural_max:.4f}) - at or above it the bar becomes an off-switch "
+        f"instead of a filter"
+    )
+    LIVE_OBSERVED_SIDEWAYS_MAX = 0.7074   # 2026-08-22 06:31:59, accepted
+    assert config.SIDEWAYS_ENTRY_SCORE_THRESHOLD <= LIVE_OBSERVED_SIDEWAYS_MAX, (
+        f"the threshold ({config.SIDEWAYS_ENTRY_SCORE_THRESHOLD}) is above the best "
+        f"SIDEWAYS score actually observed live ({LIVE_OBSERVED_SIDEWAYS_MAX}) - "
+        f"theoretically reachable is not the same as reachable in this market, and "
+        f"above this line SIDEWAYS trading stops in practice"
     )
 
     # A healthy setup - real volatility and a strong score - still passes both.
-    healthy_atr, healthy_score = 0.0015, 0.6358
+    # Raised with the threshold: 0.6358 was the old (incorrect) ceiling. 0.7074
+    # is the strongest SIDEWAYS composite actually accepted live, so a "healthy
+    # setup" fixture stays grounded in something the market really produced.
+    healthy_atr, healthy_score = 0.0015, 0.7074
     assert not (
         config.LOW_VOLATILITY_FILTER_ENABLED
         and healthy_atr > 0
