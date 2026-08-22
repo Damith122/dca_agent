@@ -58,7 +58,11 @@ SCALED = [
 LIVE_AT_4 = {
     "MAX_STOP_LOSS_USD": 0.90, "MAX_TRADE_NET_LOSS_USDT": 0.90,
     "MAX_TRADE_EXIT_BUFFER_USDT": 0.10, "TARGET_PROFIT_USD": 0.90,
-    "MIN_TARGET_PROFIT_USD": 0.35, "PROFIT_LOCK_ACTIVATION_USDT": 0.10,
+    "MIN_TARGET_PROFIT_USD": 0.35,
+    # PROFIT_LOCK_ACTIVATION_USDT deliberately omitted - see below. It was 0.10
+    # here, but 2026-08-22 re-derived it from the take-profit target rather
+    # than from a standalone fraction of notional, so it no longer reproduces
+    # the pre-refactor figure. That is the intended change, not a regression.
     "MIN_NET_PROFIT_USDT": 0.05, "SL_MIN_USD": 0.12,
     "MAX_DAILY_LOSS_USDT": 1.00, "DAILY_PROFIT_TARGET_USDT": 1.00,
     "SMART_ORDERFLOW_EXIT_MIN_LOSS_USD": 0.10,
@@ -209,3 +213,52 @@ if FAIL:
         print(f"    FAILED: {f}")
 print("=" * 74)
 sys.exit(1 if FAIL else 0)
+
+
+# ===========================================================================
+# PROFIT_LOCK_ACTIVATION_USDT: derived from the TP target, not from notional
+# ===========================================================================
+# 2026-08-22. Every other threshold above is a fixed fraction of entry
+# notional. This one is not, deliberately: it is a fraction of the NET
+# take-profit target, so that raising or lowering TAKE_PROFIT_PCT moves the
+# lock with it instead of leaving winners capped at an unrelated dollar figure.
+#
+# The old value armed the lock at 45% of net TP. With PROFIT_LOCK_RATIO = 0.50
+# that closed winners at roughly half of that - live, both winners in the
+# 2026-08-22 06:00-08:30 window exited via profit_lock at net +$0.0262 and
+# +$0.0270, about 39% of target. Break-even win rate with winners capped there
+# is 74%, which is unreachable; letting them run to target puts it at 39%.
+print("\n[profit lock activation is TP-relative]")
+
+for entry, expect_ratio in ((2.0, 0.65), (4.0, 0.65), (8.0, 0.65)):
+    cfg = load_config(entry)
+    net_tp = cfg.NET_TAKE_PROFIT_PCT * cfg.ENTRY_NOTIONAL_USDT
+    got = cfg.PROFIT_LOCK_ACTIVATION_USDT / net_tp
+    check(f"at ${entry:g} entry the lock arms at {expect_ratio:.0%} of net TP",
+          abs(got - expect_ratio) < 1e-9, f"got {got:.4f}")
+
+cfg = load_config(2.0)
+check("net TP subtracts the measured round-trip fee",
+      abs(cfg.NET_TAKE_PROFIT_PCT
+          - (cfg.TAKE_PROFIT_PCT - cfg.ROUND_TRIP_FEE_PCT_EST)) < 1e-12)
+check("the lock arms above the minimum-net-profit floor",
+      cfg.PROFIT_LOCK_ACTIVATION_USDT > cfg.MIN_NET_PROFIT_USDT,
+      f"{cfg.PROFIT_LOCK_ACTIVATION_USDT} vs {cfg.MIN_NET_PROFIT_USDT}")
+check("...and below the net TP target it is a fraction of",
+      cfg.PROFIT_LOCK_ACTIVATION_USDT
+      < cfg.NET_TAKE_PROFIT_PCT * cfg.ENTRY_NOTIONAL_USDT)
+check("it still scales linearly with entry size",
+      abs(load_config(4.0).PROFIT_LOCK_ACTIVATION_USDT
+          - 2 * load_config(2.0).PROFIT_LOCK_ACTIVATION_USDT) < 1e-9)
+
+# Raising the TP must carry the lock with it - the whole point of the change.
+hi = load_config(2.0, {"TAKE_PROFIT_PCT": "0.0070"})
+lo = load_config(2.0)
+check("doubling TAKE_PROFIT_PCT raises the activation threshold too",
+      hi.PROFIT_LOCK_ACTIVATION_USDT > lo.PROFIT_LOCK_ACTIVATION_USDT * 1.5,
+      f"{lo.PROFIT_LOCK_ACTIVATION_USDT:.4f} -> {hi.PROFIT_LOCK_ACTIVATION_USDT:.4f}")
+
+# An explicit env var still wins, as for every other scaled threshold.
+ov = load_config(2.0, {"PROFIT_LOCK_ACTIVATION_USDT": "0.25"})
+check("an explicit env override still takes precedence",
+      abs(ov.PROFIT_LOCK_ACTIVATION_USDT - 0.25) < 1e-9)

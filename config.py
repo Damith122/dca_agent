@@ -589,10 +589,57 @@ ADAPTIVE_TP_MAX_RATIO = _env_float("ADAPTIVE_TP_MAX_RATIO", 1.0)
 # ROLLING_RETURN_WINDOWS[0]=5 candles) against this threshold instead.
 ENTRY_MOMENTUM_SATURATION_PCT = _env_float("ENTRY_MOMENTUM_SATURATION_PCT", 0.0015)
 
-# --- Profit Lock (env-configurable - 2026-08 Railway-tuning fix; values and
-# behavior are UNCHANGED, only made overridable without a code edit) --------
-# 0.125% of notional -> $0.10 at $80. Arms the lock.
-PROFIT_LOCK_ACTIVATION_USDT = _notional_scaled("PROFIT_LOCK_ACTIVATION_USDT", 0.00125)
+# --- Profit Lock -------------------------------------------------------------
+#
+# 2026-08-22: the activation threshold is now derived from the take-profit
+# target instead of being an independent fixed fraction of notional.
+#
+# WHY. The old value (0.00125 of notional, $0.05 at a $40 entry) armed the
+# lock at 45% of the net TP target. With PROFIT_LOCK_RATIO = 0.50 the lock
+# then closes on a retrace to half the peak, so a position that armed at $0.05
+# net was exiting near $0.025 - and that is exactly what the live trades did:
+# both winners in the 2026-08-22 06:00-08:30 window closed via profit_lock at
+# net +$0.0262 and +$0.0270, roughly 39% of the take-profit target.
+#
+# That capping is not a small inefficiency, it is decisive. Measured over
+# those six trades:
+#
+#     avg win (gross) +0.0541    avg loss (gross) -0.0417    win rate 33%
+#     break-even win rate with winners capped at 0.0541 :  74%
+#     break-even win rate with winners reaching  0.1400 :  39%
+#
+# A 74% win rate is unreachable, so while the lock arms this early the system
+# cannot be profitable no matter how good entries get.
+#
+# HOW. The threshold is expressed as a fraction of the NET take-profit target
+# - net because unrealized_pnl_usdt, the value it is compared against, is
+# already fee-adjusted. Deriving it from TAKE_PROFIT_PCT keeps the two in step:
+# change the TP and the lock follows, instead of silently reverting to capping
+# winners at some unrelated dollar figure.
+#
+# Still routed through _notional_scaled so it stays in the startup risk-scaling
+# report and remains overridable by an explicit env var.
+
+# Measured round-trip cost over 13 live trades: 0.0732% of notional (a maker
+# entry at 0.02% plus a taker exit at 0.05% lands in the same place). A literal
+# rather than a reference to TAKER_FEE_RATE, which config.py does not define
+# until further down - a forward reference here would be a NameError at import.
+ROUND_TRIP_FEE_PCT_EST = 0.000732
+
+# What the position must actually net to have "reached target".
+NET_TAKE_PROFIT_PCT = max(0.0, TAKE_PROFIT_PCT - ROUND_TRIP_FEE_PCT_EST)
+
+# 0.65 -> the lock arms once a position has banked ~two thirds of the net TP
+# target, so a winner has room to run to target instead of being closed at the
+# first retrace off a barely-positive peak.
+PROFIT_LOCK_ACTIVATION_TP_FRACTION = _env_float(
+    "PROFIT_LOCK_ACTIVATION_TP_FRACTION", 0.65
+)
+
+PROFIT_LOCK_ACTIVATION_USDT = _notional_scaled(
+    "PROFIT_LOCK_ACTIVATION_USDT",
+    PROFIT_LOCK_ACTIVATION_TP_FRACTION * NET_TAKE_PROFIT_PCT,
+)
 PROFIT_LOCK_RATIO = _env_float("PROFIT_LOCK_RATIO", 0.50)
 
 # --- 2026-08-19 Profit Lock / risk-geometry hardening (P1-P6) -----------------
@@ -987,7 +1034,13 @@ ENTRY_SCORE_THRESHOLD = _env_float("ENTRY_SCORE_THRESHOLD", 0.75)  # raised from
 # three losing trades on its own and is the principled gate here; this
 # threshold is the secondary filter. Set SIDEWAYS_ENTRY_SCORE_THRESHOLD=0.65
 # in the environment if you deliberately want SIDEWAYS entries off entirely.
-SIDEWAYS_ENTRY_SCORE_THRESHOLD = _env_float("SIDEWAYS_ENTRY_SCORE_THRESHOLD", 0.63)  # SIDEWAYS is structurally capped lower (volatility_fit/regime_fit/momentum), all other regimes unchanged at 0.75
+# 2026-08-22: raised 0.63 -> 0.68. Six of the seven entries accepted in the
+# 06:00-08:30 window were SIDEWAYS, scoring 0.6301, 0.6303, 0.6305, 0.6349,
+# 0.6399 and 0.6409 - five of them within 0.011 of the old threshold. The bot
+# was trading almost exclusively setups that barely cleared the bar, and every
+# one of them costs a guaranteed 0.0732% round trip. 0.68 removes that cluster
+# while leaving genuine SIDEWAYS signals (the 0.7074 entry) intact.
+SIDEWAYS_ENTRY_SCORE_THRESHOLD = _env_float("SIDEWAYS_ENTRY_SCORE_THRESHOLD", 0.68)  # SIDEWAYS is structurally capped lower (volatility_fit/regime_fit/momentum), all other regimes unchanged at 0.75
 # Clean Live entry evidence exposed a directional scoring hole: the entry
 # engine rewarded abs(momentum), so a strong upward move boosted a proposed
 # SHORT exactly like a LONG. In SIDEWAYS, block a meaningful counter move
@@ -1420,6 +1473,9 @@ __all__ = [
     "ENTRY_MOMENTUM_SATURATION_PCT",
     "PROFIT_LOCK_ACTIVATION_USDT",
     "PROFIT_LOCK_RATIO",
+    "PROFIT_LOCK_ACTIVATION_TP_FRACTION",
+    "NET_TAKE_PROFIT_PCT",
+    "ROUND_TRIP_FEE_PCT_EST",
     "PROFIT_LOCK_MIN_AGE_SEC",
     "PROFIT_LOCK_SLIPPAGE_ATR_MULT",
     "ATR_RISK_SCALING_ENABLED",
