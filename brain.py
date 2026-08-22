@@ -413,8 +413,15 @@ class BrainV2:
         self.noise_samples = 0
         self.success_samples = 0
         self.tp_hit_samples = 0
-        # positive-label count, for the base rate the veto threshold scales to
+        # Base-rate window (2026-08-22). positives/labeled_samples must be
+        # measured over the SAME span of labels or the ratio is meaningless,
+        # so they are incremented together and persisted together. This is
+        # deliberately NOT tp_hit_samples: that counter predates positive
+        # tracking, and reusing it mixed 27.6M historical samples with only
+        # the positives seen since - understating the live ETH base rate by
+        # ~250x (2.1e-06 against ~5e-04 on every other symbol).
         self.tp_hit_positives = 0
+        self.tp_hit_labeled_samples = 0
         self._noise_classes_seen: set = set()
         self._success_classes_seen: set = set()
         self._tp_hit_classes_seen: set = set()
@@ -553,6 +560,7 @@ class BrainV2:
         self.tp_hit_model.partial_fit(xn, [1 if tp_was_hit else 0], classes=classes)
         self.tp_hit_fitted = True
         self.tp_hit_samples += 1
+        self.tp_hit_labeled_samples += 1
         if tp_was_hit:
             self.tp_hit_positives += 1
         self._tp_hit_classes_seen.add(1 if tp_was_hit else 0)
@@ -605,6 +613,7 @@ class BrainV2:
         setattr(self, f"_{name}_classes_seen", set())
         if name == "tp_hit":
             self.tp_hit_positives = 0
+            self.tp_hit_labeled_samples = 0
 
     def reset_saturated_heads(self) -> list:
         """Reset every classifier head whose weights diverged. Returns the
@@ -625,9 +634,9 @@ class BrainV2:
         a healthy model tops out near a few percent. Any threshold applied to
         that probability has to be expressed relative to this rate; a fixed
         absolute floor would reject every prediction the head can produce."""
-        if self.tp_hit_samples <= 0:
+        if self.tp_hit_labeled_samples <= 0:
             return 0.0
-        return self.tp_hit_positives / float(self.tp_hit_samples)
+        return self.tp_hit_positives / float(self.tp_hit_labeled_samples)
 
     def to_state(self) -> dict:
         return {
@@ -655,6 +664,7 @@ class BrainV2:
             "success_samples": self.success_samples,
             "tp_hit_samples": self.tp_hit_samples,
             "tp_hit_positives": self.tp_hit_positives,
+            "tp_hit_labeled_samples": self.tp_hit_labeled_samples,
             "noise_classes_seen": sorted(self._noise_classes_seen),
             "success_classes_seen": sorted(self._success_classes_seen),
             "tp_hit_classes_seen": sorted(self._tp_hit_classes_seen),
@@ -689,6 +699,7 @@ class BrainV2:
         self.success_samples = int(state.get("success_samples", 0))
         self.tp_hit_samples = int(state.get("tp_hit_samples", 0))
         self.tp_hit_positives = int(state.get("tp_hit_positives", 0))
+        self.tp_hit_labeled_samples = int(state.get("tp_hit_labeled_samples", 0))
         self._noise_classes_seen = set(state.get("noise_classes_seen", []))
         self._success_classes_seen = set(state.get("success_classes_seen", []))
         self._tp_hit_classes_seen = set(state.get("tp_hit_classes_seen", []))
@@ -740,15 +751,30 @@ class BrainV2:
             #
             # Resetting all three together puts weights and both counters on
             # one consistent window.
-            if state.get("version", 0) < 4:
+            # Keyed on the STATE, not the format version. The first attempt
+            # tested `version < 4` and missed the case that actually mattered:
+            # a snapshot re-saved by the previous build is legitimately
+            # version 4, yet still carries counters measured over mismatched
+            # windows. The presence of the base-rate window field is the
+            # honest signal - a snapshot without it has positives counted over
+            # an unknown span, so the ratio cannot be trusted whatever the
+            # version says.
+            #
+            # The tp_hit weights go with it. A head from before that field
+            # existed trained at least partly under the divergent schedule,
+            # and the |coef| screen cannot tell "healthy" from "drifted only a
+            # little" - the live ETH head sat under the threshold twice while
+            # reporting probabilities an order of magnitude below its peers.
+            # For an input to a safety veto, rebuilding is the honest default.
+            if "tp_hit_labeled_samples" not in state:
                 for head_name in brain._CLASSIFIER_HEADS:
                     brain.reset_head(head_name)
                 print(color(
-                    f"[brain] version-{state.get('version')} snapshot: rebuilt the "
-                    f"noise/success/tp_hit heads. They were trained under the old "
-                    f"divergent learning rate, and their sample counters predate "
-                    f"positive-label tracking, so both the weights and the base "
-                    f"rate restart from a clean window.", YELLOW,
+                    f"[brain] snapshot (version {state.get('version')}) predates "
+                    f"base-rate window tracking: rebuilt the noise/success/tp_hit "
+                    f"heads. Their positive counts were measured over an unknown "
+                    f"span of labels, so weights and both counters restart "
+                    f"together on one consistent window.", YELLOW,
                 ))
             # 2026-08-21: a snapshot written under the old "optimal" learning
             # rate carries diverged classifier weights. Correcting the
