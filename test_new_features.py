@@ -164,13 +164,45 @@ async def test_low_volatility_filter_blocks_dead_market_entry():
     assert decision.should_enter is False, "dead market must be blocked regardless of score"
     print(f"PASS: dead market blocked, score={decision.score:.4f}")
 
+    # 2026-08-23: SIDEWAYS entries are now disabled outright (see config.py -
+    # 0W/6L with average MFE 0.020%), so should_enter is False for SIDEWAYS
+    # whatever the ATR. The subject of THIS test is the dead-market filter, so
+    # it is now asserted on its own component rather than through
+    # should_enter, which the regime off-switch would otherwise dominate and
+    # make the assertion vacuous.
     normal_regime = trading.RegimeReading(
         regime=trading.REGIME_SIDEWAYS,
         atr_pct=trading.LOW_VOLATILITY_ATR_PCT_THRESHOLD * 3.0,  # comfortably above the floor
     )
     decision2 = engine.evaluate(conf, normal_regime, volume_z=1.0, momentum=0.001, features=[0.0] * 34)
-    assert decision2.should_enter is True, "normal ranging market must NOT be blocked by the dead-market filter"
-    print(f"PASS: normal ranging SIDEWAYS market still allowed, score={decision2.score:.4f}")
+    # dead_market_blocked is a local folded into regime_blocked, so it is
+    # observable through rejection_reason rather than components.
+    assert decision.components.get("rejection_reason") == "dead_market_blocked", (
+        f"the low-ATR tape must be rejected BY the dead-market filter, got "
+        f"{decision.components.get('rejection_reason')!r}"
+    )
+    assert decision2.components.get("rejection_reason") != "dead_market_blocked", (
+        "a normal-volatility tape must NOT trip the dead-market filter - it is "
+        "now rejected by the SIDEWAYS off-switch instead, which is a different "
+        "gate and must not be confused for this one"
+    )
+    print(f"PASS: dead-market filter clears a normal-volatility tape, score={decision2.score:.4f}")
+
+    # And end-to-end, in a regime that is still tradable, a healthy setup above
+    # the floor really does enter - so the filter is not silently rejecting
+    # everything downstream.
+    trending = trading.RegimeReading(
+        regime=trading.REGIME_STRONG_TREND,
+        atr_pct=trading.LOW_VOLATILITY_ATR_PCT_THRESHOLD * 3.0,
+    )
+    # volume_z=2.0 so volume_confirmation saturates - this case is about the
+    # ATR floor not blocking, so the other components are given clean values.
+    decision3 = engine.evaluate(conf, trending, volume_z=2.0, momentum=0.004, features=[0.0] * 34)
+    assert decision3.components.get("rejection_reason") != "dead_market_blocked"
+    assert decision3.should_enter is True, (
+        "a healthy above-floor setup in a tradable regime must still enter"
+    )
+    print(f"PASS: trending market above the floor still enters, score={decision3.score:.4f}")
 
 
 # ----------------------------------------------------------------------------

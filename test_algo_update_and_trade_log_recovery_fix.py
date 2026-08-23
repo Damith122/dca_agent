@@ -708,31 +708,57 @@ def test_recalibrated_gates_reject_the_losing_streak():
         f"SIDEWAYS structural ceiling recomputed as {structural_max:.4f}; the "
         f"assertion below is calibrated against 0.84"
     )
-    assert config.SIDEWAYS_ENTRY_SCORE_THRESHOLD < structural_max, (
-        f"the SIDEWAYS threshold ({config.SIDEWAYS_ENTRY_SCORE_THRESHOLD}) must stay "
-        f"below the regime's structural maximum composite score "
-        f"({structural_max:.4f}) - at or above it the bar becomes an off-switch "
-        f"instead of a filter"
+    # 2026-08-23: this assertion is INVERTED on purpose. It previously required
+    # the threshold to stay below the structural maximum, on the reasoning that
+    # an unreachable bar is an off-switch rather than a filter. That reasoning
+    # was right; the conclusion is now the intended one.
+    #
+    # 18h18m of MFE data showed SIDEWAYS entries are not merely low-quality,
+    # they have no edge to filter for: 0W/6L, average MFE 0.020%, five of six
+    # never moving beyond 0.02% in our favour and three never ticking our way
+    # at all. Raising the bar 0.63 -> 0.68 only moved the marginal cluster
+    # (losses then scored 0.6819-0.6982, barely clearing the new bar exactly as
+    # the old ones barely cleared 0.63), because a threshold selects rank, not
+    # quality.
+    #
+    # So the bar is now deliberately unreachable, and the test's job flips from
+    # "prove this is not an off-switch" to "prove it IS one, and cleanly".
+    assert config.SIDEWAYS_ENTRY_SCORE_THRESHOLD > structural_max, (
+        f"SIDEWAYS is meant to be DISABLED: the threshold "
+        f"({config.SIDEWAYS_ENTRY_SCORE_THRESHOLD}) must sit above the regime's "
+        f"structural maximum composite score ({structural_max:.4f}), otherwise "
+        f"some SIDEWAYS setup can still qualify and the off-switch leaks"
     )
+    # Every score this regime actually produced live must be excluded, not just
+    # the theoretical ceiling.
     LIVE_OBSERVED_SIDEWAYS_MAX = 0.7074   # 2026-08-22 06:31:59, accepted
-    assert config.SIDEWAYS_ENTRY_SCORE_THRESHOLD <= LIVE_OBSERVED_SIDEWAYS_MAX, (
-        f"the threshold ({config.SIDEWAYS_ENTRY_SCORE_THRESHOLD}) is above the best "
-        f"SIDEWAYS score actually observed live ({LIVE_OBSERVED_SIDEWAYS_MAX}) - "
-        f"theoretically reachable is not the same as reachable in this market, and "
-        f"above this line SIDEWAYS trading stops in practice"
+    assert config.SIDEWAYS_ENTRY_SCORE_THRESHOLD > LIVE_OBSERVED_SIDEWAYS_MAX, (
+        f"the threshold ({config.SIDEWAYS_ENTRY_SCORE_THRESHOLD}) must exclude the "
+        f"best SIDEWAYS score observed live ({LIVE_OBSERVED_SIDEWAYS_MAX})"
+    )
+    # Other regimes must be untouched - this is a SIDEWAYS off-switch, not a
+    # global one. Disabling all trading would "fix" the losses trivially.
+    assert config.ENTRY_SCORE_THRESHOLD < structural_max, (
+        f"trending regimes must remain tradable: ENTRY_SCORE_THRESHOLD "
+        f"({config.ENTRY_SCORE_THRESHOLD}) is at or above the composite ceiling"
+    )
+    assert config.ENTRY_SCORE_THRESHOLD == 0.75, (
+        "the non-SIDEWAYS threshold must stay at 0.75 - trending regimes were "
+        "profitable (3W/1L, net +0.1602) and are not what this change targets"
     )
 
     # A healthy setup - real volatility and a strong score - still passes both.
-    # Raised with the threshold: 0.6358 was the old (incorrect) ceiling. 0.7074
-    # is the strongest SIDEWAYS composite actually accepted live, so a "healthy
-    # setup" fixture stays grounded in something the market really produced.
-    healthy_atr, healthy_score = 0.0015, 0.7074
+    # 2026-08-23: with SIDEWAYS disabled, "a healthy setup still passes" can no
+    # longer be demonstrated through the SIDEWAYS bar. The ATR floor is what
+    # this section is really testing, so the score is checked against the
+    # threshold that now governs a tradable regime instead.
+    healthy_atr, healthy_score = 0.0015, 0.7846   # best live trending entry
     assert not (
         config.LOW_VOLATILITY_FILTER_ENABLED
         and healthy_atr > 0
         and healthy_atr < config.LOW_VOLATILITY_ATR_PCT_THRESHOLD
     ), "a 0.15% ATR tape must still be tradable - this is a floor, not a ban"
-    assert healthy_score >= config.SIDEWAYS_ENTRY_SCORE_THRESHOLD
+    assert healthy_score >= config.ENTRY_SCORE_THRESHOLD
     print(f"TEST 10: healthy setup (atr%={healthy_atr*100:.2f}, score={healthy_score:.4f}) "
           f"still passes both gates")
 

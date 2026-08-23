@@ -137,20 +137,59 @@ async def test_aligned_short_remains_eligible_and_logs_exact_tick():
             momentum=downward_move, features=[0.0] * 34,
         )
 
-    assert decision.should_enter is True
-    assert decision.score >= trading.SIDEWAYS_ENTRY_SCORE_THRESHOLD
+    # 2026-08-23: SIDEWAYS entries are disabled outright (threshold 0.85, above
+    # the 0.84 structural ceiling - see config.py), so should_enter is now False
+    # for ANY SIDEWAYS setup. The subject of this test is the counter-momentum
+    # guard, and that guard is unchanged: an ALIGNED move must not trip it.
+    # Asserting that directly keeps the test meaningful, where asserting
+    # should_enter would only re-measure the off-switch.
     assert decision.components["momentum_aligned"] is True
-    assert decision.components["sideways_counter_momentum_blocked"] is False
+    assert decision.components["sideways_counter_momentum_blocked"] is False, (
+        "an aligned SHORT must not be hard-blocked by the counter-momentum guard"
+    )
     assert decision.components["momentum"] == 1.0
+    assert decision.should_enter is False, (
+        "SIDEWAYS is disabled, so even a clean aligned setup must not enter"
+    )
+    assert decision.components.get("rejection_reason", "").startswith("score "), (
+        f"the rejection must come from the score bar (the off-switch), not the "
+        f"counter-momentum guard - got "
+        f"{decision.components.get('rejection_reason')!r}"
+    )
+    print("PASS: an aligned SIDEWAYS SHORT clears the counter-momentum guard "
+          "and is stopped only by the regime off-switch")
+
+
+async def test_aligned_short_in_a_tradable_regime_logs_exact_tick():
+    """The accepted-entry audit line is what this covers, so it needs a regime
+    that can still accept. Moved off SIDEWAYS when that became an off-switch."""
+    engine = trading.EntryEngineV2()
+    engine._last_log_ts = time.time()
+    conf = clean_live_like_conf("SHORT")
+    downward_move = -trading.ENTRY_MOMENTUM_SATURATION_PCT
+    trending = trading.RegimeReading(
+        regime=trading.REGIME_STRONG_TREND, atr_pct=0.0030, atr_ratio=1.4,
+    )
+
+    with Capture() as cap:
+        decision = engine.evaluate(
+            conf, trending, volume_z=2.0,
+            momentum=downward_move, features=[0.0] * 34,
+        )
+
+    assert decision.should_enter is True, (
+        f"a clean aligned SHORT in a tradable regime must still enter "
+        f"(score {decision.score:.4f} vs {trading.ENTRY_SCORE_THRESHOLD})"
+    )
+    assert decision.score >= trading.ENTRY_SCORE_THRESHOLD
     assert cap.text.count("[entry-accepted]") == 1
     assert "side=SHORT" in cap.text
-    # Threshold is a tuned constant (0.60 -> 0.63 in the 2026-08-18 fee-drag
-    # recalibration), so assert the log reports the CONFIGURED value rather
-    # than a frozen literal that silently breaks on every future tuning.
-    assert f"threshold={trading.SIDEWAYS_ENTRY_SCORE_THRESHOLD:.4f}" in cap.text
+    # Assert the log reports the CONFIGURED threshold rather than a frozen
+    # literal that silently breaks on every future tuning.
+    assert f"threshold={trading.ENTRY_SCORE_THRESHOLD:.4f}" in cap.text
     assert "raw_momentum=-" in cap.text
     assert "momentum_aligned=True" in cap.text
-    print("PASS: aligned SIDEWAYS SHORT remains eligible with an exact accepted-entry audit line")
+    print("PASS: aligned SHORT in a tradable regime emits an exact accepted-entry audit line")
 
 
 async def test_tiny_counter_sign_jitter_is_not_hard_blocked():
@@ -217,6 +256,7 @@ async def test_initial_fill_log_uses_frozen_entry_confidence():
 async def main():
     await test_counter_momentum_short_is_blocked()
     await test_aligned_short_remains_eligible_and_logs_exact_tick()
+    await test_aligned_short_in_a_tradable_regime_logs_exact_tick()
     await test_tiny_counter_sign_jitter_is_not_hard_blocked()
     await test_trending_pullback_is_not_sideways_hard_blocked()
     await test_initial_fill_log_uses_frozen_entry_confidence()

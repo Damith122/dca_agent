@@ -105,7 +105,10 @@ def conf_with(tp_hit_prob, side="LONG"):
     """A confidence reading strong enough to pass the composite threshold, so
     the veto is provably the thing doing the rejecting."""
     return trading.ConfidenceReading(
-        confidence_score=0.50,
+        # 0.50 -> 0.75 alongside the STRONG_TREND switch above: brain_confidence
+        # carries weight 0.30, so this lifts the composite clear of the 0.75
+        # trending threshold. A PRECONDITION of these tests, not their subject.
+        confidence_score=0.75,
         trend_confidence=1.0,
         trend_direction=side,
         success_probability=0.5,
@@ -116,12 +119,17 @@ def conf_with(tp_hit_prob, side="LONG"):
 
 
 def tradeable_regime():
-    # SIDEWAYS carries the lowest entry threshold (0.63), so the fixture's
-    # score (~0.68) clears it. That matters: with a STRONG_TREND regime the
-    # control cases would be rejected on score alone and the tests could not
-    # prove the veto is what does the blocking.
+    # 2026-08-23: was SIDEWAYS, chosen because it carried the lowest entry
+    # threshold (0.63) and so let the fixture clear the bar. SIDEWAYS is now an
+    # off-switch (threshold 0.85, above the 0.84 structural ceiling), so it can
+    # never accept and the control cases would all fail for the wrong reason.
+    #
+    # STRONG_TREND at 0.75 is the tradable regime now; conf_with() was
+    # strengthened to clear it. The requirement is unchanged: the control cases
+    # must genuinely be ACCEPTED, so that when a case is rejected it is
+    # provably the veto doing it and not the score threshold.
     return trading.RegimeReading(
-        regime=trading.REGIME_SIDEWAYS, atr_pct=0.0030, atr_ratio=1.0,
+        regime=trading.REGIME_STRONG_TREND, atr_pct=0.0030, atr_ratio=1.4,
     )
 
 
