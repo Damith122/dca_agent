@@ -1034,13 +1034,40 @@ ENTRY_SCORE_THRESHOLD = _env_float("ENTRY_SCORE_THRESHOLD", 0.75)  # raised from
 # three losing trades on its own and is the principled gate here; this
 # threshold is the secondary filter. Set SIDEWAYS_ENTRY_SCORE_THRESHOLD=0.65
 # in the environment if you deliberately want SIDEWAYS entries off entirely.
-# 2026-08-22: raised 0.63 -> 0.68. Six of the seven entries accepted in the
-# 06:00-08:30 window were SIDEWAYS, scoring 0.6301, 0.6303, 0.6305, 0.6349,
-# 0.6399 and 0.6409 - five of them within 0.011 of the old threshold. The bot
-# was trading almost exclusively setups that barely cleared the bar, and every
-# one of them costs a guaranteed 0.0732% round trip. 0.68 removes that cluster
-# while leaving genuine SIDEWAYS signals (the 0.7074 entry) intact.
-SIDEWAYS_ENTRY_SCORE_THRESHOLD = _env_float("SIDEWAYS_ENTRY_SCORE_THRESHOLD", 0.68)  # SIDEWAYS is structurally capped lower (volatility_fit/regime_fit/momentum), all other regimes unchanged at 0.75
+# 2026-08-23: SIDEWAYS entries are now DISABLED, not filtered.
+#
+# The 0.63 -> 0.68 raise on 2026-08-22 did not work, and the MFE data from the
+# 18h18m run that followed shows why. Raising the bar only moved the marginal
+# cluster: the five ETH losses scored 0.6819, 0.6822, 0.6834, 0.6849 and
+# 0.6982 - barely clearing 0.68, exactly as the previous cluster barely
+# cleared 0.63. Entries will always cluster just above whatever bar is set,
+# because the bar selects RANK, not quality.
+#
+# What settles it is maximum favourable excursion - how far each trade ever
+# ran in our favour before exiting:
+#
+#     SIDEWAYS      6 trades  0W/6L  net -0.4682  avg MFE 0.020%
+#     WEAK_TREND    3 trades  2W/1L  net +0.0609  avg MFE 0.307%
+#     STRONG_TREND  1 trade   1W/0L  net +0.0993  avg MFE 0.647%
+#
+# Five of the six SIDEWAYS losers never moved more than 0.02% our way; three
+# had an MFE of exactly 0.000%, meaning price never ticked in our favour at
+# all, and three were closed inside five seconds. These entries were not
+# stopped out early or capped by an exit rule - they were wrong at the instant
+# they were placed. No threshold, stop distance or take-profit setting can
+# rescue a trade whose best moment is its entry.
+#
+# The mechanism: all five ETH losses were SHORTs into a 2413-2420 range. In a
+# mean-reverting tape "momentum aligned" means selling the low, which is
+# precisely backwards.
+#
+# Disabling SIDEWAYS over that window turns -0.3080 into +0.1602.
+#
+# 0.85 is above the regime's structural ceiling of 0.84 (with SIDEWAYS's caps
+# of volatility_fit 0.40 and regime_fit 0.50, and every other term maxed), so
+# no SIDEWAYS entry can qualify. This is deliberately an off-switch. It is a
+# single value to revert if trending-only proves too sparse.
+SIDEWAYS_ENTRY_SCORE_THRESHOLD = _env_float("SIDEWAYS_ENTRY_SCORE_THRESHOLD", 0.85)  # OFF-SWITCH: above the 0.84 structural max, so SIDEWAYS never enters. All other regimes unchanged at 0.75.
 # Clean Live entry evidence exposed a directional scoring hole: the entry
 # engine rewarded abs(momentum), so a strong upward move boosted a proposed
 # SHORT exactly like a LONG. In SIDEWAYS, block a meaningful counter move
