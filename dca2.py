@@ -833,6 +833,41 @@ async def stats_export_loop(manager: MartingaleManager, interval_sec: int = STAT
             print(color(f"[csv-sync] performance_stats.csv sync error: {e}", YELLOW))
 
 
+async def feature_log_loop(manager: MartingaleManager, interval_sec: int = 120) -> None:
+    """Flushes recorded rows to disk and uploads completed shards.
+
+    Runs regardless of DRY_RUN - recording is the entire point when trading is
+    disabled. Skips itself cheaply when the recorder is off.
+    """
+    if not manager.feature_recorder.enabled:
+        return
+    while True:
+        await asyncio.sleep(interval_sec)
+        try:
+            await manager.sync_feature_log_to_github()
+        except Exception as e:  # noqa: BLE001 - never crash the trading loop
+            print(color(f"[feature-log] loop error: {_exc_text(e)}", YELLOW))
+
+
+async def feature_log_status_loop(manager: MartingaleManager, interval_sec: int = 600) -> None:
+    """Periodic visibility on how fast the dataset is accumulating, so a
+    silently-stalled recorder is obvious rather than discovered days later."""
+    if not manager.feature_recorder.enabled:
+        return
+    while True:
+        await asyncio.sleep(interval_sec)
+        try:
+            st = manager.feature_recorder.stats()
+            print(color(
+                f"{now_str()} [feature-log:{manager.symbol}] taken={st['taken']} "
+                f"finalised={st['finalised']} written={st['written']} "
+                f"pending={st['pending']} dropped={st['dropped']} "
+                f"shard={st['shard']}", GRAY,
+            ))
+        except Exception as e:  # noqa: BLE001
+            print(color(f"[feature-log] status error: {_exc_text(e)}", YELLOW))
+
+
 async def status_loop(manager: MartingaleManager, interval_sec: int = 20) -> None:
     while True:
         await asyncio.sleep(interval_sec)
@@ -1190,9 +1225,21 @@ async def main() -> None:
                 status_loop(m),
                 brain_sync_loop(m),
                 stats_export_loop(m),
+                # 2026-08-24 feature recorder; both return immediately when
+                # FEATURE_RECORDER_ENABLED is false, so scheduling them
+                # unconditionally costs nothing.
+                feature_log_loop(m),
+                feature_log_status_loop(m),
             ])
         await asyncio.gather(*tasks)
     finally:
+        # 2026-08-24: flush recorded rows before shutdown so an in-flight
+        # shard is not lost when the container is reclaimed.
+        for m in managers.values():
+            try:
+                m.feature_recorder.flush()
+            except Exception:  # noqa: BLE001 - shutdown must not raise
+                pass
         # 2026-08-20 multi-coin: flush EVERY manager, not just the primary -
         # otherwise three of four coins would lose their final brain
         # snapshot, stats export and trade-log push on every restart. Each

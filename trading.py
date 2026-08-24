@@ -245,7 +245,16 @@ import numpy as np
 # Decimal is used for the same precision reason round_step() itself uses it.
 from decimal import Decimal, ROUND_UP
 
+from feature_recorder import FeatureRecorder
 from config import (
+    # 2026-08-24 feature recorder
+    FEATURE_LOG_PATH,
+    GITHUB_FEATURE_LOG_PATH,
+    FEATURE_RECORDER_ENABLED,
+    FEATURE_RECORDER_INTERVAL_SEC,
+    FEATURE_RECORDER_SHARD_SEC,
+    FEATURE_RECORDER_MAX_PENDING,
+    feature_recorder_horizons,
     # 2026-08-21 robust env parsing: shared with config.py so a blank or
     # malformed variable falls back to the default here too, rather than
     # raising ValueError at import time.
@@ -2177,6 +2186,9 @@ _PATH_SPEC = {
     "github_trades_csv":  ("trades_log.csv",          "GITHUB_TRADES_LOG_CSV_PATH",    GITHUB_TRADES_LOG_CSV_PATH),
     "github_trades_json": ("trades_log.jsonl",        "GITHUB_TRADES_LOG_JSON_PATH",   GITHUB_TRADES_LOG_JSON_PATH),
     "github_stats_csv":   ("performance_stats.csv",   "GITHUB_STATS_CSV_PATH",         GITHUB_STATS_CSV_PATH),
+    # 2026-08-24 feature recorder (sharded; these are the base names)
+    "feature_log":        ("feature_log.jsonl",       "FEATURE_LOG_PATH",              FEATURE_LOG_PATH),
+    "github_feature_log": ("feature_log.jsonl",       "GITHUB_FEATURE_LOG_PATH",       GITHUB_FEATURE_LOG_PATH),
 }
 
 
@@ -2481,6 +2493,19 @@ class MartingaleManager:
             json_path=self.paths['stats_json'],
             csv_path=self.paths['stats_csv'],
             symbol=self.symbol,
+        )
+        # 2026-08-24: records every evaluated setup, accepted or rejected, for
+        # offline entry-rule research. Disabled unless FEATURE_RECORDER_ENABLED
+        # is set, and every one of its methods swallows its own exceptions, so
+        # it cannot affect trading either way.
+        self.feature_recorder = FeatureRecorder(
+            self.symbol,
+            self.paths['feature_log'],
+            enabled=FEATURE_RECORDER_ENABLED,
+            interval_sec=FEATURE_RECORDER_INTERVAL_SEC,
+            horizons_sec=feature_recorder_horizons(),
+            shard_sec=FEATURE_RECORDER_SHARD_SEC,
+            max_pending=FEATURE_RECORDER_MAX_PENDING,
         )
 
         self._feature_buffer: Deque[Tuple[float, np.ndarray, float]] = deque(
@@ -3518,6 +3543,55 @@ class MartingaleManager:
 
     async def sync_performance_stats_to_github(self) -> None:
         await self._sync_csv_to_github(self.paths['stats_csv'], self.paths['github_stats_csv'], os.path.basename(self.paths['stats_csv']))
+
+    async def sync_feature_log_to_github(self) -> None:
+        """Flush finalised rows, then upload any COMPLETED shard.
+
+        Only completed shards go up, and each goes up once - the active shard
+        is still being appended to, and re-uploading a growing file every
+        cycle is exactly the pattern that would make this unworkable within
+        hours. Remote names carry the same timestamp suffix as local ones, so
+        the dataset reassembles by sorting filenames.
+        """
+        if not self.feature_recorder.enabled:
+            return
+        try:
+            self.feature_recorder.flush()
+        except Exception as e:  # noqa: BLE001 - recording must never stop the bot
+            print(color(f"[feature-log] flush failed: {_exc_text(e)}", YELLOW))
+            return
+        if not self.github_sync.enabled:
+            return
+        remote_root, remote_ext = os.path.splitext(self.paths['github_feature_log'])
+        for shard in self.feature_recorder.completed_shards():
+            label = os.path.basename(shard)
+            if self._last_synced_csv_hash.get(shard) == "done":
+                continue
+            try:
+                with open(shard, "rb") as f:
+                    data = f.read()
+            except Exception as e:  # noqa: BLE001
+                print(color(f"[feature-log] could not read {label}: {_exc_text(e)}", YELLOW))
+                continue
+            if not data:
+                self._last_synced_csv_hash[shard] = "done"
+                continue
+            suffix = os.path.basename(shard)[len(os.path.basename(
+                os.path.splitext(self.paths['feature_log'])[0])):]
+            remote = f"{remote_root}{suffix}" if suffix.endswith(remote_ext) else \
+                     f"{remote_root}{suffix}{remote_ext}"
+            try:
+                pushed = await self.github_sync.upload(
+                    data, message=f"feature log {label}", path=remote)
+            except Exception as e:  # noqa: BLE001
+                print(color(f"[feature-log] upload error for {label}: {_exc_text(e)}", RED))
+                continue
+            if pushed:
+                # Marked complete so a finished shard is never re-uploaded.
+                self._last_synced_csv_hash[shard] = "done"
+                print(color(
+                    f"{now_str()} [feature-log] pushed {label} "
+                    f"({len(data)} bytes, {data.count(chr(10))} rows) to GitHub.", MAGENTA))
 
     # -- Trade-log reconciliation (Binance is the source of truth) -----------
     # Root-cause fix for trades that go missing from trades_log.jsonl/csv:
@@ -5273,6 +5347,22 @@ class MartingaleManager:
                 support_min=self.entry_support_min(),
             )
             self.last_entry_decision = decision
+
+            # 2026-08-24: capture this evaluation - accepted or rejected -
+            # together with the forward return it goes on to produce. Placed
+            # immediately after evaluate() so the recorded row is exactly the
+            # decision the engine made, with nothing re-derived. Cannot raise.
+            self.feature_recorder.observe(
+                time.time(), price,
+                features=features,
+                regime=self.last_regime,
+                conf=self.last_confidence,
+                decision=decision,
+                orderflow=orderflow_now,
+                brain_readiness=self.brain.head_readiness(),
+                extra={"vol_z": round(float(volume_z), 5),
+                       "dry": bool(DRY_RUN)},
+            )
             if decision.should_enter and decision.side is not None:
                 # Initial entry ALWAYS uses the configured INITIAL_ENTRY_USDT
                 # unscaled - confidence/regime/risk-based sizing only ever
