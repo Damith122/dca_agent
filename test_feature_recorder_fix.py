@@ -224,6 +224,25 @@ try:
     d2 = open("dca2.py").read()
     check("a sync loop is scheduled", "feature_log_loop(m)" in d2)
     check("rows are flushed on shutdown", "feature_recorder.flush()" in d2)
+    check("startup states the recorder's configuration",
+          "FEATURE RECORDER ON" in d2 and "feature recorder OFF" in d2)
+
+    print("\n[9] DRY_RUN must still reach the entry evaluation")
+    # Live regression: the recorder reported taken=0 on all four symbols
+    # because initialize_sync() returned early under DRY_RUN without setting
+    # position_sync_ready, and the entry path is gated on that flag. DRY_RUN
+    # could therefore never evaluate an entry at all - it only managed
+    # positions it could never open. The recorder made it visible.
+    body_t = "\n".join(l for l in src.splitlines()
+                        if not l.lstrip().startswith("#"))
+    i_dry = body_t.index("if DRY_RUN:\n        manager.position_sync_ready = True")
+    check("initialize_sync sets position_sync_ready before its DRY_RUN return",
+          i_dry > 0)
+    tail = body_t[i_dry:i_dry + 200]
+    check("...and does so BEFORE returning",
+          tail.index("position_sync_ready = True") < tail.index("return"))
+    check("the entry path is still gated on the flag for live trading",
+          "if not self.position_sync_ready:" in body_t)
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 

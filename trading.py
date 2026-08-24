@@ -9958,6 +9958,25 @@ async def initialize_sync(
     scoped entirely to the final-DCA decision inside
     _manage_open_position() and has no effect on position sync/recovery."""
     if DRY_RUN:
+        # 2026-08-24: mark the state authoritative before returning.
+        #
+        # This early return predates the position_sync_ready gate, which
+        # blocks entry evaluation until local state has been reconciled
+        # against a real Binance position-risk fetch. In DRY_RUN that fetch
+        # never happens, so the flag stayed False forever and the entry path
+        # returned at the gate on every tick - meaning DRY_RUN could not
+        # evaluate entries at all, only manage positions it could never open.
+        #
+        # It surfaced when the feature recorder reported taken=0 across all
+        # four symbols: the recorder hooks in immediately after
+        # entry_engine.evaluate(), and evaluate() was never being reached.
+        #
+        # Setting it here is correct rather than a workaround: the gate exists
+        # to stop the bot acting on state that might disagree with a real
+        # exchange position. In DRY_RUN no real position can exist, so local
+        # state IS authoritative by construction - there is nothing it could
+        # be out of sync with.
+        manager.position_sync_ready = True
         return  # nothing real to sync against
 
     # Trade-log reliability safety net - see reconcile_trade_history_from_exchange()

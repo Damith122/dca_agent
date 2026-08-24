@@ -134,6 +134,11 @@ from websockets.exceptions import ConnectionClosed
 # ============================================================================
 
 from config import (
+    FEATURE_RECORDER_ENABLED,
+    FEATURE_RECORDER_INTERVAL_SEC,
+    FEATURE_RECORDER_SHARD_SEC,
+    FEATURE_LOG_PATH,
+    feature_recorder_horizons,
     env_parse_warnings,
     SYMBOL,
     # 2026-08-20 multi-coin watchlist
@@ -1127,6 +1132,27 @@ async def main() -> None:
     ))
     if DRY_RUN:
         print(color(" *** DRY RUN MODE - no real orders will be sent ***", YELLOW))
+    # 2026-08-24: state the recorder's configuration at boot. Without this the
+    # only way to confirm it is running is to wait out the 10-minute status
+    # loop, which makes "is it on?" needlessly slow to answer - and makes a
+    # silently-disabled recorder look identical to a quiet one.
+    if FEATURE_RECORDER_ENABLED:
+        _horizons = feature_recorder_horizons()
+        print(color(
+            f" *** FEATURE RECORDER ON - sampling every "
+            f"{FEATURE_RECORDER_INTERVAL_SEC:g}s per symbol, horizons "
+            f"{'/'.join(f'{h:g}s' for h in _horizons)}, "
+            f"{FEATURE_RECORDER_SHARD_SEC/3600:g}h shards ***", MAGENTA,
+        ))
+        print(color(
+            f"     recording EVERY evaluated setup (accepted and rejected) to "
+            f"{os.path.basename(FEATURE_LOG_PATH)} -> GitHub", GRAY,
+        ))
+    else:
+        print(color(
+            " *** feature recorder OFF (set FEATURE_RECORDER_ENABLED=true "
+            "to collect entry-rule research data) ***", GRAY,
+        ))
     if not USE_TESTNET:
         print(color(" *** LIVE MAINNET MODE - REAL MONEY AT RISK ***", RED))
 
