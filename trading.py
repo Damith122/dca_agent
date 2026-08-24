@@ -3558,7 +3558,7 @@ class MartingaleManager:
         try:
             self.feature_recorder.flush()
         except Exception as e:  # noqa: BLE001 - recording must never stop the bot
-            print(color(f"[feature-log] flush failed: {_exc_text(e)}", YELLOW))
+            print(color(f"[feature-log] flush failed: {e}", YELLOW))
             return
         if not self.github_sync.enabled:
             return
@@ -3571,7 +3571,7 @@ class MartingaleManager:
                 with open(shard, "rb") as f:
                     data = f.read()
             except Exception as e:  # noqa: BLE001
-                print(color(f"[feature-log] could not read {label}: {_exc_text(e)}", YELLOW))
+                print(color(f"[feature-log] could not read {label}: {e}", YELLOW))
                 continue
             if not data:
                 self._last_synced_csv_hash[shard] = "done"
@@ -3584,7 +3584,7 @@ class MartingaleManager:
                 pushed = await self.github_sync.upload(
                     data, message=f"feature log {label}", path=remote)
             except Exception as e:  # noqa: BLE001
-                print(color(f"[feature-log] upload error for {label}: {_exc_text(e)}", RED))
+                print(color(f"[feature-log] upload error for {label}: {e}", RED))
                 continue
             if pushed:
                 # Marked complete so a finished shard is never re-uploaded.
@@ -5353,7 +5353,9 @@ class MartingaleManager:
             # immediately after evaluate() so the recorded row is exactly the
             # decision the engine made, with nothing re-derived. Cannot raise.
             self.feature_recorder.observe(
-                time.time(), price,
+                # self.current_price - on_price_tick() takes no price argument
+                # and holds no local of that name.
+                time.time(), self.current_price,
                 features=features,
                 regime=self.last_regime,
                 conf=self.last_confidence,
