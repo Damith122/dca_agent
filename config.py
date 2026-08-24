@@ -783,6 +783,55 @@ TP_ATR_MULT = _env_float("TP_ATR_MULT", 2.5)
 # on any deployment that has not yet set the variable. It should be turned
 # back on deliberately, once the rebuilt head has reached READY and its
 # probabilities have been observed to be sane.
+# ============================================================================
+# FEATURE RECORDER (2026-08-24)
+#
+# Records every evaluated setup - accepted AND rejected - with its full
+# feature vector, score components, orderflow snapshot and realised forward
+# return, so entry rules can be tested offline instead of with live capital.
+#
+# Defaults OFF. Turn it on with FEATURE_RECORDER_ENABLED=true, ideally
+# alongside DRY_RUN=true so the pipeline runs and records without trading.
+# ============================================================================
+FEATURE_RECORDER_ENABLED = _env_bool("FEATURE_RECORDER_ENABLED", False)
+
+# Seconds between samples, per symbol. The decision loop runs ~3.5x/s, so
+# recording every cycle would produce ~30 MB/hour and swamp the whole-file
+# GitHub sync. 10s is also the honest choice statistically: consecutive ticks
+# are so autocorrelated that denser sampling inflates the row count without
+# adding independent information.
+FEATURE_RECORDER_INTERVAL_SEC = _env_float("FEATURE_RECORDER_INTERVAL_SEC", 10.0)
+
+# Forward-return horizons in seconds. A sample is held until the longest one
+# elapses, with MFE/MAE tracked throughout.
+FEATURE_RECORDER_HORIZONS_SEC = _env_str(
+    "FEATURE_RECORDER_HORIZONS_SEC", "5,15,30,60,300"
+)
+
+# Files rotate on this interval and each completed shard uploads exactly once,
+# so no sync ever re-sends the accumulated history.
+FEATURE_RECORDER_SHARD_SEC = _env_float("FEATURE_RECORDER_SHARD_SEC", 3600.0)
+
+# Safety valve: a stalled feed must not grow the pending buffer without bound.
+FEATURE_RECORDER_MAX_PENDING = _env_int("FEATURE_RECORDER_MAX_PENDING", 2000)
+
+
+def feature_recorder_horizons() -> list:
+    """Parsed horizon list; malformed entries are skipped rather than fatal."""
+    out = []
+    for part in str(FEATURE_RECORDER_HORIZONS_SEC).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = float(part)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            out.append(value)
+    return sorted(set(out)) or [5.0, 15.0, 30.0, 60.0, 300.0]
+
+
 TP_HIT_VETO_ENABLED = (
     _env_bool("TP_HIT_VETO_ENABLED", False)
 )
@@ -1186,6 +1235,18 @@ GITHUB_TRADES_LOG_JSON_PATH = os.environ.get(
     "GITHUB_TRADES_LOG_JSON_PATH",
     "/".join(p for p in (_GITHUB_BRAIN_DIR, _symbol_scoped_default("trades_log.jsonl")) if p),
 )
+# Feature-recorder dataset. Sharded, so these are the BASE names - the
+# recorder appends a UTC timestamp per shard.
+FEATURE_LOG_PATH = os.environ.get(
+    "FEATURE_LOG_PATH", _symbol_scoped_default("feature_log.jsonl")
+)
+GITHUB_FEATURE_LOG_PATH = os.environ.get(
+    "GITHUB_FEATURE_LOG_PATH",
+    "/".join(p for p in (_GITHUB_BRAIN_DIR, _symbol_scoped_default("feature_log.jsonl")) if p),
+)
+_warn_if_explicit_path_bypasses_isolation("FEATURE_LOG_PATH")
+_warn_if_explicit_path_bypasses_isolation("GITHUB_FEATURE_LOG_PATH")
+
 _warn_if_explicit_path_bypasses_isolation("GITHUB_TRADES_LOG_CSV_PATH")
 _warn_if_explicit_path_bypasses_isolation("GITHUB_STATS_CSV_PATH")
 _warn_if_explicit_path_bypasses_isolation("GITHUB_TRADES_LOG_JSON_PATH")
@@ -1455,6 +1516,14 @@ __all__ = [
     "ENTRY_NOTIONAL_USDT",
     "notional_scaling_report",
     # 2026-08-21 tp_hit probability veto
+    "FEATURE_LOG_PATH",
+    "GITHUB_FEATURE_LOG_PATH",
+    "FEATURE_RECORDER_ENABLED",
+    "FEATURE_RECORDER_INTERVAL_SEC",
+    "FEATURE_RECORDER_HORIZONS_SEC",
+    "FEATURE_RECORDER_SHARD_SEC",
+    "FEATURE_RECORDER_MAX_PENDING",
+    "feature_recorder_horizons",
     "TP_HIT_VETO_ENABLED",
     "TP_HIT_VETO_MIN_PROB",
     "TP_HIT_VETO_BASE_RATE_RATIO",
