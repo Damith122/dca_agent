@@ -243,6 +243,149 @@ try:
           tail.index("position_sync_ready = True") < tail.index("return"))
     check("the entry path is still gated on the flag for live trading",
           "if not self.position_sync_ready:" in body_t)
+
+    print("\n[10] Every name the hot paths reference actually resolves")
+    # Live regression, and the worst bug of this change: the recorder hook was
+    # written as `observe(time.time(), price, ...)` but on_price_tick() takes no
+    # price argument and holds no local of that name. Every tick raised
+    #   [market-ws:...] error processing message, skipping: name 'price' is not defined
+    # immediately AFTER evaluate(), so the entry-debug line still printed and the
+    # failure looked like "the recorder isn't recording". Under DRY_RUN nothing
+    # was at risk, but on a live deploy it would have killed every step after
+    # that line - order placement, DCA, stops, profit lock.
+    #
+    # A static scope check catches this class of bug across the whole file,
+    # which importing the module cannot: a NameError inside a function only
+    # surfaces when that line executes.
+    import ast as _ast, builtins as _bi
+
+    def _stores(node, stop_at_nested=True):
+        """Names bound anywhere in this node, not descending into nested
+        function bodies when asked (those have their own scope)."""
+        out = set()
+        for child in _ast.iter_child_nodes(node):
+            if stop_at_nested and isinstance(
+                    child, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)):
+                out.add(child.name)
+                continue
+            if isinstance(child, _ast.Name) and isinstance(child.ctx, _ast.Store):
+                out.add(child.id)
+            elif isinstance(child, _ast.ExceptHandler) and child.name:
+                out.add(child.name)
+            elif isinstance(child, (_ast.Import, _ast.ImportFrom)):
+                for a in child.names:
+                    out.add((a.asname or a.name).split(".")[0])
+            elif isinstance(child, _ast.Lambda):
+                continue
+            out |= _stores(child, stop_at_nested)
+        return out
+
+    def _params(fn):
+        a = fn.args
+        out = {x.arg for x in list(a.args) + list(a.kwonlyargs) + list(a.posonlyargs)}
+        if a.vararg: out.add(a.vararg.arg)
+        if a.kwarg:  out.add(a.kwarg.arg)
+        return out
+
+    def _loads(node):
+        """Loaded names in this scope only, skipping nested function bodies.
+
+        Annotations are skipped deliberately: every module here uses
+        `from __future__ import annotations`, so annotations are strings and
+        never evaluated. Counting them reported MartingaleManager in
+        websocket.py as unresolved when it is only ever a type hint.
+        """
+        out = []
+        for child in _ast.iter_child_nodes(node):
+            if isinstance(child, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)):
+                continue
+            if isinstance(child, _ast.arg):
+                continue                      # bare annotation on a parameter
+            if isinstance(child, _ast.AnnAssign):
+                # `x: SomeType = value` - the annotation is never evaluated
+                # (local annotations never are, and PEP 563 makes the rest
+                # strings), so only the target and value can reference names.
+                for part in (child.target, child.value):
+                    if part is None:
+                        continue
+                    if isinstance(part, _ast.Name) and isinstance(part.ctx, _ast.Load):
+                        out.append((part.id, part.lineno))
+                    out += _loads(part)
+                continue
+            if isinstance(child, _ast.Name) and isinstance(child.ctx, _ast.Load):
+                out.append((child.id, child.lineno))
+            out += _loads(child)
+        return out
+
+    def _scan_loads(fn):
+        """Loads that really execute when the function runs: its body, plus
+        decorators and argument defaults (evaluated at def time). Return and
+        parameter annotations are excluded for the reason above."""
+        out = []
+        for stmt in fn.body:
+            # A nested def/class is its own scope, checked separately by
+            # _scan. Descending into it here would attribute ITS parameters
+            # and locals to the enclosing function and report them unresolved.
+            if isinstance(stmt, (_ast.FunctionDef, _ast.AsyncFunctionDef,
+                                 _ast.ClassDef)):
+                continue
+            if isinstance(stmt, _ast.AnnAssign):
+                # Same exclusion as in _loads, applied when the ANNOTATED
+                # ASSIGNMENT is the statement itself rather than a child.
+                for part in (stmt.target, stmt.value):
+                    if part is None:
+                        continue
+                    if isinstance(part, _ast.Name) and isinstance(part.ctx, _ast.Load):
+                        out.append((part.id, part.lineno))
+                    out += _loads(part)
+                continue
+            out += _loads(stmt)
+            if isinstance(stmt, _ast.Name) and isinstance(stmt.ctx, _ast.Load):
+                out.append((stmt.id, stmt.lineno))
+        for d in list(fn.decorator_list) + [x for x in
+                (list(fn.args.defaults) + [k for k in fn.args.kw_defaults if k])]:
+            out += _loads(d)
+            if isinstance(d, _ast.Name) and isinstance(d.ctx, _ast.Load):
+                out.append((d.id, d.lineno))
+        return out
+
+    def _scan(scope_node, inherited, mod_names, problems):
+        """Recursive scope check. A nested function inherits everything bound
+        in its enclosing scopes - closures are exactly why the first version of
+        this check produced false positives on _side_stats and _cache_locally."""
+        for fn in _ast.iter_child_nodes(scope_node):
+            if not isinstance(fn, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)):
+                continue
+            if isinstance(fn, _ast.ClassDef):
+                _scan(fn, inherited | {fn.name}, mod_names, problems)
+                continue
+            bound = inherited | _params(fn) | _stores(fn) | {fn.name}
+            for name, line in _scan_loads(fn):
+                if (name not in bound and name not in mod_names
+                        and not hasattr(_bi, name)):
+                    problems.append(f"{fn.name}:{name}@{line}")
+            _scan(fn, bound, mod_names, problems)
+
+    def _module_names(tree):
+        names = set(_stores(tree, stop_at_nested=True))
+        for n in _ast.walk(tree):
+            if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)):
+                names.add(n.name)
+            elif isinstance(n, (_ast.Import, _ast.ImportFrom)):
+                for a in n.names:
+                    names.add((a.asname or a.name).split(".")[0])
+        return names
+
+    for mod in ("trading.py", "dca2.py", "feature_recorder.py", "websocket.py",
+                "config.py", "brain.py", "exchange.py", "github_sync.py"):
+        tree = _ast.parse(open(mod).read())
+        problems = []
+        _scan(tree, set(), _module_names(tree), problems)
+        check(f"{mod}: every referenced name resolves",
+              not problems, "; ".join(problems[:6]))
+
+    check("the recorder is passed self.current_price, not an undefined local",
+          "time.time(), self.current_price," in src)
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
