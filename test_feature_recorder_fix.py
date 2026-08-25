@@ -213,11 +213,16 @@ try:
     print("\n[8] Wiring into the engine")
     src = open("trading.py").read()
     body = "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("#"))
-    check("the recorder is observed right after evaluate()",
+    # 2026-08-25: observe() moved BEFORE the FLAT gate (see section [11]), so
+    # it now runs ahead of evaluate() rather than after it. The decision is
+    # attached separately by annotate_latest(), which is what must follow
+    # evaluate() - that ordering is asserted in [11].
+    check("the decision reaches the recorder via annotate_latest",
           body.index("self.last_entry_decision = decision")
-          < body.index("self.feature_recorder.observe("))
+          < body.index("self.feature_recorder.annotate_latest("))
     check("it is fed the same decision object the engine produced",
-          "decision=decision," in body)
+          "decision_fields(\n                    decision," in body
+          or "decision_fields(decision," in body)
     check("it receives the orderflow snapshot", "orderflow=orderflow_now," in body)
     check("only completed shards are uploaded",
           "completed_shards()" in body)
@@ -385,7 +390,57 @@ try:
               not problems, "; ".join(problems[:6]))
 
     check("the recorder is passed self.current_price, not an undefined local",
-          "time.time(), self.current_price," in src)
+          "_recorder_tick_ts, self.current_price," in src)
+
+    print("\n[11] Recording must not stop when a position opens")
+    # Live regression: observe() sat inside `if self.position.status == "FLAT"`,
+    # so sampling stopped the moment a symbol opened a position. Under DRY_RUN
+    # a simulated entry never gets a fill, so every symbol parked in ENTERING
+    # and never recorded again - 24.7h of runtime yielded 3.2h of data.
+    # Scoped to on_price_tick: trading.py contains several FLAT gates and a
+    # file-wide search finds the wrong one.
+    _t = _ast.parse(src)
+    _tick = next(n for n in _ast.walk(_t)
+                 if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+                 and n.name == "on_price_tick")
+    obs_line = ann_line = flat_line = None
+    for node in _ast.walk(_tick):
+        if isinstance(node, _ast.Attribute) and node.attr == "observe":
+            obs_line = node.lineno
+        elif isinstance(node, _ast.Attribute) and node.attr == "annotate_latest":
+            ann_line = node.lineno
+        elif (isinstance(node, _ast.If) and flat_line is None
+              and "status == 'FLAT'" in _ast.unparse(node.test).replace('"', "'")):
+            flat_line = node.lineno
+    check("observe() runs BEFORE the FLAT gate", obs_line < flat_line,
+          f"observe@{obs_line} flat@{flat_line}")
+    check("the decision is annotated INSIDE the flat branch", ann_line > flat_line,
+          f"annotate@{ann_line} flat@{flat_line}")
+    check("observe() no longer receives a decision at the pre-gate site",
+          "decision=decision," not in src)
+
+    # annotate_latest must bind only to a sample taken on the SAME tick.
+    r4 = new_rec(tmp, interval_sec=60.0, horizons_sec=[1])
+    r4.observe(T0, 100.0, regime=R(), conf=C())
+    r4.annotate_latest(T0, **r4.decision_fields(
+        D(enter=True, side="LONG", score=0.9, comp={"threshold": 0.75}), FLOW, 1.5))
+    check("a decision annotates the sample from this tick",
+          r4._pending[-1]["row"]["score"] == 0.9)
+    check("...and marks it as decided", r4._pending[-1]["row"]["decided"] is True)
+    r4.annotate_latest(T0 + 30.0, **r4.decision_fields(
+        D(enter=False, score=0.1, comp={}), FLOW, 1.5))
+    check("a later tick with no fresh sample does NOT overwrite an older row",
+          r4._pending[-1]["row"]["score"] == 0.9)
+
+    r5 = new_rec(tmp, interval_sec=60.0, horizons_sec=[1])
+    r5.observe(T0, 100.0, regime=R(), conf=C(),
+               extra={"pos_status": "OPEN", "dry": True})
+    check("a sample taken while a position is OPEN is still recorded",
+          r5.stats()["taken"] == 1)
+    check("...and is marked undecided so it is separable in analysis",
+          r5._pending[-1]["row"]["decided"] is False)
+    check("...and carries the position status",
+          r5._pending[-1]["row"]["pos_status"] == "OPEN")
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 

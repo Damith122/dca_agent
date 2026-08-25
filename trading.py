@@ -5072,6 +5072,30 @@ class MartingaleManager:
         )
         self.last_confidence = self.confidence_engine.evaluate(brain_out, risk_score, self.position.side)
 
+        # 2026-08-25: sample market state BEFORE the FLAT gate.
+        #
+        # This call used to sit inside the FLAT branch, next to the entry
+        # decision. That branch only runs while the position is flat, so
+        # recording stopped the moment a symbol opened a position - and under
+        # DRY_RUN a simulated entry never receives a fill, so every symbol
+        # parked in ENTERING and never recorded again. 24.7 hours of runtime
+        # produced 3.2 hours of data for that reason.
+        #
+        # The research question is about market conditions and the forward
+        # returns that follow them, which do not depend on whether we happen
+        # to hold a position. Sampling here keeps that continuous; the entry
+        # decision, which genuinely only exists when flat, is attached
+        # afterwards by annotate_latest().
+        _recorder_tick_ts = time.time()
+        self.feature_recorder.observe(
+            _recorder_tick_ts, self.current_price,
+            features=features,
+            regime=self.last_regime,
+            conf=self.last_confidence,
+            brain_readiness=self.brain.head_readiness(),
+            extra={"dry": bool(DRY_RUN), "pos_status": self.position.status},
+        )
+
         if self.position.status == "FLAT":
             if time.time() - self.last_trade_action_ts < TRADE_COOLDOWN_SEC:
                 return
@@ -5348,22 +5372,15 @@ class MartingaleManager:
             )
             self.last_entry_decision = decision
 
-            # 2026-08-24: capture this evaluation - accepted or rejected -
-            # together with the forward return it goes on to produce. Placed
-            # immediately after evaluate() so the recorded row is exactly the
-            # decision the engine made, with nothing re-derived. Cannot raise.
-            self.feature_recorder.observe(
-                # self.current_price - on_price_tick() takes no price argument
-                # and holds no local of that name.
-                time.time(), self.current_price,
-                features=features,
-                regime=self.last_regime,
-                conf=self.last_confidence,
-                decision=decision,
-                orderflow=orderflow_now,
-                brain_readiness=self.brain.head_readiness(),
-                extra={"vol_z": round(float(volume_z), 5),
-                       "dry": bool(DRY_RUN)},
+            # 2026-08-25: attach this evaluation - accepted or rejected - to
+            # the sample taken above on this same tick. The sample already
+            # holds the market state; this adds the decision, which only
+            # exists while flat. A no-op on ticks where the 10s interval did
+            # not fire, so a decision is never stapled onto an older row.
+            self.feature_recorder.annotate_latest(
+                _recorder_tick_ts,
+                **self.feature_recorder.decision_fields(
+                    decision, orderflow_now, volume_z),
             )
             if decision.should_enter and decision.side is not None:
                 # Initial entry ALWAYS uses the configured INITIAL_ENTRY_USDT

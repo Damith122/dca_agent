@@ -158,6 +158,58 @@ class FeatureRecorder:
         except Exception:  # noqa: BLE001 - recording must never disturb trading
             pass
 
+    def annotate_latest(self, now: float, **fields: Any) -> None:
+        """Attach decision context to the sample taken on THIS tick.
+
+        observe() runs before the FLAT gate so market state is captured
+        whatever the position is doing, but the engine only produces a
+        decision when flat. This fills those fields in afterwards, and only
+        when a sample was actually taken this tick - so a decision is never
+        stapled onto an older row. Never raises.
+        """
+        if not self.enabled or not self._pending:
+            return
+        try:
+            latest = self._pending[-1]
+            if abs(latest["t"] - now) > 1e-6:
+                return          # no sample taken this tick; nothing to annotate
+            row = latest["row"]
+            for k, v in fields.items():
+                if v is not None:
+                    row[k] = v
+        except Exception:  # noqa: BLE001 - recording must never disturb trading
+            pass
+
+    def decision_fields(self, decision: Any, orderflow: Optional[dict] = None,
+                        volume_z: Any = None) -> dict:
+        """Flatten a decision + orderflow snapshot into row fields."""
+        comp = getattr(decision, "components", None) or {}
+        of = orderflow or {}
+        return {
+            "enter": bool(getattr(decision, "should_enter", False)),
+            "side": getattr(decision, "side", None),
+            "score": _f(getattr(decision, "score", None), 5),
+            "thr": _f(comp.get("threshold"), 4),
+            "reason": comp.get("rejection_reason"),
+            "c_vol": _f(comp.get("volume_confirmation"), 5),
+            "c_volfit": _f(comp.get("volatility_fit"), 5),
+            "c_mom": _f(comp.get("momentum"), 5),
+            "c_mom_raw": _f(comp.get("momentum_raw"), 8),
+            "c_mom_mag": _f(comp.get("momentum_magnitude"), 5),
+            "c_mom_align": comp.get("momentum_aligned"),
+            "c_regfit": _f(comp.get("regime_fit"), 5),
+            "exhausted": comp.get("momentum_exhausted"),
+            "cm_blocked": comp.get("sideways_counter_momentum_blocked"),
+            "of_ok": of.get("data_available"),
+            "of_imb": _f(of.get("imbalance"), 5),
+            "of_delta": _f(of.get("trade_delta"), 3),
+            "of_support": of.get("book_support"),
+            "of_aligned": of.get("flow_aligned"),
+            "of_blocked": of.get("blocked"),
+            "vol_z": _f(volume_z, 5),
+            "decided": True,
+        }
+
     def _track(self, now: float, price: float) -> None:
         """Update excursions and horizon returns on every pending sample, then
         finalise the ones whose longest horizon has elapsed.
@@ -245,6 +297,11 @@ class FeatureRecorder:
             "of_blocked": of.get("blocked"),
             # --- head readiness, so unreliable rows can be excluded later ---
             "rdy": {k: v for k, v in (brain_readiness or {}).items()} or None,
+            # False until annotate_latest() supplies a decision; a sample
+            # taken while a position is open has market state but no
+            # entry decision, and the two must be distinguishable.
+            "decided": False,
+            "pos_status": None,
         }
         if features is not None:
             try:
