@@ -229,11 +229,18 @@ class FeatureRecorder:
                 s["mfe_long"] = move
             if move < s["mae_long"]:
                 s["mae_long"] = move
+            # Horizons are sorted, so a cursor removes the repeated dict
+            # lookups: only the next unfilled horizon is ever checked. With a
+            # 3600s max horizon the buffer holds ~360 samples per symbol, and
+            # re-testing all eight horizons on each of them every tick was
+            # most of this loop's cost - which matters on an event loop that
+            # has already been starved once by the decision cycle.
             age = now - s["t"]
-            for h in self.horizons:
-                key = f"r{int(h)}"
-                if key not in s["fwd"] and age >= h:
-                    s["fwd"][key] = move
+            hi = s["hi"]
+            while hi < len(self.horizons) and age >= self.horizons[hi]:
+                s["fwd"][f"r{int(self.horizons[hi])}"] = move
+                hi += 1
+            s["hi"] = hi
 
         while self._pending:
             s = self._pending[0]
@@ -314,6 +321,7 @@ class FeatureRecorder:
         self._pending.append({
             "t": now, "px": float(price), "row": row,
             "fwd": {}, "mfe_long": 0.0, "mae_long": 0.0,
+            "hi": 0,          # cursor into self.horizons; see _track()
         })
         self.samples_taken += 1
 

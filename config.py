@@ -802,10 +802,27 @@ FEATURE_RECORDER_ENABLED = _env_bool("FEATURE_RECORDER_ENABLED", False)
 # adding independent information.
 FEATURE_RECORDER_INTERVAL_SEC = _env_float("FEATURE_RECORDER_INTERVAL_SEC", 10.0)
 
-# Forward-return horizons in seconds. A sample is held until the longest one
+# Forward-return horizons in seconds. A sample is held until the LONGEST one
 # elapses, with MFE/MAE tracked throughout.
+#
+# 2026-08-26: extended to 3600s (1h). The 25.6h dataset showed mean reversion
+# is real but too small to clear fees - fading moves beyond 2 ATR earned
+# +2.5 to +5.1 bps gross against a 7.3 bps round trip. Reversion was also
+# strongest at the LONGEST pair recorded (bwd300 -> r300, r = -0.063), which
+# is exactly what you would see if the effect keeps growing past the edge of
+# the measurement window. 300s was the limit, so that was untestable.
+#
+# 900/1800/3600 test it directly: if the reversion move scales with horizon
+# while the fee stays fixed at 7.3 bps, a 15-60 minute hold could clear costs
+# where a 5-minute one cannot.
+#
+# COST OF THE LONGER WINDOW - a sample is only written once its longest
+# horizon matures, so rows now lag reality by an hour rather than 5 minutes,
+# and a restart discards up to an hour of in-flight samples per symbol
+# instead of 5 minutes. The short horizons are all retained, so nothing that
+# worked before is lost.
 FEATURE_RECORDER_HORIZONS_SEC = _env_str(
-    "FEATURE_RECORDER_HORIZONS_SEC", "5,15,30,60,300"
+    "FEATURE_RECORDER_HORIZONS_SEC", "5,15,30,60,300,900,1800,3600"
 )
 
 # Files rotate on this interval and each completed shard uploads exactly once,
