@@ -3589,9 +3589,17 @@ class MartingaleManager:
             if pushed:
                 # Marked complete so a finished shard is never re-uploaded.
                 self._last_synced_csv_hash[shard] = "done"
+                # 2026-08-26: data is bytes (opened "rb"), so the row count
+                # needs a BYTES separator - chr(10) is a str and made
+                # bytes.count() raise TypeError, which escaped this method
+                # and aborted the remaining shards in the same cycle. The
+                # separator is computed here rather than inline because a
+                # backslash is not allowed inside an f-string expression on
+                # Python 3.11.
+                row_count = data.count(b"\n")
                 print(color(
                     f"{now_str()} [feature-log] pushed {label} "
-                    f"({len(data)} bytes, {data.count(chr(10))} rows) to GitHub.", MAGENTA))
+                    f"({len(data)} bytes, {row_count} rows) to GitHub.", MAGENTA))
 
     # -- Trade-log reconciliation (Binance is the source of truth) -----------
     # Root-cause fix for trades that go missing from trades_log.jsonl/csv:

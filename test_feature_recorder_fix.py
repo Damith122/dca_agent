@@ -488,6 +488,60 @@ try:
     check("horizons maturing on the same tick are all filled",
           all(jrow.get(f"r{h}") is not None for h in (1, 2, 3, 4)),
           str({f"r{h}": jrow.get(f"r{h}") for h in (1, 2, 3, 4)}))
+
+    print("\n[13] Completed shards upload without aborting the cycle")
+    # Live regression 2026-08-26: the success print did
+    # `data.count(chr(10))` on a payload opened in "rb" mode. bytes.count()
+    # rejects a str, so every successful upload raised TypeError AFTER the
+    # push. The exception escaped sync_feature_log_to_github() and aborted
+    # the loop over completed_shards(), so only one shard could be uploaded
+    # per 120s cycle and the log filled with "[feature-log] loop error".
+    import asyncio as _asyncio
+    import trading as _trading
+
+    class _Up:
+        enabled = True
+
+        def __init__(self):
+            self.paths = []
+
+        async def upload(self, data, message="", path=""):
+            assert isinstance(data, bytes), "shard payload must stay bytes"
+            self.paths.append(path)
+            return True
+
+    class _Mgr:
+        pass
+
+    sync_rec = new_rec(tmp, interval_sec=1e9, horizons_sec=[1])
+    base = os.path.splitext(sync_rec.local_path)[0]
+    shard_a, shard_b = f"{base}_20260826T090000Z.jsonl", f"{base}_20260826T100000Z.jsonl"
+    for pth in (shard_a, shard_b):
+        with open(pth, "w", encoding="utf-8") as fh:
+            fh.write('{"a":1}\n{"a":2}\n')
+
+    mgr = _Mgr()
+    mgr.feature_recorder = sync_rec
+    mgr.github_sync = _Up()
+    mgr._last_synced_csv_hash = {}
+    mgr.paths = {"feature_log": sync_rec.local_path,
+                 "github_feature_log": "brain/feature_log_LIVE_SOLUSDT.jsonl"}
+    sync_rec.completed_shards = lambda: [shard_a, shard_b]
+
+    err = None
+    try:
+        _asyncio.run(_trading.MartingaleManager.sync_feature_log_to_github(mgr))
+    except Exception as exc:            # noqa: BLE001 - that is the bug
+        err = exc
+    check("uploading a completed shard raises nothing", err is None, repr(err))
+    check("every completed shard uploads in ONE cycle",
+          len(mgr.github_sync.paths) == 2, str(mgr.github_sync.paths))
+    check("remote names keep the shard timestamp suffix",
+          all(p.endswith("Z.jsonl") for p in mgr.github_sync.paths),
+          str(mgr.github_sync.paths))
+    check("row count uses a bytes separator",
+          'data.count(chr(' not in open("trading.py", encoding="utf-8").read())
+
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
