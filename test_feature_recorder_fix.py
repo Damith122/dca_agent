@@ -441,6 +441,53 @@ try:
           r5._pending[-1]["row"]["decided"] is False)
     check("...and carries the position status",
           r5._pending[-1]["row"]["pos_status"] == "OPEN")
+
+    print("\n[12] Long horizons (900/1800/3600s)")
+    # 2026-08-26: added to test whether mean reversion keeps growing past the
+    # 300s measurement edge. Reversion was real but too small to clear the
+    # 7.3 bps round trip (+2.5 to +5.1 bps gross), and was strongest at the
+    # LONGEST pair recorded - which is what you see when the effect continues
+    # beyond the window.
+    H = config.feature_recorder_horizons()
+    for h in (900.0, 1800.0, 3600.0):
+        check(f"{int(h)}s horizon is configured", h in H)
+    check("the short horizons are retained",
+          all(h in H for h in (5.0, 15.0, 30.0, 60.0, 300.0)))
+    check("horizons are sorted (the _track cursor depends on it)",
+          H == sorted(H))
+    check("the pending buffer has headroom at the new max horizon",
+          max(H) / config.FEATURE_RECORDER_INTERVAL_SEC
+          < config.FEATURE_RECORDER_MAX_PENDING,
+          f"{max(H)/config.FEATURE_RECORDER_INTERVAL_SEC:.0f} vs "
+          f"{config.FEATURE_RECORDER_MAX_PENDING}")
+
+    # Every horizon must actually land - a silently-null longest horizon is
+    # exactly the bug caught earlier, and it matters more now that the
+    # longest one is the whole point of the change.
+    long_r = new_rec(tmp, interval_sec=1e9, horizons_sec=[1, 2, 5, 10])
+    long_r.observe(T0, 100.0, regime=R(), conf=C())
+    for dt_, px_ in ((1.0, 101.0), (2.0, 99.0), (5.0, 100.5), (10.0, 102.0)):
+        long_r._track(T0 + dt_, px_)
+    long_r._track(T0 + 11.0, 100.0)
+    long_r.flush(T0 + 11.0)
+    lrow = [json.loads(l) for l in
+            open(long_r.current_shard_path(T0 + 11.0), encoding="utf-8")][0]
+    for h in (1, 2, 5, 10):
+        check(f"r{h} is populated, not null", lrow.get(f"r{h}") is not None)
+    check("MFE spans the whole window, not just the first horizon",
+          abs(lrow["mfe_long"] - 0.02) < 1e-6, f"got {lrow['mfe_long']}")
+
+    # The cursor must not skip a horizon when several mature on one tick.
+    jump = new_rec(tmp, interval_sec=1e9, horizons_sec=[1, 2, 3, 4])
+    jump.observe(T0, 100.0, regime=R(), conf=C())
+    jump._track(T0 + 5.0, 103.0)      # all four mature simultaneously
+    jump._track(T0 + 6.0, 100.0)
+    jump.flush(T0 + 6.0)
+    jrow = [json.loads(l) for l in
+            open(jump.current_shard_path(T0 + 6.0), encoding="utf-8")][0]
+    check("horizons maturing on the same tick are all filled",
+          all(jrow.get(f"r{h}") is not None for h in (1, 2, 3, 4)),
+          str({f"r{h}": jrow.get(f"r{h}") for h in (1, 2, 3, 4)}))
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
