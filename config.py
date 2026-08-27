@@ -832,6 +832,22 @@ FEATURE_RECORDER_SHARD_SEC = _env_float("FEATURE_RECORDER_SHARD_SEC", 3600.0)
 # Safety valve: a stalled feed must not grow the pending buffer without bound.
 FEATURE_RECORDER_MAX_PENDING = _env_int("FEATURE_RECORDER_MAX_PENDING", 2000)
 
+# --- Local shard retention -------------------------------------------------
+# The recorder produces ~400 KB per symbol per hour and never cleaned up after
+# itself, so a long run filled the container's disk allowance while the bot was
+# holding real positions. Retention only ever touches shards this process has
+# CONFIRMED uploaded to GitHub - losing recorded data to a tidying routine
+# would be worse than running out of disk, because a full disk is loud and a
+# silently deleted dataset is not.
+# Age rule: delete confirmed-uploaded shards older than this. 0 disables it.
+FEATURE_LOG_RETAIN_LOCAL_HOURS = _env_float("FEATURE_LOG_RETAIN_LOCAL_HOURS", 6.0)
+# Budget rule (safety net): if the shard directory still exceeds this after the
+# age sweep, delete confirmed-uploaded shards oldest-first until it fits.
+# 0 disables it. 256 MB is ~7 days of four-symbol recording.
+FEATURE_LOG_MAX_LOCAL_MB = _env_float("FEATURE_LOG_MAX_LOCAL_MB", 256.0)
+# Master switch. Off means shards accumulate exactly as they did before.
+FEATURE_LOG_RETENTION_ENABLED = _env_bool("FEATURE_LOG_RETENTION_ENABLED", True)
+
 
 def feature_recorder_horizons() -> list:
     """Parsed horizon list; malformed entries are skipped rather than fatal."""
@@ -1541,6 +1557,10 @@ __all__ = [
     "FEATURE_RECORDER_SHARD_SEC",
     "FEATURE_RECORDER_MAX_PENDING",
     "feature_recorder_horizons",
+    # 2026-08-27 local shard retention
+    "FEATURE_LOG_RETENTION_ENABLED",
+    "FEATURE_LOG_RETAIN_LOCAL_HOURS",
+    "FEATURE_LOG_MAX_LOCAL_MB",
     "TP_HIT_VETO_ENABLED",
     "TP_HIT_VETO_MIN_PROB",
     "TP_HIT_VETO_BASE_RATE_RATIO",

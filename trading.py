@@ -240,6 +240,8 @@ from typing import Deque, Dict, List, Optional, Tuple
 import aiohttp
 import numpy as np
 
+import retention
+
 # 2026-08 post-only (maker) entry execution: the SELL-side maker price must
 # round UP to the tick grid, which round_step() (ROUND_DOWN only) cannot do.
 # Decimal is used for the same precision reason round_step() itself uses it.
@@ -254,6 +256,9 @@ from config import (
     FEATURE_RECORDER_INTERVAL_SEC,
     FEATURE_RECORDER_SHARD_SEC,
     FEATURE_RECORDER_MAX_PENDING,
+    FEATURE_LOG_RETENTION_ENABLED,
+    FEATURE_LOG_RETAIN_LOCAL_HOURS,
+    FEATURE_LOG_MAX_LOCAL_MB,
     feature_recorder_horizons,
     # 2026-08-21 robust env parsing: shared with config.py so a blank or
     # malformed variable falls back to the default here too, rather than
@@ -3589,9 +3594,45 @@ class MartingaleManager:
             if pushed:
                 # Marked complete so a finished shard is never re-uploaded.
                 self._last_synced_csv_hash[shard] = "done"
+                # 2026-08-26: data is bytes (opened "rb"), so the row count
+                # needs a BYTES separator - chr(10) is a str and made
+                # bytes.count() raise TypeError, which escaped this method
+                # and aborted the remaining shards in the same cycle. The
+                # separator is computed here rather than inline because a
+                # backslash is not allowed inside an f-string expression on
+                # Python 3.11.
+                row_count = data.count(b"\n")
                 print(color(
                     f"{now_str()} [feature-log] pushed {label} "
-                    f"({len(data)} bytes, {data.count(chr(10))} rows) to GitHub.", MAGENTA))
+                    f"({len(data)} bytes, {row_count} rows) to GitHub.", MAGENTA))
+        self.prune_feature_log_disk()
+
+    def prune_feature_log_disk(self) -> None:
+        """Deletes shards this process has CONFIRMED uploaded, so a long run
+        cannot fill the container's disk allowance while the bot is holding
+        real positions. Only paths marked "done" by the upload loop above are
+        eligible, so an unsynced shard is never removed - see retention.py for
+        the full rule set. Guarded end to end: retention failing must never
+        interrupt trading or recording."""
+        if not (FEATURE_LOG_RETENTION_ENABLED and self.feature_recorder.enabled):
+            return
+        try:
+            uploaded = {p for p, v in self._last_synced_csv_hash.items() if v == "done"}
+            report = retention.prune_shards(
+                self.feature_recorder.completed_shards(),
+                uploaded=uploaded,
+                retain_hours=FEATURE_LOG_RETAIN_LOCAL_HOURS,
+                max_bytes=FEATURE_LOG_MAX_LOCAL_MB * 1048576.0,
+            )
+            for gone in report["deleted"]:
+                # Drop the marker too, or the dict grows without bound across
+                # a long run and keeps a deleted path pinned forever.
+                self._last_synced_csv_hash.pop(gone, None)
+            line = retention.describe(report)
+            if line:
+                print(color(f"{now_str()} [feature-log] {line}", GRAY))
+        except Exception as e:  # noqa: BLE001 - retention must never stop the bot
+            print(color(f"[feature-log] retention error: {e}", YELLOW))
 
     # -- Trade-log reconciliation (Binance is the source of truth) -----------
     # Root-cause fix for trades that go missing from trades_log.jsonl/csv:

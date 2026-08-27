@@ -137,6 +137,9 @@ from config import (
     FEATURE_RECORDER_ENABLED,
     FEATURE_RECORDER_INTERVAL_SEC,
     FEATURE_RECORDER_SHARD_SEC,
+    FEATURE_LOG_RETENTION_ENABLED,
+    FEATURE_LOG_RETAIN_LOCAL_HOURS,
+    FEATURE_LOG_MAX_LOCAL_MB,
     FEATURE_LOG_PATH,
     feature_recorder_horizons,
     env_parse_warnings,
@@ -1148,6 +1151,18 @@ async def main() -> None:
             f"     recording EVERY evaluated setup (accepted and rejected) to "
             f"{os.path.basename(FEATURE_LOG_PATH)} -> GitHub", GRAY,
         ))
+        if FEATURE_LOG_RETENTION_ENABLED:
+            print(color(
+                f"     local retention: delete UPLOADED shards older than "
+                f"{FEATURE_LOG_RETAIN_LOCAL_HOURS:g}h, cap "
+                f"{FEATURE_LOG_MAX_LOCAL_MB:g} MB (GitHub copies are never "
+                f"touched)", GRAY,
+            ))
+        else:
+            print(color(
+                "     local retention OFF - shards accumulate until the disk "
+                "allowance runs out", YELLOW,
+            ))
     else:
         print(color(
             " *** feature recorder OFF (set FEATURE_RECORDER_ENABLED=true "
