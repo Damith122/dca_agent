@@ -511,7 +511,10 @@ try:
             return True
 
     class _Mgr:
-        pass
+        # The real retention sweep runs at the end of the upload cycle, so bind
+        # it rather than stubbing it - a shard must never be deleted in the
+        # same cycle that uploaded it, and this is where that would show up.
+        prune_feature_log_disk = _trading.MartingaleManager.prune_feature_log_disk
 
     sync_rec = new_rec(tmp, interval_sec=1e9, horizons_sec=[1])
     base = os.path.splitext(sync_rec.local_path)[0]
@@ -541,6 +544,8 @@ try:
           str(mgr.github_sync.paths))
     check("row count uses a bytes separator",
           'data.count(chr(' not in open("trading.py", encoding="utf-8").read())
+    check("a shard just uploaded is NOT deleted by the retention sweep",
+          os.path.exists(shard_a) and os.path.exists(shard_b))
 
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
