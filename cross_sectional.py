@@ -51,7 +51,14 @@ class BookParams:
     gross_exposure: float = 1.0  # sum of |weights|
     max_weight: float = 0.10     # per-name cap, so one name cannot dominate
     damping: float = 0.5         # 0 = jump to target, 1 = never trade
-    no_trade_band: float = 0.005  # ignore weight changes smaller than this
+    # Ignore weight changes smaller than this FRACTION OF A TYPICAL POSITION.
+    # It was an absolute weight threshold, which does not survive a change of
+    # universe size: across 492 names each position is 0.0034 of the book,
+    # below the old 0.005 default, so every trade was suppressed as "too
+    # small" and a flat book could never open a position again. Expressed
+    # relatively, 0.15 means "skip moves worth less than 15% of one position"
+    # and behaves the same whether the universe holds 20 names or 500.
+    no_trade_band: float = 0.15
     min_names: int = 10          # below this, breadth is not worth the costs
 
 
@@ -104,18 +111,31 @@ def target_weights(signal: np.ndarray, p: BookParams) -> np.ndarray:
     return w
 
 
+def typical_weight(weights: np.ndarray, p: BookParams) -> float:
+    """Size of one position in this book, used to scale the no-trade band."""
+    held = int((weights != 0).sum())
+    if held:
+        return float(np.abs(weights[weights != 0]).mean())
+    return p.gross_exposure / max(1, 2 * max(1, int(round(len(weights)
+                                                         * p.quantile))))
+
+
 def apply_damping(target: np.ndarray, previous: Optional[np.ndarray],
                   p: BookParams) -> np.ndarray:
     """Move part-way to the target and ignore trivial changes.
 
     Turnover is the cost driver, and the marginal name that just crossed a
     quantile boundary is the least informative one in the book. Damping and
-    a no-trade band drop exactly those trades.
+    the no-trade band drop exactly those trades.
+
+    The band is a fraction of a TYPICAL POSITION, not an absolute weight, so
+    it means the same thing across universes of any size - see BookParams.
     """
     if previous is None:
         return target
     moved = previous + (1.0 - p.damping) * (target - previous)
-    small = np.abs(moved - previous) < p.no_trade_band
+    unit = typical_weight(target, p)
+    small = np.abs(moved - previous) < p.no_trade_band * unit
     moved[small] = previous[small]
     return moved
 

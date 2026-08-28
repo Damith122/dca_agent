@@ -108,9 +108,37 @@ check("heavy damping moves only slightly toward the target",
 check("zero damping goes straight to the target",
       np.allclose(CS.apply_damping(t, prev, CS.BookParams(damping=0.0,
                                                           no_trade_band=0.0)), t))
-banded = CS.apply_damping(t, prev, CS.BookParams(damping=0.0, no_trade_band=1.0))
-check("a wide no-trade band suppresses every trade",
+banded = CS.apply_damping(t, prev, CS.BookParams(damping=0.9, no_trade_band=50.0))
+check("an absurdly wide band suppresses adjustments",
       np.allclose(banded, prev))
+
+# Live regression from the 492-symbol run. The band was an ABSOLUTE weight
+# threshold, so across a wide universe every position (0.0034 of the book)
+# was smaller than the 0.005 default. Once flat, the book could never open a
+# position again - it reported turnover 0.0x, cost 0.0%, Sharpe +0.00, and
+# the optimiser crowned that empty book as its best configuration.
+def churn(n, band, damping=0.0, T=900):
+    r = np.random.default_rng(3)
+    px_ = 100 * np.exp(np.cumsum(r.normal(0, 0.01, (T, n)), axis=0))
+    bp = CS.BookParams(quantile=0.3, damping=damping, no_trade_band=band)
+    prev_, tot = None, 0.0
+    for i in range(0, T - 24, 24):
+        w_ = CS.apply_damping(CS.target_weights(CS.sig_low_vol(px_, i), bp),
+                              prev_, bp)
+        tot += CS.turnover(w_, prev_)
+        prev_ = w_
+    return tot
+
+
+for n in (20, 100, 492):
+    check(f"a {n}-name book with the default band still trades",
+          churn(n, CS.BookParams().no_trade_band) > 1.0,
+          f"turnover {churn(n, CS.BookParams().no_trade_band):.3f}")
+check("the band means the same thing at 20 names as at 492",
+      abs(churn(20, 0.15) / churn(20, 0.0)
+          - churn(492, 0.15) / churn(492, 0.0)) < 0.25)
+check("...and the old absolute 0.005 is what killed the wide book",
+      churn(492, 0.005 / (0.5 / 148)) < 1.0)
 check("the first book's turnover is its full gross",
       abs(CS.turnover(t, None) - np.abs(t).sum()) < 1e-12)
 

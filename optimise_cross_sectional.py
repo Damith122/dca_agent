@@ -110,7 +110,7 @@ def main(argv=None):
 
     REBAL = [24, 48, 72, 120, 168, 336]
     DAMP = [0.0, 0.5, 0.8]
-    BAND = [0.0, 0.005, 0.02]
+    BAND = [0.0, 0.15, 0.5]        # fractions of one position, not weights
     QUANT = [0.1, 0.2, 0.3]
     SMOOTH = [1, 3, 6]
     FEES = [a.fee_bps, a.maker_bps]
@@ -123,6 +123,12 @@ def main(argv=None):
         fn = base_fn if sm == 1 else CS.smoothed(base_fn, sm)
         st = evaluate(px, fn, reb, p, fee, bars_per_year)
         if st["periods"] < 20:
+            continue
+        # A configuration that never trades scores Sharpe 0.00, which sorts
+        # ABOVE every losing configuration and gets crowned "best". It is not
+        # a strategy, it is an empty book - and it is exactly what the live
+        # 492-name run selected. Require the book to actually hold positions.
+        if st["annual_turnover"] < 0.5:
             continue
         rows.append({"rebalance": reb, "damping": damp, "band": band,
                      "quantile": quant, "smooth": sm, "fee": fee, **st})
