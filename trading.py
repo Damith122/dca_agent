@@ -259,6 +259,9 @@ from config import (
     FEATURE_LOG_RETENTION_ENABLED,
     FEATURE_LOG_RETAIN_LOCAL_HOURS,
     FEATURE_LOG_MAX_LOCAL_MB,
+    TP_HIT_LABEL_ADAPTIVE,
+    TP_HIT_LABEL_MULT,
+    TP_HIT_LABEL_MIN_SAMPLES,
     feature_recorder_horizons,
     # 2026-08-21 robust env parsing: shared with config.py so a blank or
     # malformed variable falls back to the default here too, rather than
@@ -2516,6 +2519,12 @@ class MartingaleManager:
         self._feature_buffer: Deque[Tuple[float, np.ndarray, float]] = deque(
             maxlen=LABEL_HORIZON_TICKS + 1
         )
+        # EWMA of |forward_return| at the label horizon, so the tp_hit
+        # threshold can be expressed relative to what this horizon actually
+        # produces rather than against a take-profit distance that belongs to
+        # a completely different timescale.
+        self._tp_label_scale: float = TAKE_PROFIT_PCT
+        self._tp_label_samples: int = 0
         self.last_regime: RegimeReading = RegimeReading()
         self.last_confidence: ConfidenceReading = ConfidenceReading()
         self.last_entry_decision: Optional[EntryDecision] = None
@@ -4891,11 +4900,29 @@ class MartingaleManager:
                 noise_band = max(old_atr_pct * 0.5, 1e-6)
                 is_noise = abs(forward_return) < noise_band
                 self.brain.learn_noise(old_features, is_noise)
-                # tp_hit: forward move reached (at least) the base take-profit
-                # distance in EITHER direction - a rough proxy for "was there
-                # a tradeable move available from here", refined further by
-                # the success/quality heads learned at actual trade close.
-                tp_was_hit = abs(forward_return) >= TAKE_PROFIT_PCT
+                # tp_hit: was this an unusually large move from here?
+                #
+                # This compared |forward_return| over LABEL_HORIZON_TICKS
+                # against TAKE_PROFIT_PCT. Those describe different
+                # timescales - 10 ticks is about 2.5 seconds, where the live
+                # median move is 0.8 bps, against a 35 bps threshold. The
+                # label was True 0.003% of the time, so the head learned to
+                # say "no" always and correlated -0.0007 with the outcome.
+                #
+                # The threshold now scales with the move typical AT THIS
+                # HORIZON, so the question is learnable and the label is
+                # balanced. TP_HIT_LABEL_ADAPTIVE=false restores the old
+                # fixed threshold.
+                self._tp_label_scale = (
+                    0.999 * self._tp_label_scale
+                    + 0.001 * max(abs(forward_return), 1e-9))
+                self._tp_label_samples += 1
+                if (TP_HIT_LABEL_ADAPTIVE
+                        and self._tp_label_samples >= TP_HIT_LABEL_MIN_SAMPLES):
+                    threshold = TP_HIT_LABEL_MULT * self._tp_label_scale
+                else:
+                    threshold = TAKE_PROFIT_PCT
+                tp_was_hit = abs(forward_return) >= threshold
                 self.brain.learn_tp_hit(old_features, tp_was_hit)
                 self._brain_dirty = True
         self._feature_buffer.append((price, features.copy(), atr_pct_now))

@@ -414,7 +414,11 @@ class BrainV2:
         # scale used to squash trend_model's raw regression output into a
         # 0..1 "trend_confidence" - set from observed prediction magnitude,
         # starts at a sane prior and adapts slowly.
+        # Scale for trend_confidence. This must track the size of the
+        # PREDICTIONS, not the size of realised returns - see predict_all().
         self._trend_scale = 0.0015
+        self._pred_scale = 0.0015
+        self._pred_scale_samples = 0
 
         # 2026-08 entry-quality audit fix (confirmed defect #6/#9 - see
         # config.py's BRAIN_HEAD_MIN_SAMPLES comment for the full root
@@ -518,7 +522,27 @@ class BrainV2:
         self.last_tp_hit_prob = tp_hit_prob
         self.last_quality_pred = quality_pred
 
-        trend_confidence = clamp(abs(trend_pred) / max(self._trend_scale, 1e-6), 0.0, 1.0)
+        # 2026-08-28: this divided |prediction| by an EWMA of realised
+        # per-tick |return|. Those are different quantities in different
+        # units of typical magnitude, and the realised EWMA converges to
+        # about 0.7 bps while the regressor emits predictions comfortably
+        # above that - so the ratio exceeded 1 on essentially every tick and
+        # clamped. Live evidence: trend_confidence was 1.000000 in all
+        # 84,744 recorded rows over 64 hours, one distinct value.
+        #
+        # Confidence has to be relative to the prediction's OWN
+        # distribution: "is this forecast large compared with the forecasts
+        # this model usually makes". That is a ratio of like to like, and it
+        # can actually vary.
+        self._pred_scale = (0.99 * self._pred_scale
+                            + 0.01 * max(abs(trend_pred), 1e-9))
+        self._pred_scale_samples += 1
+        if self._pred_scale_samples < 200:
+            # Until the scale has settled, a confidence would be arbitrary.
+            trend_confidence = 0.5
+        else:
+            trend_confidence = clamp(
+                abs(trend_pred) / max(self._pred_scale * 2.0, 1e-12), 0.0, 1.0)
         trend_direction = "LONG" if trend_pred > 0 else ("SHORT" if trend_pred < 0 else None)
 
         return {
@@ -675,6 +699,8 @@ class BrainV2:
             "tp_hit_fitted": self.tp_hit_fitted,
             "update_count": self.update_count,
             "_trend_scale": self._trend_scale,
+            "_pred_scale": self._pred_scale,
+            "_pred_scale_samples": self._pred_scale_samples,
             "norm": self.norm.state(),
             "noise_samples": self.noise_samples,
             "success_samples": self.success_samples,
@@ -699,6 +725,8 @@ class BrainV2:
         self.tp_hit_fitted = state["tp_hit_fitted"]
         self.update_count = state["update_count"]
         self._trend_scale = state.get("_trend_scale", 0.0015)
+        self._pred_scale = state.get("_pred_scale", 0.0015)
+        self._pred_scale_samples = int(state.get("_pred_scale_samples", 0))
         self.norm.load(state["norm"])
         # 2026-08 entry-quality audit fix - migration-safe: a version-2
         # snapshot (or any snapshot predating this fix) simply has none of
