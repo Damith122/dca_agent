@@ -442,6 +442,13 @@ class BrainV2:
         # ~250x (2.1e-06 against ~5e-04 on every other symbol).
         self.tp_hit_positives = 0
         self.tp_hit_labeled_samples = 0
+        # Rolling positive rate. The cumulative ratio cannot forget: after
+        # three million samples under one label definition it needs three
+        # million more to reflect a new one. An EWMA converges in roughly
+        # 1/alpha samples instead, so a label change is absorbed in hours
+        # rather than never. See tp_hit_base_rate().
+        self.tp_hit_rate_ewma = 0.0
+        self.tp_hit_rate_samples = 0
         self._noise_classes_seen: set = set()
         self._success_classes_seen: set = set()
         self._tp_hit_classes_seen: set = set()
@@ -601,6 +608,14 @@ class BrainV2:
         self.tp_hit_fitted = True
         self.tp_hit_samples += 1
         self.tp_hit_labeled_samples += 1
+        hit = 1.0 if tp_was_hit else 0.0
+        if self.tp_hit_rate_samples == 0:
+            self.tp_hit_rate_ewma = hit
+        else:
+            self.tp_hit_rate_ewma = ((1.0 - self._TP_RATE_ALPHA)
+                                     * self.tp_hit_rate_ewma
+                                     + self._TP_RATE_ALPHA * hit)
+        self.tp_hit_rate_samples += 1
         if tp_was_hit:
             self.tp_hit_positives += 1
         self._tp_hit_classes_seen.add(1 if tp_was_hit else 0)
@@ -654,6 +669,8 @@ class BrainV2:
         if name == "tp_hit":
             self.tp_hit_positives = 0
             self.tp_hit_labeled_samples = 0
+            self.tp_hit_rate_ewma = 0.0
+            self.tp_hit_rate_samples = 0
 
     def reset_saturated_heads(self) -> list:
         """Reset every classifier head whose weights diverged. Returns the
@@ -667,13 +684,31 @@ class BrainV2:
                 reset.append((name, peak))
         return reset
 
+    _TP_RATE_ALPHA = 1e-4          # converges in ~10k samples
+    _TP_RATE_WARMUP = 20_000       # two time constants before trusting it
+
     def tp_hit_base_rate(self) -> float:
-        """Observed positive rate of the tp_hit label. The label asks whether
-        price moved at least TAKE_PROFIT_PCT within LABEL_HORIZON_TICKS, which
-        is rare, so a well-calibrated head's output is SMALL by construction -
-        a healthy model tops out near a few percent. Any threshold applied to
-        that probability has to be expressed relative to this rate; a fixed
-        absolute floor would reject every prediction the head can produce."""
+        """Observed positive rate of the tp_hit label, over a ROLLING window.
+
+        Any threshold on the head's probability has to be relative to this
+        rate rather than an absolute floor.
+
+        It is rolling because the label definition changed on 2026-08-28.
+        The old label asked whether price moved TAKE_PROFIT_PCT within
+        LABEL_HORIZON_TICKS - about 35 bps in 2.5 seconds - which was true
+        0.003% of the time. The new one scales the threshold to the move
+        typical at that horizon and is true around 25% of the time. A
+        cumulative ratio mixes the two forever: three million samples of the
+        old definition would need three million of the new one to be
+        forgotten, so the reported rate stayed near 0.04% while the head
+        emitted probabilities between 0.09 and 0.68. Any veto computed
+        against that mixture is a no-op.
+
+        The EWMA converges in roughly 1/alpha samples, so a future label
+        change is absorbed in hours. The cumulative ratio is still returned
+        during warm-up, when the EWMA has not settled."""
+        if self.tp_hit_rate_samples >= self._TP_RATE_WARMUP:
+            return float(self.tp_hit_rate_ewma)
         if self.tp_hit_labeled_samples <= 0:
             return 0.0
         return self.tp_hit_positives / float(self.tp_hit_labeled_samples)
@@ -707,6 +742,8 @@ class BrainV2:
             "tp_hit_samples": self.tp_hit_samples,
             "tp_hit_positives": self.tp_hit_positives,
             "tp_hit_labeled_samples": self.tp_hit_labeled_samples,
+            "tp_hit_rate_ewma": self.tp_hit_rate_ewma,
+            "tp_hit_rate_samples": self.tp_hit_rate_samples,
             "noise_classes_seen": sorted(self._noise_classes_seen),
             "success_classes_seen": sorted(self._success_classes_seen),
             "tp_hit_classes_seen": sorted(self._tp_hit_classes_seen),
@@ -743,6 +780,8 @@ class BrainV2:
         self.success_samples = int(state.get("success_samples", 0))
         self.tp_hit_samples = int(state.get("tp_hit_samples", 0))
         self.tp_hit_positives = int(state.get("tp_hit_positives", 0))
+        self.tp_hit_rate_ewma = float(state.get("tp_hit_rate_ewma", 0.0))
+        self.tp_hit_rate_samples = int(state.get("tp_hit_rate_samples", 0))
         self.tp_hit_labeled_samples = int(state.get("tp_hit_labeled_samples", 0))
         self._noise_classes_seen = set(state.get("noise_classes_seen", []))
         self._success_classes_seen = set(state.get("success_classes_seen", []))
