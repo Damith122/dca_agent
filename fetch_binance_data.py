@@ -33,6 +33,7 @@ import argparse
 import csv
 import hashlib
 import io
+import json
 import os
 import sys
 import time
@@ -123,7 +124,6 @@ def _api_topup(symbol: str, interval: str, start_ms: int, end_ms: int) -> List[R
         raw = _get(url, timeout=30)
         if not raw:
             break
-        import json
         rows = json.loads(raw.decode())
         if not rows:
             break
@@ -151,6 +151,38 @@ def month_stamps(months: float) -> Tuple[List[str], List[str]]:
         days.append(d.strftime("%Y-%m-%d"))
         d += timedelta(days=1)
     return stamps, days
+
+
+def usdt_perp_universe(limit: int = 0) -> List[str]:
+    """Every actively trading USDT perpetual on Binance USD-M.
+
+    Cross-sectional strategies live or die on breadth: four majors that
+    correlate 0.76 are worth about 1.5 independent names, and no amount of
+    signal work fixes that. This is how the universe gets wide enough for
+    the Fundamental Law to have something to multiply.
+
+    Only PERPETUAL contracts with status TRADING and a USDT quote are
+    returned - dated futures roll and delist, which would put survivorship
+    holes in the middle of a panel.
+    """
+    raw = _get(EXCHANGE_INFO, timeout=60)
+    if not raw:
+        raise SystemExit(
+            "could not read exchangeInfo from Binance. If this is a 403 on "
+            "CONNECT, the machine is blocked from Binance - run it locally.")
+    try:
+        info = json.loads(raw.decode())
+    except ValueError as e:
+        raise SystemExit(f"exchangeInfo did not parse as JSON: {e}")
+    syms = sorted(
+        s["symbol"] for s in info.get("symbols", [])
+        if s.get("status") == "TRADING"
+        and s.get("quoteAsset") == "USDT"
+        and s.get("contractType") == "PERPETUAL"
+    )
+    if not syms:
+        raise SystemExit("exchangeInfo returned no trading USDT perpetuals")
+    return syms[:limit] if limit else syms
 
 
 def sane(r: Row) -> bool:

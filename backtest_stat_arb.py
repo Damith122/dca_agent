@@ -335,8 +335,11 @@ def main(argv=None):
 
     if a.json:
         with open(a.json, "w", encoding="utf-8") as fh:
-            json.dump({"pooled": ps, "false_positive_pct": fp_rate,
-                       "control": fp}, fh, indent=2)
+            json.dump({"pooled": ps,
+                       "false_positive_pct": null["flag_pct"],
+                       "null_t_median": float(np.median(m)) if len(m) else None,
+                       "null_t_95th": float(np.percentile(m, 95)) if len(m) else None,
+                       "p_value": pval if len(m) else None}, fh, indent=2)
         print(f"\n  wrote {a.json}")
     return 0
 
