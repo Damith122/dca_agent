@@ -148,6 +148,47 @@ for name, fn in CS.SIGNALS.items():
 check("a signal with insufficient history returns NaN, not zero",
       np.all(np.isnan(CS.sig_momentum(px, 5))))
 
+print("\n[6b] Beta is a time-series regression, not a cross-section")
+# First version computed the covariance of WEIGHTS with one cross-section of
+# returns - a rank correlation wearing beta's name. Beta is the regression of
+# the book's realised return series on the market's.
+r6 = np.random.default_rng(11)
+mkt = r6.normal(0, 0.02, 500)
+check("a book that IS the market has beta 1",
+      abs(CS.book_beta(mkt, mkt) - 1.0) < 1e-9)
+check("a book short the market has beta -1",
+      abs(CS.book_beta(-mkt, mkt) + 1.0) < 1e-9)
+check("partial exposure is recovered",
+      abs(CS.book_beta(0.3 * mkt + r6.normal(0, 0.01, 500), mkt) - 0.3) < 0.05)
+check("an independent book has beta near zero",
+      abs(CS.book_beta(r6.normal(0, 0.02, 500), mkt)) < 0.1)
+check("too few observations give NaN, not a number",
+      np.isnan(CS.book_beta(mkt[:5], mkt[:5])))
+check("a flat market does not divide by zero",
+      CS.book_beta(mkt, np.zeros(500)) == 0.0)
+
+print("\n[6c] Signal smoothing cuts turnover without inventing information")
+px_s = np.cumprod(1 + r6.normal(0, 0.01, (400, 30)), axis=0) * 100
+raw = CS.sig_momentum(px_s, 300)
+sm = CS.smoothed(CS.sig_momentum, 5)(px_s, 300)
+check("a smoothed signal is still defined", np.isfinite(sm).sum() > 20)
+check("...and still ranks broadly like the raw signal",
+      CS.spearman_ic(raw, sm) > 0.7, f"{CS.spearman_ic(raw, sm):.2f}")
+check("smoothing does not read the future",
+      np.allclose(CS.smoothed(CS.sig_momentum, 5)(px_s[:301], 300)[np.isfinite(sm)],
+                  sm[np.isfinite(sm)]))
+w_raw, w_sm = [], []
+prev_r = prev_s = None
+tr_r = tr_s = 0.0
+for i in range(200, 380, 6):
+    a_ = CS.target_weights(CS.sig_momentum(px_s, i), P)
+    b_ = CS.target_weights(CS.smoothed(CS.sig_momentum, 5)(px_s, i), P)
+    tr_r += CS.turnover(a_, prev_r)
+    tr_s += CS.turnover(b_, prev_s)
+    prev_r, prev_s = a_, b_
+check("smoothing reduces cumulative turnover", tr_s < tr_r,
+      f"smoothed {tr_s:.2f} vs raw {tr_r:.2f}")
+
 print("\n[7] End to end: it finds a planted edge and rejects noise")
 T, N = 2500, 40
 r2 = np.random.default_rng(17)

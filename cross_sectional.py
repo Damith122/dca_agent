@@ -243,3 +243,54 @@ SIGNALS = {
     "low_vol": sig_low_vol,
     "mom_skip": sig_momentum_skip,
 }
+
+
+def smoothed(signal_fn, k: int):
+    """Average a signal over its own last k observations.
+
+    Rank churn is what turnover is made of. A name sitting on a quantile
+    boundary flips in and out on noise, and each flip costs the fee twice
+    while adding almost nothing to the forecast. Smoothing the signal keeps
+    the same information and stops paying for the noise around it.
+    """
+    def fn(px, i, _k=k, _f=signal_fn):
+        acc, n = None, 0
+        for back in range(_k):
+            j = i - back
+            if j < 0:
+                break
+            v = _f(px, j)
+            if not np.isfinite(v).any():
+                continue
+            acc = v if acc is None else acc + v
+            n += 1
+        return acc / n if n else np.full(px.shape[1], np.nan)
+    return fn
+
+
+def book_beta(book_returns: np.ndarray, market_returns: np.ndarray) -> float:
+    """Beta of the book's return SERIES to the market's return series.
+
+    A dollar-neutral book is not automatically market-neutral. Ranking on
+    volatility puts the calm names long and the wild ones short, and the
+    wild ones carry more beta - so the book runs persistently short the
+    market even with weights summing to zero. Over a trending sample that
+    is a directional bet whose profit has nothing to do with the signal,
+    and it is the most likely way a low-vol result flatters itself.
+
+    The first version of this function computed the covariance of WEIGHTS
+    with one cross-section of returns, which is a rank-correlation - an IC
+    in disguise, not a beta. Beta is a time-series regression of the
+    book's realised returns on the market's, and nothing else measures the
+    exposure that matters.
+    """
+    b = np.asarray(book_returns, dtype=float)
+    m = np.asarray(market_returns, dtype=float)
+    ok = np.isfinite(b) & np.isfinite(m)
+    if ok.sum() < 10:
+        return np.nan
+    b, m = b[ok], m[ok]
+    var = float(((m - m.mean()) ** 2).sum())
+    if var <= 0:
+        return 0.0
+    return float(((b - b.mean()) * (m - m.mean())).sum() / var)
