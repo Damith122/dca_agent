@@ -1,0 +1,14 @@
+# Offline research only - NOT installed on the trading container.
+#
+# train_ml_model.py and analyze_feature_log.py run on your own machine, so
+# their dependencies stay out of requirements.txt. pandas and xgboost would
+# add build time and resident memory to a live container that never imports
+# them, and a heavier deploy is a slower recovery when something breaks.
+#
+#     pip install -r requirements-research.txt
+#
+# xgboost is optional: train_ml_model.py falls back to LightGBM, then to
+# sklearn's HistGradientBoostingClassifier, which is the same histogram
+# algorithm and gives comparable results.
+pandas>=2.0
+xgboost>=2.0
