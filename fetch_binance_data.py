@@ -44,6 +44,7 @@ from typing import Dict, List, Optional, Tuple
 
 VISION = "https://data.binance.vision/data"
 FAPI = "https://fapi.binance.com/fapi/v1/klines"
+EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
       "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000, "1d": 86_400_000}
 
@@ -213,6 +214,11 @@ def write_csv(path: str, rows: List[Row]) -> None:
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbols", default="SOLUSDT,BTCUSDT,ETHUSDT,NEARUSDT")
+    ap.add_argument("--universe", default=None,
+                    help="'all' fetches every trading USDT perpetual - the "
+                         "breadth a cross-sectional book needs")
+    ap.add_argument("--universe-limit", type=int, default=0,
+                    help="cap the universe size (0 = no cap)")
     ap.add_argument("--intervals", default="1h,15m")
     ap.add_argument("--months", type=float, default=6.0)
     ap.add_argument("--out", default="data")
@@ -221,7 +227,15 @@ def main(argv=None):
                          "if you know why you want it")
     a = ap.parse_args(argv)
 
-    symbols = [s.strip().upper() for s in a.symbols.split(",") if s.strip()]
+    if a.universe == "all":
+        symbols = usdt_perp_universe(a.universe_limit)
+        print(f"universe: {len(symbols)} trading USDT perpetuals")
+        with open(os.path.join(a.out, "universe.txt") if a.out else "universe.txt",
+                  "w", encoding="utf-8") as fh:
+            os.makedirs(a.out, exist_ok=True)
+            fh.write("\n".join(symbols) + "\n")
+    else:
+        symbols = [s.strip().upper() for s in a.symbols.split(",") if s.strip()]
     intervals = [s.strip() for s in a.intervals.split(",") if s.strip()]
     for iv in intervals:
         if iv not in MS:
