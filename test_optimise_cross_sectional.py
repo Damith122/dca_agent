@@ -95,6 +95,21 @@ noise_out = O.evaluate(px_noise[cut:], CS.sig_momentum, 24, p, 7.32, 24 * 365)
 check("noise does not survive the hold-out",
       noise_out["ic_t"] < 2.0, f"t={noise_out['ic_t']:.2f}")
 
+print("\n[4b] A positive Sharpe on a negative IC is not a strategy")
+# Live regression from the mom_skip run: every top row had IC t near -4.5
+# alongside a positive Sharpe. The signal ranked the wrong way round, so the
+# money came from the -0.11 beta, and the optimiser crowned it anyway.
+check("the sweep filters to configurations with a positive IC",
+      'coherent = [r for r in rows if r["ic_t"] > 0]' in src)
+check("...and says so explicitly when none qualifies",
+      "NO COHERENT CONFIGURATION" in src)
+check("...pointing at the inverse ranking as the next HYPOTHESIS, not a fix",
+      "test it" in src and "flipping a" in src)
+check("the beta warning is chosen per signal, not hard-coded for low_vol",
+      '"mom_skip":' in src and '"reversal":' in src)
+check("an empty ledger warns that the adjustment is not applying",
+      "no cross-signal" in src)
+
 print("\n[5] The verdict names the hurdle that failed")
 for phrase in ("below the", "costs exceed the edge",
                "directional ", "did not survive unseen data"):

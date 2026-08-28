@@ -150,11 +150,23 @@ def main(argv=None):
         print(f"  book beta to the equal-weighted market: {beta:+.4f}  "
               f"(over {len(book_r)} rebalances)")
         if abs(betas.mean()) > 0.05:
-            print("  WARNING: this book is NOT market neutral despite summing to")
-            print("  zero. Ranking on volatility puts calm names long and wild")
-            print("  ones short, and the wild ones carry more beta. Some of the")
-            print("  measured IC may be a directional bet on a trending sample,")
-            print("  not a forecast. Treat any win below with suspicion.\n")
+            print("  WARNING: this book is NOT market neutral despite summing")
+            print("  to zero, so part of its return is a directional bet on a")
+            print("  trending sample rather than a forecast.")
+            # The mechanism differs by signal, and naming the wrong one sends
+            # you to fix the wrong thing.
+            why = {
+                "low_vol": "ranking on volatility puts calm names long and "
+                           "wild ones short, and wild names carry more beta",
+                "momentum": "in a trending sample the winners are the high-beta "
+                            "names, so the book ends up long beta",
+                "mom_skip": "same as momentum - the ranking correlates with "
+                            "beta whenever the market itself has trended",
+                "reversal": "fading winners tilts the book short the names that "
+                            "led the market, which is a short-beta position",
+            }.get(a.signal, "the ranking correlates with beta in this sample")
+            print(f"  Here: {why}.")
+            print("  Treat any win below with suspicion.\n")
         else:
             print("  book is close to market neutral - the IC is not just beta.\n")
 
@@ -205,6 +217,26 @@ def main(argv=None):
         print("  A high IC there with a poor Sharpe means the signal is real")
         print("  but the harvesting is losing it - a cost problem, not a")
         print("  forecasting one.")
+
+    # A positive Sharpe on a NEGATIVE IC is incoherent: the signal ranked
+    # the wrong way round, so whatever made money did not come from it. The
+    # live mom_skip run produced exactly this - every top row had IC t near
+    # -4.5 alongside a positive Sharpe, and the profit was the -0.11 beta.
+    # Crowning that row would be reporting an accident as a strategy.
+    coherent = [r for r in rows if r["ic_t"] > 0]
+    if not coherent:
+        print("\n  NO COHERENT CONFIGURATION. Every setting with a positive")
+        print("  Sharpe has a NEGATIVE information coefficient, meaning the")
+        print("  signal ranked the wrong way round and the return came from")
+        print("  somewhere else - almost certainly market exposure. There is")
+        print(f"  nothing here to trade. Best IC t was {max(r['ic_t'] for r in rows):+.2f};")
+        print("  a consistently negative IC is worth noting, because the")
+        print("  INVERSE ranking is then the hypothesis to test - but test it")
+        print("  as its own signal, on its own hold-out, not by flipping a")
+        print("  sign after seeing the answer.")
+        rows = sorted(rows, key=lambda r: -r["ic_t"])
+    else:
+        rows = coherent
 
     best = rows[0]
     print(f"\n=== best configuration ===")
@@ -271,6 +303,14 @@ def main(argv=None):
     # --- trial ledger -----------------------------------------------------
     prior = [] if a.no_ledger else read_ledger(a.ledger)
     prior_signals = sorted({t["signal"] for t in prior})
+    if not a.no_ledger and not prior:
+        import os as _os
+        print(f"\n  NOTE: {a.ledger} is empty or new, so no cross-signal")
+        print("  adjustment is being applied. The ledger lives beside the")
+        print("  script - if you run from a freshly extracted copy it starts")
+        print("  blank and forgets every signal you have already tested.")
+        print(f"  Keep one ledger and point every run at it: --ledger "
+              f"{_os.path.abspath(a.ledger)}")
     n_trials = len(prior_signals) + (0 if a.signal in prior_signals else 1)
     alpha = 0.05 / max(1, n_trials)
     if prior_signals:
