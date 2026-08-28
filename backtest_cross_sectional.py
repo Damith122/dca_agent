@@ -193,9 +193,22 @@ def main(argv=None):
           f"rebalance every {a.rebalance} bars ===")
     print(f"    {len(kept)} symbols, {len(grid)} aligned bars, "
           f"fee {a.fee_bps:g} bps round trip")
-    print(f"    effective breadth {breadth:.1f} of {len(kept)} names "
-          f"(correlation discount)")
-    if breadth < 5:
+    print(f"    effective breadth "
+          f"{('%.1f' % breadth) if np.isfinite(breadth) else 'UNMEASURABLE'} "
+          f"of {len(kept)} names (correlation discount)")
+    # How much of the panel is actually usable is the first thing to check
+    # when breadth looks wrong - a universe that mostly failed to download
+    # produces a breadth number that says nothing about markets.
+    filled = float(np.isfinite(px).mean() * 100)
+    print(f"    panel is {filled:.1f}% populated "
+          f"({int(np.isfinite(px).all(axis=0).sum())} names with no gaps at all)")
+    if not np.isfinite(breadth):
+        print("\n    BREADTH COULD NOT BE MEASURED - too few names survive the")
+        print("    missing-data filter to build a correlation matrix. This is a")
+        print("    DATA problem, not a market verdict: check how many symbols")
+        print("    actually downloaded a full history. Everything below still")
+        print("    runs, but hurdle 4 cannot be judged.\n")
+    elif breadth < 5:
         print(f"\n    WARNING: {breadth:.1f} independent names is not a")
         print("    cross-sectional universe. The whole mechanism is breadth,")
         print("    and you do not have any. Widen the universe before reading")
@@ -244,8 +257,9 @@ def main(argv=None):
     print(f"  p-value on Sharpe      {p_sh:.3f}")
 
     t_hurdle = 2.0 + math.log(max(1, len(CS.SIGNALS)))
+    breadth_ok = bool(np.isfinite(breadth) and breadth >= 5)
     ok = (bs["ic_t"] >= t_hurdle and p_ic <= 0.05 and bs["sharpe"] > 0
-          and breadth >= 5)
+          and breadth_ok)
     print(f"\n  hurdle 1  IC t >= {t_hurdle:.2f} ({len(CS.SIGNALS)} signals "
           f"searched): {'PASS' if bs['ic_t'] >= t_hurdle else 'FAIL'}")
     print(f"  hurdle 2  p <= 0.05 vs shuffled ranks: "
@@ -253,7 +267,8 @@ def main(argv=None):
     print(f"  hurdle 3  net Sharpe > 0 after costs: "
           f"{'PASS' if bs['sharpe'] > 0 else 'FAIL'}")
     print(f"  hurdle 4  effective breadth >= 5: "
-          f"{'PASS' if breadth >= 5 else 'FAIL'} at {breadth:.1f}")
+          f"{'PASS' if breadth_ok else ('FAIL' if np.isfinite(breadth) else 'UNMEASURABLE')}"
+          f" at {('%.1f' % breadth) if np.isfinite(breadth) else 'n/a'}")
     print("\n  " + ("TRADEABLE - all four hurdles clear." if ok else
                     "NOT TRADEABLE. All four hurdles must clear."))
     if not ok and bs["cost_drag_pct"] > 30:

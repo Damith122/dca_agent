@@ -71,6 +71,33 @@ check("cross-sectionally demeaned returns do not explode the measure",
 check("a single name reports breadth 1",
       CS.effective_breadth(universe(1, 0.0, seed=7)) == 1.0)
 
+# Live regression: the real 300-symbol run reported breadth 1.0 and failed
+# hurdle 4. That was np.corrcoef propagating one NaN across the whole matrix,
+# the finite-column filter keeping nothing, and a guard returning 1.0 - a
+# data failure wearing the costume of a market verdict.
+clean = universe(50, 0.30, seed=8)
+base = CS.effective_breadth(clean)
+one_nan = clean.copy()
+one_nan[5, 7] = np.nan
+check("one stray NaN does not collapse the measurement",
+      abs(CS.effective_breadth(one_nan) - base) < 0.5,
+      f"{CS.effective_breadth(one_nan):.2f} vs {base:.2f}")
+late = clean.copy()
+late[:1500, 3] = np.nan          # a symbol listed part-way through
+check("a late-listed name does not collapse it either",
+      abs(CS.effective_breadth(late) - base) < 1.0,
+      f"{CS.effective_breadth(late):.2f} vs {base:.2f}")
+scattered = clean.copy()
+scattered[np.random.default_rng(9).random(clean.shape) < 0.02] = np.nan
+check("2% scattered missing data is tolerated",
+      np.isfinite(CS.effective_breadth(scattered)))
+check("an unmeasurable panel returns NaN, never a plausible-looking 1.0",
+      np.isnan(CS.effective_breadth(np.full((100, 20), np.nan))))
+check("...and a mostly-empty panel does too",
+      np.isnan(CS.effective_breadth(
+          np.where(np.random.default_rng(10).random((200, 20)) < 0.9,
+                   np.nan, 1.0))))
+
 print("\n[3] Turnover control")
 t = CS.target_weights(rng.normal(size=50), P)
 prev = CS.target_weights(rng.normal(size=50), P)

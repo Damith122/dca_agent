@@ -144,43 +144,60 @@ def spearman_ic(signal: np.ndarray, fwd: np.ndarray) -> float:
     return float((a * b).sum() / denom) if denom > 0 else np.nan
 
 
-def effective_breadth(returns: np.ndarray) -> float:
+def effective_breadth(returns: np.ndarray, max_missing: float = 0.2
+                      ) -> float:
     """How many INDEPENDENT directions of variation a universe really has.
 
-    Uses the participation ratio of the correlation matrix eigenvalues,
+    Participation ratio of the correlation eigenvalues,
 
         N_eff = (sum lambda_i)^2 / sum lambda_i^2
 
     which equals N for independent names and collapses toward 1 as a single
-    factor takes over. It is the standard measure and, unlike the pairwise
-    formula, it does not break down under transformation.
+    factor takes over.
 
-    Two earlier versions of this function were wrong in opposite directions
-    and both are worth remembering. The pairwise formula
-    N/(1 + (N-1)*rho) on RAW returns understates a market-neutral book,
-    because the book does not hold the factor that drives rho. Applying the
-    same formula to cross-sectionally DEMEANED returns explodes, because
-    demeaning forces the average pairwise correlation to exactly -1/(N-1)
-    and the denominator goes to zero - it reported a breadth of 100,492 for
-    sixty names.
+    NaN handling is the whole difficulty and it has already gone wrong once
+    in production. np.corrcoef propagates a single NaN across the ENTIRE
+    matrix, so one late-listed symbol with one missing bar turned every
+    entry to NaN, the finite-column filter kept nothing, and the guard
+    returned 1.0 - which read as "this universe is one asset" when it
+    actually meant "this function could not run". A 300-name universe of
+    perpetuals has missing bars in almost every column, so it fired every
+    time.
 
-    The honest reading of the number this returns: for a single-factor
-    universe it lands near 1-2 however many names you add, and that ceiling
-    is the whole reason a wide universe is necessary but not sufficient.
+    The fix is to build a complete block before correlating: drop columns
+    missing more than `max_missing` of their history, then drop any rows
+    still holding a NaN, and only then correlate. If that leaves too little
+    to measure, return NaN - an explicit "unknown" the caller must handle,
+    never a number that looks like an answer.
     """
-    if returns.shape[1] < 2:
-        return float(returns.shape[1])
-    with np.errstate(invalid="ignore"):
-        c = np.corrcoef(returns, rowvar=False)
-    good = np.isfinite(c).all(axis=0)
-    c = c[good][:, good]
-    if c.shape[0] < 2:
-        return float(max(1, c.shape[0]))
-    ev = np.linalg.eigvalsh(c)
-    ev = np.clip(ev, 0.0, None)
+    r = np.asarray(returns, dtype=float)
+    if r.ndim != 2 or r.shape[1] < 2:
+        return float(r.shape[1]) if r.ndim == 2 and r.shape[1] >= 1 else np.nan
+
+    keep_col = np.isnan(r).mean(axis=0) <= max_missing
+    if keep_col.sum() < 2:
+        return np.nan
+    r = r[:, keep_col]
+
+    keep_row = ~np.isnan(r).any(axis=1)
+    if keep_row.sum() < max(30, r.shape[1] // 2):
+        return np.nan
+    r = r[keep_row]
+
+    # A column with no variation makes corrcoef divide by zero.
+    varying = r.std(axis=0) > 0
+    if varying.sum() < 2:
+        return np.nan
+    r = r[:, varying]
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        c = np.corrcoef(r, rowvar=False)
+    if not np.isfinite(c).all():
+        return np.nan
+    ev = np.clip(np.linalg.eigvalsh(c), 0.0, None)
     denom = float((ev * ev).sum())
     if denom <= 0:
-        return float(c.shape[0])
+        return np.nan
     return float(ev.sum() ** 2 / denom)
 
 
