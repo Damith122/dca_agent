@@ -114,6 +114,38 @@ check("an empty result has t = 0", B.summarise([])["t_stat"] == 0.0)
 check("a single trade cannot manufacture a t-stat",
       B.summarise([{"net_bps": 999.0, "bars": 1, "reason": "target"}])["t_stat"] == 0.0)
 
+print("\n[6b] Live regressions from the 6-month run")
+# The real run reported 548 trades on BTC/SOL with a 3-bar mean hold, against
+# a measured half-life of 501 bars. A 501-bar half-life cannot make 3-bar
+# round trips; the entry rule was a floor, not a band, so a spread parked
+# beyond the stop was entered and stopped out every single bar.
+parked = SA.PairStats(beta=0.7, intercept=0.0, spread_mean=0.0, spread_sd=0.01,
+                      adf=-4.0, half_life=350, cointegrated=True)
+n = 200
+drift = np.linspace(0.06, 0.09, n)          # z sits at 6..9, far past the stop
+churn = B.trade_pair(drift + rng.normal(0, 0.0005, n), np.zeros(n), parked,
+                     2.0, 0.5, 4.0, 7.32, 200)
+check("a spread parked beyond the stop generates NO trades", len(churn) == 0,
+      f"{len(churn)} trades")
+
+inside = np.full(n, 0.025) + rng.normal(0, 0.0002, n)   # z ~ 2.5, inside the band
+ok_trades = B.trade_pair(inside, np.zeros(n), parked, 2.0, 0.5, 4.0, 7.32, 200)
+check("...but a spread inside the entry band still trades", len(ok_trades) > 0,
+      f"{len(ok_trades)} trades")
+
+# Three of six real pairs came back with a negative beta between assets that
+# are ~0.7 correlated. That is spurious regression, not a hedge.
+anti = SA.fit_pair(-np.cumsum(rng.normal(0, 0.01, 2000)),
+                   np.cumsum(rng.normal(0, 0.01, 2000)))
+check("a beta contradicting the return correlation is rejected",
+      not anti.cointegrated, anti.reason)
+fac = np.cumsum(rng.normal(0, 0.01, 3000))
+w = np.zeros(3000)
+for i in range(1, 3000):
+    w[i] = 0.95 * w[i - 1] + rng.normal(0, 0.01)
+check("...while a sane positive-beta pair is untouched by the filter",
+      SA.fit_pair(1.3 * fac + w, fac).cointegrated)
+
 print("\n[7] Walk-forward never fits on the window it trades")
 src = open("backtest_stat_arb.py", encoding="utf-8").read()
 check("the fit uses only data up to the training boundary",

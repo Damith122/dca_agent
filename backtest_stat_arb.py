@@ -104,9 +104,15 @@ def trade_pair(log_y: np.ndarray, log_x: np.ndarray, st: SA.PairStats,
                 })
                 pos = 0
         if pos == 0 and i < len(z) - 1:
-            if z[i] >= z_entry:
+            # The entry band is a BAND, not a floor. Entering at |z| beyond
+            # the stop means stopping out on the very next bar and re-entering
+            # the bar after - a churn loop that pays the fee every bar and
+            # captures nothing. It is also economically wrong: |z| past the
+            # stop is the evidence that this spread has stopped reverting, so
+            # it is the last moment to add exposure to it.
+            if z_entry <= z[i] < z_stop:
                 pos, entry_i = -1, i        # spread rich: short it
-            elif z[i] <= -z_entry:
+            elif -z_stop < z[i] <= -z_entry:
                 pos, entry_i = 1, i         # spread cheap: buy it
     return trades
 

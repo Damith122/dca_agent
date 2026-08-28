@@ -133,7 +133,18 @@ def fit_pair(log_y: np.ndarray, log_x: np.ndarray, *, alpha: float = 0.05,
     crit = EG_CRITICAL.get(alpha, -3.34)
 
     ok, why = True, ""
-    if stat > crit:
+    # A hedge ratio whose sign contradicts the assets' return correlation is
+    # not a hedge. Between two positively-correlated majors a negative beta
+    # means the "spread" is long both legs - a leveraged directional bet
+    # wearing a market-neutral label. It is the classic signature of spurious
+    # regression on non-stationary series, and it appeared on three of six
+    # real pairs, so it is filtered rather than trusted.
+    corr = float(np.corrcoef(np.diff(log_y), np.diff(log_x))[0, 1]) \
+        if len(log_y) > 2 else 0.0
+    if abs(corr) > 0.2 and beta * corr <= 0:
+        ok, why = False, (f"beta {beta:+.3f} contradicts return correlation "
+                          f"{corr:+.2f} - spurious regression, not a hedge")
+    elif stat > crit:
         ok, why = False, f"ADF {stat:.2f} above {crit:.2f} - no cointegration"
     elif not math.isfinite(hl):
         ok, why = False, "spread diverges rather than reverts"
