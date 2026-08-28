@@ -98,11 +98,16 @@ def load_csv(directory: str, symbol: str) -> List[Candle]:
     return out
 
 
+# The volatility filter is tuned here rather than guessed. Measured on 42h of
+# recorded ticks, 1h ATR(14)/price ran 0.74%-1.57% and 15m ran 0.27%-0.90%, so
+# a single hard-coded floor cannot serve both timeframes - and 42h is far too
+# little to fix one from anyway. Let the walk-forward pick it out of sample.
 GRID = {
     "channel": [20, 40, 60],
     "stop_atr": [1.5, 2.5],
     "tp_atr": [4.0, 8.0],
     "trail_atr": [2.0, 3.0],
+    "atr_floor": [0.0, 0.004, 0.010],
 }
 
 
