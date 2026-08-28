@@ -23,6 +23,8 @@ MODULES = [
     "stat_arb.py", "cross_sectional.py", "backtest_cross_sectional.py",
     "train_ml_model.py", "ml_features.py", "risk_simulator.py",
     "edge_requirements.py", "analyze_feature_log.py", "retention.py",
+    "optimise_cross_sectional.py", "fetch_funding_universe.py",
+    "backtest_xs_funding.py",
 ]
 
 passed = failed = 0
