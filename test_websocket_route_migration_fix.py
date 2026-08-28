@@ -11,6 +11,13 @@ import io
 import websocket as ws_module
 
 
+class _StubManager:
+    """2026-08-20 multi-coin: market_data_consumer() now builds its stream
+    URLs from the manager's OWN symbol rather than the module-level SYMBOL
+    global, so the stub has to carry one."""
+    symbol = "SOLUSDT"
+
+
 async def test_live_market_routes_are_split():
     captured = []
     original_use_testnet = ws_module.USE_TESTNET
@@ -22,12 +29,12 @@ async def test_live_market_routes_are_split():
             captured.append((url, label, stream_suffix))
 
         ws_module._run_single_market_stream = fake_runner
-        await ws_module.market_data_consumer(object())
+        await ws_module.market_data_consumer(_StubManager())
     finally:
         ws_module.USE_TESTNET = original_use_testnet
         ws_module._run_single_market_stream = original_runner
 
-    assert len(captured) == 2
+    assert len(captured) == 3   # bookTicker + depth + aggTrade
     by_suffix = {suffix: url for url, _label, suffix in captured}
     assert "/public/stream?streams=" in by_suffix["bookTicker"]
     assert by_suffix["bookTicker"].endswith("@bookTicker")
@@ -46,7 +53,7 @@ async def test_testnet_market_route_stays_legacy_combined():
             captured.append((url, label, stream_suffix))
 
         ws_module._run_single_market_stream = fake_runner
-        await ws_module.market_data_consumer(object())
+        await ws_module.market_data_consumer(_StubManager())
     finally:
         ws_module.USE_TESTNET = original_use_testnet
         ws_module._run_single_market_stream = original_runner
@@ -55,7 +62,7 @@ async def test_testnet_market_route_stays_legacy_combined():
     url, label, suffix = captured[0]
     assert "/stream?streams=" in url
     assert "@bookTicker/" in url and url.endswith("@aggTrade")
-    assert label == "testnet-combined"
+    assert label == "testnet-combined:SOLUSDT"
     assert suffix == "both"
 
 

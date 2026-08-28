@@ -193,7 +193,16 @@ async def test_profit_lock_requires_fee_safe_floor():
     manager.close_position = fake_close_position
     # Force current unrealized pnl estimate to a thin positive margin
     # (below trading.MIN_NET_PROFIT_USDT) that is still <= locked_profit.
+    #
+    # 2026-08-19 P1: Profit Lock now reads estimate_net_pnl_usdt_EXECUTABLE()
+    # (best_bid/best_ask + actual accumulated commission) rather than
+    # estimate_net_pnl_usdt() (mid/mark + both legs guessed at TAKER_FEE_RATE),
+    # because the old basis decided on a price the close could not achieve - it
+    # closed a live trade at a realized -$0.0170 on a +$0.0936 estimate. Both
+    # are stubbed here so this test pins the FLOOR behaviour it was written for,
+    # independent of which estimator feeds it.
     manager.estimate_net_pnl_usdt = lambda price, qty=None: 0.03
+    manager.estimate_net_pnl_usdt_executable = lambda extra_qty=0.0, extra_entry_price=None: 0.03
     manager.current_price = 60050.0
     manager.candles.on_price(60050.0)
 
@@ -207,6 +216,7 @@ async def test_profit_lock_requires_fee_safe_floor():
     # still at/below locked_profit (peak 0.11 * ratio 0.5 = 0.055) should
     # close exactly as before this fix.
     manager.estimate_net_pnl_usdt = lambda price, qty=None: 0.052
+    manager.estimate_net_pnl_usdt_executable = lambda extra_qty=0.0, extra_entry_price=None: 0.052
     await manager._manage_open_position()
     assert "profit_lock" in close_calls, "Profit Lock must still close once above the fee-safe floor"
     print("PASS: margin above MIN_NET_PROFIT_USDT still triggers profit_lock close as before")

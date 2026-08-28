@@ -848,6 +848,52 @@ FEATURE_LOG_MAX_LOCAL_MB = _env_float("FEATURE_LOG_MAX_LOCAL_MB", 256.0)
 # Master switch. Off means shards accumulate exactly as they did before.
 FEATURE_LOG_RETENTION_ENABLED = _env_bool("FEATURE_LOG_RETENTION_ENABLED", True)
 
+# --- Donchian breakout engine (higher timeframe pivot) ---------------------
+# The micro mean-reversion work concluded that no 10s-3600s signal clears the
+# 7.32 bps round-trip fee: the best rule scored t=+0.27 against the fee over
+# 42h, and 1 of 25 rules was net-positive out of sample. This engine trades a
+# 15m/1h Donchian breakout instead, where a winner is 1-2% rather than 10 bps
+# and the fee is ~0.5% of the move rather than ~100% of it.
+#
+# DEFAULT OFF, deliberately. It has NOT been validated on historical data -
+# backtest_breakout.py could not reach Binance from the machine it was written
+# on. Run it yourself over 3-6 months and turn this on only if the
+# WALK-FORWARD (not the in-sample) lines are net profitable. Enabling this
+# without that evidence repeats the mistake that produced 0W/7L.
+BREAKOUT_ENGINE_ENABLED = _env_bool("BREAKOUT_ENGINE_ENABLED", False)
+BREAKOUT_TIMEFRAME = _env_str("BREAKOUT_TIMEFRAME", "1h")
+BREAKOUT_CHANNEL = _env_int("BREAKOUT_CHANNEL", 20)
+BREAKOUT_ATR_PERIOD = _env_int("BREAKOUT_ATR_PERIOD", 14)
+BREAKOUT_ATR_FLOOR = _env_float("BREAKOUT_ATR_FLOOR", 0.0025)
+BREAKOUT_ATR_CEILING = _env_float("BREAKOUT_ATR_CEILING", 0.040)
+BREAKOUT_STOP_ATR = _env_float("BREAKOUT_STOP_ATR", 1.5)
+BREAKOUT_TP_ATR = _env_float("BREAKOUT_TP_ATR", 6.0)
+BREAKOUT_TRAIL_ATR = _env_float("BREAKOUT_TRAIL_ATR", 2.0)
+BREAKOUT_TRAIL_START_ATR = _env_float("BREAKOUT_TRAIL_START_ATR", 2.0)
+BREAKOUT_RISK_PCT = _env_float("BREAKOUT_RISK_PCT", 0.01)
+BREAKOUT_MAX_LEVERAGE = _env_float("BREAKOUT_MAX_LEVERAGE", 5.0)
+BREAKOUT_ALLOW_SHORT = _env_bool("BREAKOUT_ALLOW_SHORT", True)
+
+
+def breakout_params():
+    """Live parameters as a BreakoutParams, so the bot and the backtest are
+    driven by one set of numbers rather than two that can drift apart."""
+    from breakout import BreakoutParams
+    return BreakoutParams(
+        channel=BREAKOUT_CHANNEL,
+        atr_period=BREAKOUT_ATR_PERIOD,
+        atr_floor=BREAKOUT_ATR_FLOOR,
+        atr_ceiling=BREAKOUT_ATR_CEILING,
+        stop_atr=BREAKOUT_STOP_ATR,
+        tp_atr=BREAKOUT_TP_ATR,
+        trail_atr=BREAKOUT_TRAIL_ATR,
+        trail_start_atr=BREAKOUT_TRAIL_START_ATR,
+        risk_pct=BREAKOUT_RISK_PCT,
+        max_leverage=BREAKOUT_MAX_LEVERAGE,
+        fee_bps_round_trip=ROUND_TRIP_FEE_PCT_EST * 1e4,
+        allow_short=BREAKOUT_ALLOW_SHORT,
+    )
+
 
 def feature_recorder_horizons() -> list:
     """Parsed horizon list; malformed entries are skipped rather than fatal."""
@@ -1561,6 +1607,21 @@ __all__ = [
     "FEATURE_LOG_RETENTION_ENABLED",
     "FEATURE_LOG_RETAIN_LOCAL_HOURS",
     "FEATURE_LOG_MAX_LOCAL_MB",
+    # 2026-08-28 Donchian breakout engine
+    "BREAKOUT_ENGINE_ENABLED",
+    "BREAKOUT_TIMEFRAME",
+    "BREAKOUT_CHANNEL",
+    "BREAKOUT_ATR_PERIOD",
+    "BREAKOUT_ATR_FLOOR",
+    "BREAKOUT_ATR_CEILING",
+    "BREAKOUT_STOP_ATR",
+    "BREAKOUT_TP_ATR",
+    "BREAKOUT_TRAIL_ATR",
+    "BREAKOUT_TRAIL_START_ATR",
+    "BREAKOUT_RISK_PCT",
+    "BREAKOUT_MAX_LEVERAGE",
+    "BREAKOUT_ALLOW_SHORT",
+    "breakout_params",
     "TP_HIT_VETO_ENABLED",
     "TP_HIT_VETO_MIN_PROB",
     "TP_HIT_VETO_BASE_RATE_RATIO",
