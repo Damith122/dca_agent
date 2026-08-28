@@ -140,6 +140,14 @@ from config import (
     FEATURE_LOG_RETENTION_ENABLED,
     FEATURE_LOG_RETAIN_LOCAL_HOURS,
     FEATURE_LOG_MAX_LOCAL_MB,
+    BREAKOUT_ENGINE_ENABLED,
+    BREAKOUT_TIMEFRAME,
+    BREAKOUT_CHANNEL,
+    BREAKOUT_STOP_ATR,
+    BREAKOUT_TP_ATR,
+    BREAKOUT_TRAIL_ATR,
+    BREAKOUT_TRAIL_START_ATR,
+    BREAKOUT_RISK_PCT,
     FEATURE_LOG_PATH,
     feature_recorder_horizons,
     env_parse_warnings,
@@ -1167,6 +1175,22 @@ async def main() -> None:
         print(color(
             " *** feature recorder OFF (set FEATURE_RECORDER_ENABLED=true "
             "to collect entry-rule research data) ***", GRAY,
+        ))
+    if BREAKOUT_ENGINE_ENABLED:
+        print(color(
+            f" *** BREAKOUT ENGINE ON - {BREAKOUT_TIMEFRAME} Donchian({BREAKOUT_CHANNEL}), "
+            f"stop {BREAKOUT_STOP_ATR:g} ATR, target {BREAKOUT_TP_ATR:g} ATR, "
+            f"trail {BREAKOUT_TRAIL_ATR:g} ATR from {BREAKOUT_TRAIL_START_ATR:g} ATR, "
+            f"risking {BREAKOUT_RISK_PCT * 100:g}% per trade ***", MAGENTA,
+        ))
+        print(color(
+            "     verify with: python3 backtest_breakout.py --months 6 "
+            "- deploy only on profitable WALK-FORWARD results", GRAY,
+        ))
+    else:
+        print(color(
+            " *** breakout engine OFF - validate with backtest_breakout.py "
+            "before setting BREAKOUT_ENGINE_ENABLED=true ***", GRAY,
         ))
     if not USE_TESTNET:
         print(color(" *** LIVE MAINNET MODE - REAL MONEY AT RISK ***", RED))
