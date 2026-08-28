@@ -128,6 +128,44 @@ check("an unreliable head reports UNRELIABLE rather than READY",
 check("...and predict_all falls back to 0.5 rather than guessing",
       "if (self.success_fitted and success_reliable) else 0.5" in src)
 
+print("\n[3b] The base rate must be able to forget a label change")
+# Live follow-on: after the label was fixed the head emitted tp_hit_p from
+# 0.09 to 0.68, while tp_hit_base_rate still reported 0.043% - three million
+# samples of the OLD definition drowning nine thousand of the new one. Any
+# veto computed against that mixture is a no-op.
+check("the rate is tracked as an EWMA, not only cumulatively",
+      "self.tp_hit_rate_ewma" in src)
+check("...and the EWMA is what gets returned once warm",
+      "if self.tp_hit_rate_samples >= self._TP_RATE_WARMUP" in src)
+check("...with the cumulative ratio as the warm-up fallback",
+      "self.tp_hit_positives / float(self.tp_hit_labeled_samples)" in src)
+check("both are persisted across restarts",
+      '"tp_hit_rate_ewma": self.tp_hit_rate_ewma' in src
+      and 'state.get("tp_hit_rate_ewma"' in src)
+check("a head reset clears the rolling rate too",
+      "self.tp_hit_rate_ewma = 0.0" in src.split("def to_state")[0])
+
+alpha, warm = 1e-4, 20000
+# Three million samples of a 0.003% label, then a switch to 25%.
+cum_pos, cum_n = int(3_000_000 * 3.2e-05), 3_000_000
+r, ss = 0.0, 0
+rng2 = np.random.default_rng(3)
+for i in range(40000):
+    hit = 1.0 if rng2.random() < 0.25 else 0.0
+    r = hit if ss == 0 else (1 - alpha) * r + alpha * hit
+    ss += 1
+    cum_pos += hit
+    cum_n += 1
+cumulative = cum_pos / cum_n
+check("the cumulative ratio stays stuck near the old label's rate",
+      cumulative < 0.01, f"{cumulative * 100:.4f}%")
+check("the EWMA reaches the new label's rate within hours",
+      0.15 < r < 0.35, f"{r * 100:.1f}% after {ss} samples")
+check("...which is what a veto threshold needs to stay meaningful",
+      0.5 * r > 0.05, f"threshold would be {0.5 * r:.4f}")
+check("the warm-up is at least two time constants",
+      warm >= 2 / alpha)
+
 print("\n[4] Defaults are safe")
 check("adaptive labelling defaults ON", config.TP_HIT_LABEL_ADAPTIVE is True)
 check("the multiplier is above 1, so the label stays selective",
