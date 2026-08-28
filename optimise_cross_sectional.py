@@ -39,6 +39,36 @@ import backtest_cross_sectional as B
 import cross_sectional as CS
 
 
+def read_ledger(path):
+    """Every signal previously tested on this dataset.
+
+    The in-run hurdle already accounts for configurations swept inside one
+    call. It cannot see the calls BEFORE it, and trying signals until one
+    passes is the oldest way to manufacture a result: four independent
+    attempts at p<=0.05 carry an 18.5% chance that one clears on noise.
+    The ledger gives the hurdle a memory.
+    """
+    import os
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh).get("trials", [])
+    except Exception:  # noqa: BLE001 - a corrupt ledger must not block research
+        return []
+
+
+def append_ledger(path, entry):
+    trials = read_ledger(path)
+    trials.append(entry)
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"trials": trials}, fh, indent=2)
+    except Exception:  # noqa: BLE001
+        pass
+    return trials
+
+
 def evaluate(px, signal_fn, rebalance, p, fee_bps, ppy_base):
     r, t, ic = B.run_book(px, signal_fn, p, rebalance, fee_bps)
     return B.summarise(r, t, ic, ppy_base / rebalance, fee_bps)
@@ -55,6 +85,14 @@ def main(argv=None):
     ap.add_argument("--maker-bps", type=float, default=4.0,
                     help="cost if entries are posted rather than taken")
     ap.add_argument("--null-runs", type=int, default=60)
+    ap.add_argument("--holdout", type=float, default=0.33,
+                    help="fraction of the sample reserved for a single "
+                         "pre-committed test; 0 disables it")
+    ap.add_argument("--ledger", default=".research_log.json",
+                    help="running record of every signal tried on this "
+                         "dataset, used to adjust the significance hurdle")
+    ap.add_argument("--no-ledger", action="store_true",
+                    help="do not read or write the trial ledger")
     ap.add_argument("--json", default=None)
     a = ap.parse_args(argv)
 
@@ -75,6 +113,18 @@ def main(argv=None):
     bars_per_year = {"15m": 4 * 24 * 365, "1h": 24 * 365,
                      "4h": 6 * 365, "1d": 365}.get(a.interval, 24 * 365)
     base_fn = CS.SIGNALS[a.signal]
+
+    # Reserve the tail BEFORE anything is measured. The sweep never sees it,
+    # so the single test at the end is the only honest number in the output.
+    px_all = px
+    if a.holdout > 0:
+        cut = int(len(px) * (1.0 - a.holdout))
+        px, px_hold = px[:cut], px[cut:]
+        print(f"    hold-out: sweeping on {len(px)} bars, "
+              f"reserving the last {len(px_hold)} untouched")
+    else:
+        px_hold = None
+        print("    NO HOLD-OUT - every number below is in-sample")
 
     print(f"=== cost optimisation for '{a.signal}', {len(kept)} names, "
           f"{len(grid)} bars ===")
@@ -145,6 +195,17 @@ def main(argv=None):
               f"{r['sharpe']:+8.2f} {r['ic_t']:+7.2f} "
               f"{r['annual_turnover']:8.1f} {r['cost_drag_pct']:6.1f}%")
 
+    # Selecting on Sharpe and then reporting that row's IC can understate a
+    # signal that forecasts well but is expensive to harvest. Show both.
+    by_ic = max(rows, key=lambda r: r["ic_t"])
+    if by_ic is not rows[0]:
+        print(f"\n  strongest FORECAST (not the best net Sharpe): "
+              f"rebalance {by_ic['rebalance']}, IC t {by_ic['ic_t']:+.2f}, "
+              f"Sharpe {by_ic['sharpe']:+.2f}")
+        print("  A high IC there with a poor Sharpe means the signal is real")
+        print("  but the harvesting is losing it - a cost problem, not a")
+        print("  forecasting one.")
+
     best = rows[0]
     print(f"\n=== best configuration ===")
     print(f"  rebalance every {best['rebalance']} bars, damping "
@@ -207,16 +268,79 @@ def main(argv=None):
           f"{'PASS' if beta_ok else 'FAIL'} at "
           f"{betas.mean() if len(betas) else float('nan'):+.4f}")
 
-    all_ok = (best["ic_t"] >= t_hurdle and p_ic <= 0.05
-              and best["sharpe"] > 0 and beta_ok)
-    print("\n  " + ("TRADEABLE at these settings. The edge was real and "
-                    "turnover was eating it." if all_ok else
-                    "NOT TRADEABLE. A sweep that only clears the UNADJUSTED "
-                    "hurdle has\n  found its luckiest cell, not an edge."))
+    # --- trial ledger -----------------------------------------------------
+    prior = [] if a.no_ledger else read_ledger(a.ledger)
+    prior_signals = sorted({t["signal"] for t in prior})
+    n_trials = len(prior_signals) + (0 if a.signal in prior_signals else 1)
+    alpha = 0.05 / max(1, n_trials)
+    if prior_signals:
+        print(f"\n=== trial ledger: {n_trials} signal(s) tested on this dataset "
+              f"({', '.join(prior_signals + ([a.signal] if a.signal not in prior_signals else []))}) ===")
+        print(f"  Bonferroni alpha {alpha:.4f} instead of 0.0500 - each extra")
+        print("  signal is another chance for noise to clear the bar.")
+
+    # --- the hold-out: one test, no searching inside it -------------------
+    hold_ok, hold_t, hold_sharpe = None, float("nan"), float("nan")
+    if px_hold is not None and len(px_hold) > best["rebalance"] * 6:
+        hs = evaluate(px_hold, fn, best["rebalance"], p, best["fee"],
+                      bars_per_year)
+        hold_t, hold_sharpe = hs["ic_t"], hs["sharpe"]
+        hold_ok = bool(hs["ic_t"] >= 2.0 and hs["sharpe"] > 0)
+        print(f"\n=== HOLD-OUT: the winning configuration, tested once ===")
+        print(f"  on {len(px_hold)} bars the sweep never saw")
+        print(f"  IC t {hold_t:+.2f}   net Sharpe {hold_sharpe:+.2f}   "
+              f"trades over {hs['periods']} rebalances")
+        print(f"  hurdle: IC t >= 2.00 and Sharpe > 0 -> "
+              f"{'PASS' if hold_ok else 'FAIL'}")
+        print("  This is a SINGLE pre-committed test, so it needs only the")
+        print("  plain 2.0 threshold - there was nothing to search inside it.")
+    elif px_hold is not None:
+        print(f"\n=== HOLD-OUT: too short to test at rebalance "
+              f"{best['rebalance']} ===")
+
+    all_ok = (best["ic_t"] >= t_hurdle and p_ic <= alpha
+              and best["sharpe"] > 0 and beta_ok
+              and (hold_ok is not False))
+    if all_ok:
+        print("\n  TRADEABLE at these settings. The edge survived the search "
+              "adjustment,\n  the null control, the beta check and a "
+              "hold-out it never saw.")
+    else:
+        # Name the hurdle that actually failed. A generic verdict sends you
+        # to fix the wrong thing - beta is a hedging problem, a short IC is a
+        # signal problem, and a negative Sharpe is a cost problem.
+        why = []
+        if best["ic_t"] < t_hurdle:
+            why.append(f"IC t {best['ic_t']:+.2f} below the {t_hurdle:.2f} "
+                       f"demanded by searching {len(rows)} configurations")
+        if p_ic > alpha:
+            why.append(f"p {p_ic:.3f} above the {alpha:.4f} allowed after "
+                       f"{n_trials} signal(s)")
+        if best["sharpe"] <= 0:
+            why.append(f"net Sharpe {best['sharpe']:+.2f} - costs exceed the edge")
+        if not beta_ok:
+            why.append(f"book beta {beta:+.4f} - this is a directional "
+                       "position, hedge it or drop the signal")
+        if hold_ok is False:
+            why.append(f"hold-out IC t {hold_t:+.2f} / Sharpe {hold_sharpe:+.2f} "
+                       "- it did not survive unseen data")
+        print("\n  NOT TRADEABLE:")
+        for w in why:
+            print(f"    - {w}")
     if best["sharpe"] > 0 and best["ic_t"] < t_hurdle:
         print(f"\n  Note: IC t {best['ic_t']:+.2f} would pass a plain 2.0 threshold but not")
         print(f"  the {t_hurdle:.2f} demanded by searching {len(rows)} configurations.")
         print("  Confirm on data none of this sweep has seen before trading it.")
+
+    if not a.no_ledger:
+        append_ledger(a.ledger, {
+            "signal": a.signal, "configs": len(rows),
+            "best_sharpe": best["sharpe"], "best_ic_t": best["ic_t"],
+            "p_ic": p_ic, "holdout_ic_t": None if hold_ok is None else hold_t,
+            "holdout_sharpe": None if hold_ok is None else hold_sharpe,
+        })
+        print(f"\n  recorded in {a.ledger} - the next signal you try will face")
+        print("  a stricter hurdle because of it.")
 
     if a.json:
         with open(a.json, "w", encoding="utf-8") as fh:
