@@ -26,16 +26,47 @@ import json
 import os
 import sys
 import time
+import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import List, Tuple
 
 FUNDING_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
 
+# Binance tickers are uppercase alphanumerics. The universe file is written
+# from exchangeInfo, which has been seen to carry a promotional listing with
+# CJK characters in its symbol - and a non-ASCII symbol interpolated into a
+# URL makes urllib raise UnicodeEncodeError before any request is sent.
+TICKER = re.compile(r"[A-Z0-9]{2,20}\Z")
+
+
+def safe(text: str) -> str:
+    """Render text that a Windows cp1252 console can print.
+
+    The symbol that broke the run would also have crashed the progress line
+    on the way to reporting itself - two failures from one bad string, and
+    the second would have been even more confusing than the first.
+    """
+    enc = getattr(sys.stdout, "encoding", None) or "ascii"
+    try:
+        text.encode(enc)
+        return text
+    except (UnicodeEncodeError, LookupError):
+        return text.encode("ascii", "backslashreplace").decode("ascii")
+
 
 def fetch_symbol(symbol: str, months: float, pause: float = 0.15
                  ) -> List[Tuple[float, float]]:
-    """[(funding_time_seconds, rate_bps)] oldest first, deduplicated."""
+    """[(funding_time_seconds, rate_bps)] oldest first, deduplicated.
+
+    Raises ValueError for a symbol this endpoint cannot be asked about, and
+    urllib errors for genuine network trouble. The caller distinguishes the
+    two: one bad symbol must never discard hundreds of good downloads.
+    """
+    if not TICKER.match(symbol):
+        raise ValueError(f"{safe(symbol)!r} is not a Binance ticker")
+    symbol = urllib.parse.quote(symbol, safe="")
     end = int(time.time() * 1000)
     start = end - int(months * 30.44 * 86_400_000)
     out = {}
@@ -49,11 +80,8 @@ def fetch_symbol(symbol: str, months: float, pause: float = 0.15
             if e.code in (400, 404):
                 return []          # symbol has no funding history; skip it
             raise
-        except Exception as e:  # noqa: BLE001
-            raise SystemExit(
-                f"could not reach Binance for {symbol}: {e}\n"
-                "If this is a 403 on CONNECT, the machine is blocked from "
-                "Binance - run it locally.")
+        except urllib.error.URLError:
+            raise                      # network trouble - the caller decides
         if not rows:
             break
         for r in rows:
@@ -85,13 +113,37 @@ def main(argv=None):
 
     os.makedirs(a.out, exist_ok=True)
     print(f"=== funding history for {len(syms)} symbols, {a.months:g} months ===")
-    kept, skipped, empty = 0, [], 0
+    kept, short, unusable, net_fail = 0, 0, [], 0
     for i, sym in enumerate(syms, 1):
-        rows = fetch_symbol(sym, a.months)
+        label = safe(sym)
+        try:
+            rows = fetch_symbol(sym, a.months)
+            net_fail = 0
+        except ValueError as e:
+            # Not a ticker this endpoint can be asked about. Skip it and say
+            # so - never abandon the symbols already downloaded.
+            unusable.append(label)
+            print(f"\r  [{i}/{len(syms)}] {label:<14s} skipped: {e}      ")
+            continue
+        except Exception as e:  # noqa: BLE001 - one symbol must not end the run
+            net_fail += 1
+            unusable.append(label)
+            print(f"\r  [{i}/{len(syms)}] {label:<14s} failed: "
+                  f"{safe(str(e))[:60]}      ")
+            if net_fail >= 10:
+                # Ten in a row is not bad symbols, it is a dead connection.
+                print("\n  Ten consecutive failures - stopping. If these are "
+                      "403s on CONNECT,\n  this machine is blocked from "
+                      "Binance; run it locally.")
+                print(f"  {kept} symbols were already written to {a.out} and "
+                      "are still usable.")
+                break
+            time.sleep(1.0)
+            continue
+
         if len(rows) < a.min_rows:
-            (skipped.append(sym) if rows else None)
-            empty += 0 if rows else 1
-            print(f"\r  [{i}/{len(syms)}] {sym:<14s} "
+            short += 1
+            print(f"\r  [{i}/{len(syms)}] {label:<14s} "
                   f"only {len(rows)} rows - skipped        ", end="")
             continue
         with open(os.path.join(a.out, f"{sym}.csv"), "w", newline="",
@@ -100,10 +152,13 @@ def main(argv=None):
             w.writerow(["funding_time", "rate_bps"])
             w.writerows(rows)
         kept += 1
-        print(f"\r  [{i}/{len(syms)}] {sym:<14s} {len(rows)} rows          ",
+        print(f"\r  [{i}/{len(syms)}] {label:<14s} {len(rows)} rows          ",
               end="", flush=True)
-    print(f"\r  done. {kept} symbols written to {a.out}, "
-          f"{len(skipped) + empty} skipped for short history.        ")
+    print(f"\r  done. {kept} written to {a.out}; {short} skipped for short "
+          f"history; {len(unusable)} unusable.        ")
+    if unusable:
+        print(f"  unusable: {', '.join(unusable[:8])}"
+              f"{' ...' if len(unusable) > 8 else ''}")
     if kept < 30:
         print("\n  WARNING: a cross-sectional funding book needs breadth. Under")
         print("  30 names there is not enough dispersion for the ranking to")

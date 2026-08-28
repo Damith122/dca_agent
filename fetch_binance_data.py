@@ -35,9 +35,11 @@ import hashlib
 import io
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -46,6 +48,22 @@ from typing import Dict, List, Optional, Tuple
 VISION = "https://data.binance.vision/data"
 FAPI = "https://fapi.binance.com/fapi/v1/klines"
 EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+
+# exchangeInfo has been seen to carry a promotional listing whose symbol
+# contains CJK characters. Interpolated into a URL that makes urllib raise
+# UnicodeEncodeError before any request goes out, so it is filtered at the
+# source rather than handled at every call site.
+TICKER = re.compile(r"[A-Z0-9]{2,20}\Z")
+
+
+def safe(text: str) -> str:
+    """Render text a Windows cp1252 console can print without raising."""
+    enc = getattr(sys.stdout, "encoding", None) or "ascii"
+    try:
+        text.encode(enc)
+        return text
+    except (UnicodeEncodeError, LookupError):
+        return text.encode("ascii", "backslashreplace").decode("ascii")
 MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
       "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000, "1d": 86_400_000}
 
@@ -102,7 +120,9 @@ def _verify(blob: bytes, checksum: Optional[bytes], label: str) -> bool:
 
 
 def _archive(market: str, freq: str, symbol: str, interval: str, stamp: str):
-    base = f"{VISION}/{market}/{freq}/klines/{symbol}/{interval}/{symbol}-{interval}-{stamp}.zip"
+    q = urllib.parse.quote(symbol, safe="")
+    base = (f"{VISION}/{market}/{freq}/klines/{q}/{interval}/"
+            f"{q}-{interval}-{stamp}.zip")
     blob = _get(base)
     if blob is None:
         return None
@@ -174,12 +194,15 @@ def usdt_perp_universe(limit: int = 0) -> List[str]:
         info = json.loads(raw.decode())
     except ValueError as e:
         raise SystemExit(f"exchangeInfo did not parse as JSON: {e}")
-    syms = sorted(
-        s["symbol"] for s in info.get("symbols", [])
-        if s.get("status") == "TRADING"
-        and s.get("quoteAsset") == "USDT"
-        and s.get("contractType") == "PERPETUAL"
-    )
+    raw = [s["symbol"] for s in info.get("symbols", [])
+           if s.get("status") == "TRADING"
+           and s.get("quoteAsset") == "USDT"
+           and s.get("contractType") == "PERPETUAL"]
+    syms = sorted(s for s in raw if TICKER.match(s))
+    dropped = [safe(s) for s in raw if not TICKER.match(s)]
+    if dropped:
+        print(f"  dropped {len(dropped)} listing(s) whose symbol is not a "
+              f"plain ticker: {', '.join(dropped[:5])}")
     if not syms:
         raise SystemExit("exchangeInfo returned no trading USDT perpetuals")
     return syms[:limit] if limit else syms
@@ -275,9 +298,21 @@ def main(argv=None):
 
     print(f"=== downloading {a.months:g} months of {a.market} klines ===")
     report = []
+    failed = []
     for iv in intervals:
         for sym in symbols:
-            rows, st = download(sym, iv, a.months, a.market)
+            if not TICKER.match(sym):
+                failed.append(f"{safe(sym)} ({iv})")
+                print(f"  {safe(sym)} {iv}: not a plain ticker - skipped")
+                continue
+            try:
+                rows, st = download(sym, iv, a.months, a.market)
+            except SystemExit:
+                raise
+            except Exception as e:  # noqa: BLE001 - one symbol, not the run
+                failed.append(f"{safe(sym)} ({iv})")
+                print(f"  {safe(sym)} {iv}: failed - {safe(str(e))[:60]}")
+                continue
             if not rows:
                 print(f"  {sym} {iv}: NO DATA - check the symbol exists on this market")
                 continue
@@ -288,6 +323,9 @@ def main(argv=None):
             last = datetime.fromtimestamp(rows[-1][0] / 1000, timezone.utc)
             report.append((sym, iv, st, span, first, last, path))
 
+    if failed:
+        print(f"\n  {len(failed)} symbol(s) skipped or failed: "
+              f"{', '.join(failed[:8])}{' ...' if len(failed) > 8 else ''}")
     print("\n=== summary ===")
     print(f"{'symbol':>9s} {'iv':>4s} {'bars':>7s} {'days':>6s} "
           f"{'missing':>8s} {'dropped':>8s}  range")

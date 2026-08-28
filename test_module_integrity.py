@@ -24,7 +24,7 @@ MODULES = [
     "train_ml_model.py", "ml_features.py", "risk_simulator.py",
     "edge_requirements.py", "analyze_feature_log.py", "retention.py",
     "optimise_cross_sectional.py", "fetch_funding_universe.py",
-    "backtest_xs_funding.py",
+    "backtest_xs_funding.py", "ml_features.py",
 ]
 
 passed = failed = 0
