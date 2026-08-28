@@ -161,6 +161,8 @@ def show(title: str, st: dict, p: BreakoutParams):
     print(f"  avg win / avg loss  {st['avg_win_pct']:+.2f}% / {st['avg_loss_pct']:+.2f}%")
     print(f"  expectancy/trade    {st['expectancy_pct']:+.3f}%  "
           f"(fee {p.fee_bps_round_trip:.2f} bps already deducted)")
+    print(f"  avg win / avg loss  {st['avg_win_r']:.2f}R / {st['avg_loss_r']:.2f}R  "
+          f"(1R = the planned stop loss)")
 
 
 def main(argv=None):
@@ -213,6 +215,20 @@ def main(argv=None):
               f"{max(r['max_drawdown_pct'] for r in results.values()):.2f}%")
         print("\n  Deploy only if the OUT-OF-SAMPLE lines are profitable. "
               "In-sample results\n  from a parameter grid always look good and mean nothing.")
+
+        # Hand the exact numbers to the sizing tool rather than making the
+        # reader transcribe them. --observed-trades is the walk-forward count,
+        # not the in-sample one: sizing off a number the strategy has not
+        # earned out of sample is how an account gets emptied.
+        tw = sum(r["trades"] for r in results.values())
+        if tw:
+            wr = sum(r["win_rate"] * r["trades"] for r in results.values()) / tw
+            aw = sum(r["avg_win_r"] * r["trades"] for r in results.values()) / tw
+            al = sum(r["avg_loss_r"] * r["trades"] for r in results.values()) / tw
+            print("\n=== next step: size it ===")
+            print(f"  python3 risk_simulator.py --win-rate {wr:.1f} "
+                  f"--avg-win {aw:.2f} --avg-loss {al:.2f} \\\n"
+                  f"                            --trades 200 --observed-trades {tw}")
 
     if a.json and results:
         with open(a.json, "w", encoding="utf-8") as fh:
