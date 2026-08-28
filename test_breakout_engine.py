@@ -183,7 +183,40 @@ if t:
     check("...and its loss reaches the equity curve", cv[-1] < 1000.0,
           f"{cv[-1]:.4f}")
 
-print("\n[10] Stats arithmetic")
+print("\n[10] R-multiples hand off exactly to risk_simulator")
+# 1R is the PLANNED loss, so a full stop-out must be -1R regardless of how
+# volatile that particular trade was. Deriving R from average percentages
+# afterwards gets this wrong whenever ATR varies between trades.
+p = BreakoutParams(channel=5, atr_period=3, stop_atr=2.0, tp_atr=99.0,
+                   trail_start_atr=99.0, fee_bps_round_trip=0.0)
+pos = open_position("LONG", 100.0, 0.0, atr=1.0, equity=1000.0, p=p)
+check("risk_frac is the stop distance as a fraction of entry",
+      abs(pos.entry - pos.stop) / pos.entry == 0.02,
+      str(abs(pos.entry - pos.stop) / pos.entry))
+
+trend = mk([100] * 8 + [120] + [100] * 3 + [60] * 4, spread=0.0005)
+t, cv = run(trend, BreakoutParams(channel=5, atr_period=3, atr_floor=0.0,
+                                  atr_ceiling=1.0, allow_short=False,
+                                  stop_atr=1.0, tp_atr=99.0,
+                                  trail_start_atr=99.0, fee_bps_round_trip=0.0))
+stopped = [x for x in t if x.reason == "stop"]
+check("a trade exists to measure", bool(stopped), str([x.reason for x in t]))
+if stopped:
+    check("a full stop-out is exactly -1R",
+          abs(stopped[0].r_multiple(0.0) + 1.0) < 1e-9,
+          f"{stopped[0].r_multiple(0.0):.6f}R")
+    check("...and the fee makes it worse than -1R",
+          stopped[0].r_multiple(50.0) < -1.0)
+
+st = stats(t, cv, BreakoutParams(fee_bps_round_trip=0.0))
+check("stats expose avg_win_r and avg_loss_r for the sizing tool",
+      "avg_win_r" in st and "avg_loss_r" in st)
+check("avg_loss_r is reported as a positive magnitude",
+      st["avg_loss_r"] >= 0, str(st["avg_loss_r"]))
+check("a trade with no recorded risk reports 0R rather than dividing by zero",
+      __import__("breakout").Trade("LONG", 0, 100, 1, 110).r_multiple(0.0) == 0.0)
+
+print("\n[11] Stats arithmetic")
 st = stats([], [1000.0], BreakoutParams())
 check("empty results do not divide by zero", st["trades"] == 0
       and st["profit_factor"] == 0.0)

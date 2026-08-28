@@ -1095,6 +1095,26 @@ REGIME_LOOKBACK_CANDLES = 30
 N_FEATURES_V2 = 34
 BRAIN2_WARMUP_UPDATES = _env_int("BRAIN2_WARMUP_UPDATES", 80)
 LABEL_HORIZON_TICKS = 10
+
+# --- tp_hit label calibration (2026-08-28) --------------------------------
+# The tp_hit head labelled a sample positive when |forward return| over
+# LABEL_HORIZON_TICKS reached TAKE_PROFIT_PCT. Those two numbers describe
+# different timescales: 10 ticks is roughly 2.5 seconds, over which the
+# median move measured on live data is 0.8 bps, against a 35 bps threshold.
+# The label was therefore True 0.003% of the time, the head correctly learned
+# to answer "no" always, and its output correlated -0.0007 with the outcome.
+#
+# The threshold is now a multiple of the move actually typical at this
+# horizon, tracked as an EWMA. That asks a learnable question - "is this an
+# unusually large move from here" - with a balanced label, instead of an
+# impossible one. 1.2x the mean absolute move puts the base rate near 30%
+# for a roughly Laplace return distribution.
+TP_HIT_LABEL_ADAPTIVE = _env_bool("TP_HIT_LABEL_ADAPTIVE", True)
+TP_HIT_LABEL_MULT = _env_float("TP_HIT_LABEL_MULT", 1.2)
+# Below this many observations the EWMA is still moving; fall back to the
+# fixed threshold rather than labelling against a half-formed scale.
+TP_HIT_LABEL_MIN_SAMPLES = _env_int("TP_HIT_LABEL_MIN_SAMPLES", 500)
+
 FEATURE_SHORT_LOOKBACK = 5
 RECENT_TRADE_WINDOW = 20
 TP_HIT_LOOKAHEAD_CANDLES = 8      # how far ahead we check "did price reach TP-ish move"
@@ -1721,6 +1741,9 @@ __all__ = [
     "RECENT_TRADE_WINDOW",
     "TP_HIT_LOOKAHEAD_CANDLES",
     "BRAIN_HEAD_MIN_SAMPLES",
+    "TP_HIT_LABEL_ADAPTIVE",
+    "TP_HIT_LABEL_MULT",
+    "TP_HIT_LABEL_MIN_SAMPLES",
     "ENTRY_SCORE_THRESHOLD",
     "SIDEWAYS_ENTRY_SCORE_THRESHOLD",
     "SIDEWAYS_ENTRY_MOMENTUM_ALIGNMENT_ENABLED",

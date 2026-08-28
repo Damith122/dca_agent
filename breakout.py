@@ -76,6 +76,19 @@ class Trade:
     reason: str = ""
     mfe: float = 0.0
     mae: float = 0.0
+    # Stop distance as a fraction of entry, captured when the trade opened.
+    # This is what makes an R-multiple exact: 1R is the planned loss, so a
+    # full stop-out is -1R by construction and a trailed exit is whatever
+    # fraction of it actually happened. Deriving R from average percentages
+    # afterwards gets this wrong whenever volatility varies between trades.
+    risk_frac: float = 0.0
+
+    def r_multiple(self, fee_bps: float) -> float:
+        """Net result in units of the risk taken. Zero risk_frac means the
+        trade predates this field; report 0 rather than divide by zero."""
+        if self.risk_frac <= 0:
+            return 0.0
+        return (self.gross_pct - fee_bps / 1e4) / self.risk_frac
 
     @property
     def gross_pct(self) -> float:
@@ -225,7 +238,8 @@ def run(candles: Sequence[Candle], p: BreakoutParams, equity: float = 1000.0):
             if exit_px is not None:
                 t = Trade(side=pos.side, entry_ts=pos.entry_ts, entry=pos.entry,
                           exit_ts=c.ts, exit=exit_px, qty=pos.qty, reason=reason,
-                          mfe=pos.mfe, mae=pos.mae)
+                          mfe=pos.mfe, mae=pos.mae,
+                          risk_frac=p.stop_atr * pos.atr / pos.entry)
                 notional = pos.qty * pos.entry
                 pnl = t.gross_pct * notional - notional * p.fee_bps_round_trip / 1e4
                 equity += pnl
@@ -257,7 +271,8 @@ def run(candles: Sequence[Candle], p: BreakoutParams, equity: float = 1000.0):
         last = candles[-1]
         t = Trade(side=pos.side, entry_ts=pos.entry_ts, entry=pos.entry,
                   exit_ts=last.ts, exit=last.close, qty=pos.qty,
-                  reason="end_of_data", mfe=pos.mfe, mae=pos.mae)
+                  reason="end_of_data", mfe=pos.mfe, mae=pos.mae,
+                  risk_frac=p.stop_atr * pos.atr / pos.entry)
         notional = pos.qty * pos.entry
         equity += t.gross_pct * notional - notional * p.fee_bps_round_trip / 1e4
         trades.append(t)
@@ -293,4 +308,12 @@ def stats(trades: Sequence[Trade], curve: Sequence[float], p: BreakoutParams) ->
         "avg_win_pct": (sum(wins) / len(wins) * 100.0) if wins else 0.0,
         "avg_loss_pct": (sum(losses) / len(losses) * 100.0) if losses else 0.0,
         "expectancy_pct": sum(nets) / len(nets) * 100.0,
+        # R-multiples: what risk_simulator.py needs, so the handoff between
+        # the two tools is exact rather than eyeballed off percentages.
+        "avg_win_r": (sum(rw) / len(rw)) if (rw := [t.r_multiple(p.fee_bps_round_trip)
+                                                   for t in trades
+                                                   if t.r_multiple(p.fee_bps_round_trip) > 0]) else 0.0,
+        "avg_loss_r": (-sum(rl) / len(rl)) if (rl := [t.r_multiple(p.fee_bps_round_trip)
+                                                     for t in trades
+                                                     if t.r_multiple(p.fee_bps_round_trip) <= 0]) else 0.0,
     }
