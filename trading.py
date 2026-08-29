@@ -1558,6 +1558,12 @@ class EntryEngineV2:
                 f"risk_score={components['risk_score']:.4f} "
                 f"quality_pred={conf.quality_pred:+.4f} "
                 f"success_p={conf.success_probability:.4f} tp_hit_p={conf.tp_hit_probability:.4f} "
+                # The PERIODIC line needs this too, not just the accepted-entry
+                # line below. That one only prints when an entry is actually
+                # taken, and no entry has ever been taken - precisely because
+                # this head was saturated - so adding it there alone left the
+                # one number worth watching still invisible in the logs.
+                f"noise_p={conf.noise_probability:.4f} "
                 f"tp_hit_veto={tp_hit_veto} tp_hit_thr={tp_hit_threshold:.3e} "
                 f"tp_hit_base_rate={tp_hit_base_rate:.3e} "
                 f"final_score={score:.4f} threshold={active_threshold:.4f} "

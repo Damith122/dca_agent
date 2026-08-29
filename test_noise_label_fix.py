@@ -207,6 +207,15 @@ check("...and before the tp_hit label reads it", -1 < i_upd < i_tp)
 
 check("noise_p is now logged directly instead of solved back out",
       "noise_p={conf.noise_probability" in TSRC)
+# It must be on the PERIODIC line. The accepted-entry line prints only when
+# an entry is taken, and none ever was - which is the very condition being
+# diagnosed - so putting it only there would leave it invisible.
+_periodic = TSRC[TSRC.find("if self._should_log():"):]
+_periodic = _periodic[:_periodic.find("if should_enter:")]
+check("...on the throttled periodic line, which actually gets emitted",
+      "noise_p={conf.noise_probability" in _periodic)
+check("...and it sits beside the other head probabilities",
+      "tp_hit_p" in _periodic and "success_p" in _periodic)
 
 
 # ==========================================================================
