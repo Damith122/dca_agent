@@ -416,7 +416,8 @@ def enforce_safety_gates() -> None:
 # client.get_exchange_info(), so it travels with the REST client).
 # ============================================================================
 
-from exchange import BinanceApiError, RestClient, SymbolFilters, fetch_symbol_filters
+from exchange import (BinanceApiError, RestClient, SymbolFilters,
+                      SymbolNotListed, fetch_symbol_filters)
 
 
 # ============================================================================
@@ -1225,6 +1226,14 @@ async def main() -> None:
         for sym in ACTIVE_SYMBOLS:
             try:
                 managers[sym] = await setup_symbol(client, sym, portfolio)
+            except SymbolNotListed as e:
+                # Its own branch so the log says "not on this venue" rather
+                # than burying it among genuine initialisation failures -
+                # the fix is a watchlist change, not a retry.
+                print(color(
+                    f"[setup] {sym} is NOT LISTED here ({_exc_text(e)}) - excluded "
+                    f"from this run; the remaining watchlist symbols continue.", YELLOW,
+                ))
             except Exception as e:  # noqa: BLE001 - one symbol must not sink the watchlist
                 print(color(
                     f"[setup] {sym} FAILED to initialise ({_exc_text(e)}) - it is excluded "

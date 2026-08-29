@@ -667,11 +667,31 @@ class SymbolFilters:
     min_notional: float
 
 
+class SymbolNotListed(Exception):
+    """This symbol is not on this venue.
+
+    Deliberately an Exception, not SystemExit. SystemExit inherits from
+    BaseException, so `except Exception` does not catch it - and dca2.py's
+    per-symbol setup loop guards each symbol with exactly that. A symbol
+    missing from exchangeInfo therefore bypassed the guard designed to
+    exclude it and killed the whole process instead.
+
+    That never fired on mainnet, where every watchlist symbol is listed. It
+    fires immediately on TESTNET, whose symbol list is far smaller - which is
+    precisely when the watchlist most needs to survive one absence.
+    """
+
+
 async def fetch_symbol_filters(client: RestClient, symbol: str) -> SymbolFilters:
     info = await client.get_exchange_info()
     sym_info = next((s for s in info["symbols"] if s["symbol"] == symbol), None)
     if sym_info is None:
-        raise SystemExit(f"Symbol {symbol} not found in exchangeInfo response.")
+        listed = sorted(s["symbol"] for s in info.get("symbols", []))
+        raise SymbolNotListed(
+            f"{symbol} is not listed on this venue "
+            f"({len(listed)} symbols available). "
+            f"Check the watchlist against the endpoint you are pointed at - "
+            f"testnet lists far fewer symbols than mainnet.")
 
     tick_size = step_size = min_qty = 0.0
     min_notional = 0.0
