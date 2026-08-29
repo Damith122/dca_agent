@@ -304,6 +304,24 @@ try:
         for child in _ast.iter_child_nodes(node):
             if isinstance(child, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)):
                 continue
+            if isinstance(child, _ast.Lambda):
+                # A lambda is its own scope, exactly like a def. Descending
+                # into it blindly attributed ITS parameters to the enclosing
+                # function and reported them unresolved (a plain
+                # `key=lambda t: t[0]` was enough to trigger it). Its
+                # defaults ARE evaluated in the enclosing scope, so those
+                # still count here; its body's loads count only if they are
+                # not one of its own parameters.
+                lam_params = _params(child)
+                for d in list(child.args.defaults) + [k for k in child.args.kw_defaults if k]:
+                    out += _loads(d)
+                    if isinstance(d, _ast.Name) and isinstance(d.ctx, _ast.Load):
+                        out.append((d.id, d.lineno))
+                body_loads = list(_loads(child.body))
+                if isinstance(child.body, _ast.Name) and isinstance(child.body.ctx, _ast.Load):
+                    body_loads.append((child.body.id, child.body.lineno))
+                out += [(n, ln) for n, ln in body_loads if n not in lam_params]
+                continue
             if isinstance(child, _ast.arg):
                 continue                      # bare annotation on a parameter
             if isinstance(child, _ast.AnnAssign):

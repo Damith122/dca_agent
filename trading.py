@@ -248,6 +248,7 @@ import retention
 from decimal import Decimal, ROUND_UP
 
 from feature_recorder import FeatureRecorder
+from dry_fills import DryFillSimulator
 from config import (
     # 2026-08-24 feature recorder
     FEATURE_LOG_PATH,
@@ -262,6 +263,10 @@ from config import (
     TP_HIT_LABEL_ADAPTIVE,
     TP_HIT_LABEL_MULT,
     TP_HIT_LABEL_MIN_SAMPLES,
+    DRY_FILL_ENABLED,
+    DRY_FILL_SLIPPAGE_BPS,
+    DRY_FILL_TAKER_FEE_PCT,
+    DRY_FILL_MIN_DELAY_SEC,
     feature_recorder_horizons,
     # 2026-08-21 robust env parsing: shared with config.py so a blank or
     # malformed variable falls back to the default here too, rather than
@@ -2554,6 +2559,32 @@ class MartingaleManager:
         self._last_synced_csv_hash: Dict[str, Optional[str]] = {}
 
         self._order_index: Dict[int, str] = {}
+        # 2026-08-29 DRY_RUN simulated fills. Under DRY_RUN no order is ever
+        # sent, so no fill event ever arrives, so no position ever opens or
+        # closes, and brain.learn_success() - which is only ever called from
+        # _on_close_filled() - never runs. That is why the success head sat
+        # at its 0.5 fallback with single-digit lifetime samples against
+        # BRAIN_HEAD_MIN_SAMPLES=20: starved of labels, not broken.
+        #
+        # This fills simulated orders against the REAL mainnet prices already
+        # being streamed, on a LATER tick than the one that submitted them,
+        # charging adverse slippage and taker commission. It emits a Binance
+        # ORDER_TRADE_UPDATE payload into handle_order_update() rather than
+        # calling the fill handlers directly, so fee accumulation, realized
+        # PnL, the close-dedup gate, trade logging and Brain reinforcement
+        # all run the SAME production code path a live fill runs - there is
+        # no second implementation that could drift.
+        #
+        # None (and every call site a no-op) unless DRY_RUN is on: with real
+        # trading the exchange supplies the fills and this is never consulted.
+        self._dry_fills: Optional[DryFillSimulator] = (
+            DryFillSimulator(
+                taker_fee_pct=DRY_FILL_TAKER_FEE_PCT,
+                slippage_bps=DRY_FILL_SLIPPAGE_BPS,
+                min_delay_sec=DRY_FILL_MIN_DELAY_SEC,
+            )
+            if (DRY_RUN and DRY_FILL_ENABLED) else None
+        )
         # 2026-08 protective-stop ownership fix (review finding 4):
         # monotonic per-process counter feeding _new_protective_stop_client_algo_id().
         self._protective_stop_seq: int = 0
@@ -5112,6 +5143,11 @@ class MartingaleManager:
             return
         self._ticks_run += 1
 
+        # Resolve any DRY_RUN order queued on an EARLIER tick before any
+        # decision is made on this one, so the state machine below sees the
+        # position as it now is. No-op outside DRY_RUN. See _resolve_dry_fills().
+        await self._resolve_dry_fills()
+
         await self._sweep_orphan_protective_stops()
         # 2026-08 post-only (maker) entry execution: a GTX limit order can
         # legitimately rest unfilled forever if price walks away from it.
@@ -5857,6 +5893,17 @@ class MartingaleManager:
             self.position.side = side_signal
             self.position.status = "ENTERING" if step == 0 else "DCA_PENDING"
             self.last_trade_action_ts = time.time()
+            # Queue the simulated fill. It resolves on a LATER tick (see
+            # _resolve_dry_fills()), never this one - submitting and filling
+            # against the same observed price is lookahead, and it is the
+            # single most common way a paper-trading harness manufactures an
+            # edge that does not exist. No-op when DRY_FILL_ENABLED is off,
+            # in which case the position stays parked in ENTERING exactly as
+            # it did before, and the recorder keeps sampling regardless.
+            if self._dry_fills is not None:
+                self._dry_fills.register(
+                    fake_id, role, order_side, qty, price, tick=self._ticks_run,
+                )
             return
 
         # 2026-08 entry-context/commission race fix: transition status
@@ -6011,6 +6058,21 @@ class MartingaleManager:
                 f"{now_str()} [DRY RUN] would place CLOSE {close_side} {qty} "
                 f"{self.symbol} reduceOnly MARKET", GRAY
             ))
+            # Same later-tick rule as the entry side. The realized PnL of
+            # this close is computed at RESOLUTION time from the position's
+            # avg_entry_price and the price that has actually arrived by
+            # then - not from self.current_price now, which is the price the
+            # close decision itself was made on.
+            if self._dry_fills is not None:
+                self._dry_fills.register(
+                    fake_id, "close", close_side, qty,
+                    # submitted_price is bookkeeping only (the fill is priced
+                    # at resolution time); avg_entry_price is the fallback so
+                    # a momentarily-absent current_price cannot silently drop
+                    # the registration and pin the position in CLOSING.
+                    self.current_price or self.position.avg_entry_price or 0.0,
+                    tick=self._ticks_run,
+                )
             return fake_id
 
         try:
@@ -7210,6 +7272,17 @@ class MartingaleManager:
             # In dry run there's no real fill event coming back, so apply the
             # reduction immediately to keep local state consistent.
             await self._apply_partial_close(qty, self.current_price or p.avg_entry_price, dry_run=True)
+            # 2026-08-29: and de-register it. The reduction is already
+            # applied, so no event will ever arrive to pop this id - it used
+            # to leak into _order_index for the life of the process. That was
+            # harmless while DRY_RUN dispatched no fill events at all, but
+            # simulated fills now do: fake ids are derived from the clock
+            # modulo 1e6, so a leaked "partial_close" id could eventually
+            # collide with a later close's id and route that close to
+            # _apply_partial_close() instead of _on_close_filled(), leaving
+            # the position stuck OPEN with no trade logged and no Brain
+            # label. Cheap to prevent, expensive to diagnose.
+            self._order_index.pop(fake_id, None)
             return
 
         try:
@@ -9187,6 +9260,71 @@ class MartingaleManager:
         ))
         await self.handle_order_update(event)
         return True
+
+    async def _resolve_dry_fills(self) -> None:
+        """Fills DRY_RUN orders queued on an EARLIER tick, at the price that
+        has arrived since. No-op unless DRY_RUN and DRY_FILL_ENABLED.
+
+        Called at the top of the throttled section of on_price_tick(), so a
+        simulated order submitted during tick N cannot resolve before tick
+        N+1 - at least TICK_MIN_INTERVAL_SEC later, at whatever price the
+        market has actually moved to. The alternative (filling at the price
+        the decision was made on) would let entries execute at a level the
+        decision already knew about, which is exactly the lookahead that
+        makes a paper harness look profitable and a live account not.
+
+        The event is dispatched through handle_order_update(), the same
+        entry point the live user-data websocket uses, rather than calling
+        _on_entry_filled()/_on_close_filled() directly. Commission
+        accumulation, realized-PnL bookkeeping, the close-dedup gate, the
+        trade log and brain.learn_success()/learn_quality() therefore all
+        run the production path unchanged - a simulated trade is accounted
+        for exactly as a real one, because it IS the same code.
+        """
+        sim = self._dry_fills
+        if sim is None or sim.pending_count() == 0:
+            return
+        price = self.current_price
+        if price is None or price <= 0:
+            return
+        # Oldest first: if an entry and a close were somehow both queued,
+        # they must be applied in submission order or the close would be
+        # priced against a position that had not opened yet.
+        pending = sim.ready(price, tick=self._ticks_run)
+        for pf, fill_price in sorted(pending, key=lambda t: t[0].submitted_ts):
+            if pf.order_id not in self._order_index:
+                # Something else already consumed or discarded this order
+                # (it is not tracked any more). Dispatching now would land
+                # in handle_order_update()'s untracked branch and sit in
+                # _unmatched_fills until it expired, so drop it here.
+                sim.cancel(pf.order_id)
+                continue
+            # Snapshot the realized PnL BEFORE dispatching: _on_close_filled()
+            # resets the position to FLAT, so avg_entry_price/side must be
+            # read while they still describe the position being closed.
+            # Gross of commission, matching Binance's own "rp" convention -
+            # the downstream accounting subtracts fees itself from "n", and
+            # netting them here as well would deduct them twice.
+            realized = 0.0
+            if pf.role in ("close", "partial_close"):
+                p = self.position
+                if p.avg_entry_price and p.side:
+                    realized = sim.realized_pnl(
+                        p.side, p.avg_entry_price, fill_price, pf.qty,
+                    )
+            if sim.resolve(pf.order_id) is None:
+                continue
+            print(color(
+                f"{now_str()} [dry-fill] simulated {pf.role.upper()} {pf.side} {pf.qty} "
+                f"{self.symbol} @ {fill_price:.6f} (submitted @ {pf.submitted_price:.6f}, "
+                f"{time.time() - pf.submitted_ts:.2f}s ago, slippage "
+                f"{DRY_FILL_SLIPPAGE_BPS:.1f}bps, fee "
+                f"${sim.commission(fill_price, pf.qty):.4f}, rp ${realized:+.4f}) - "
+                f"routing through the live fill path", GRAY,
+            ))
+            await self.handle_order_update(
+                sim.build_event(pf, fill_price, self.symbol, realized_pnl=realized)
+            )
 
     async def handle_order_update(self, event: dict) -> None:
         o = event.get("o", {})

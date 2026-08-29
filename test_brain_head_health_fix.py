@@ -115,10 +115,18 @@ check("a perfectly flat market does not label everything positive",
       f"{np.array(h2[2000:]).mean() * 100:.2f}%")
 
 print("\n[3] success_p is starved, not broken - and says so")
-# Only one real call site; the other two matches are comments explaining why
-# certain paths deliberately do NOT reinforce.
-real_calls = sum(1 for ln in tsrc.splitlines()
-                 if "brain.learn_success(" in ln and not ln.strip().startswith("#"))
+# Only one real call site. Counted from the syntax tree rather than by text
+# match: prose mentioning learn_success() - in a comment explaining why a
+# path deliberately does NOT reinforce, or in a docstring describing what
+# runs downstream of a fill - is not a call, and a line-based count read
+# those as extra call sites.
+import ast as _ast_bh
+real_calls = sum(
+    1 for n in _ast_bh.walk(_ast_bh.parse(tsrc))
+    if isinstance(n, _ast_bh.Call)
+    and isinstance(n.func, _ast_bh.Attribute)
+    and n.func.attr == "learn_success"
+)
 check("its only label source is a closed trade", real_calls == 1,
       f"{real_calls} call sites")
 check("the reliability gate needs both classes AND a sample count",
