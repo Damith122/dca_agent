@@ -35,6 +35,11 @@ from collections import Counter, defaultdict
 import numpy as np
 
 HORIZONS = [5, 15, 30, 60, 300, 900, 1800, 3600]
+# Probability heads are bounded [0,1] and a median at either end means
+# saturation. quality is a REGRESSION over reward and risk/conf are scores -
+# a zero-centred regression sitting near 0 is healthy, not saturated, so
+# applying a probability test to them produces a false alarm.
+PROB_HEADS = {"success_p", "tp_hit_p", "noise_p", "trend_conf"}
 HEADS = ["success_p", "tp_hit_p", "noise_p", "quality", "conf", "risk",
          "trend_conf"]
 
@@ -113,9 +118,11 @@ def head_health(rows):
         if d == 1:
             verdict = "CONSTANT - this head is not learning"
             broken.append(h)
-        elif np.median(v) > 0.98 or np.median(v) < 0.02:
+        elif h in PROB_HEADS and (np.median(v) > 0.98 or np.median(v) < 0.02):
             verdict = "SATURATED - pinned at one end of its range"
             broken.append(h)
+        elif h not in PROB_HEADS:
+            verdict = "(regression/score - range check only)"
         else:
             verdict = ""
         print(f"  {h:>11s} {d:9d} {v.min():12.6f} {np.median(v):12.6f} "
@@ -141,37 +148,59 @@ def head_health(rows):
 
 def calibration(rows):
     rule("3. CALIBRATION  -  when a head says X%, does X% happen?")
-    # tp_hit_p claims the probability of reaching the take-profit before the
-    # stop. The recorded MFE/MAE say what actually happened.
+    # tp_hit_p predicts whether |move| exceeds an adaptive threshold at the
+    # LABEL horizon - about 2.5 seconds. An earlier version of this function
+    # compared it against "did MFE beat MAE over the whole recorder window",
+    # which is a different event over a horizon 1400x longer, and produced a
+    # damning gap column that criticised the head for something it never
+    # claimed. r5 is the closest recorded horizon to the label's own, so the
+    # realised outcome is reconstructed from that.
     p = np.array([r.get("tp_hit_p", np.nan) for r in rows], dtype=float)
-    mfe = np.array([r.get("mfe_long", np.nan) for r in rows], dtype=float)
-    mae = np.array([r.get("mae_long", np.nan) for r in rows], dtype=float)
-    ok = np.isfinite(p) & np.isfinite(mfe) & np.isfinite(mae)
+    r5 = np.array([r.get("r5", np.nan) for r in rows], dtype=float)
+    ok = np.isfinite(p) & np.isfinite(r5)
     if ok.sum() < 500:
-        print("  not enough rows with both a prediction and an outcome")
+        print("  not enough rows carrying both a prediction and an r5 outcome")
         return
-    p, mfe, mae = p[ok], mfe[ok], mae[ok]
-    # "Hit" = the favourable excursion beat the adverse one over the window.
-    hit = (mfe > -mae).astype(float)
-    print(f"  {ok.sum()} rows with a prediction and a realised excursion")
-    print(f"  base rate (MFE beat MAE): {hit.mean() * 100:.1f}%\n")
+    p, moves = p[ok], np.abs(r5[ok])
+
+    # Reconstruct the adaptive threshold the bot itself would have used: an
+    # EWMA of |move| at this horizon, times the configured multiplier.
+    scale, hits = float(np.median(moves)), []
+    for v in moves:
+        scale = 0.999 * scale + 0.001 * max(v, 1e-9)
+        hits.append(v >= 1.2 * scale)
+    hit = np.array(hits, dtype=float)
+    warm = 500
+    p, hit = p[warm:], hit[warm:]
+    print(f"  {len(p)} rows, outcome = |r5| above the adaptive threshold")
+    print(f"  realised base rate: {hit.mean() * 100:.1f}%")
+    print(f"  mean prediction:    {p.mean() * 100:.1f}%\n")
     print(f"  {'predicted tp_hit_p':>22s} {'n':>7s} {'predicted':>10s} "
           f"{'actual':>9s}  gap")
-    edges = [0, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 0.1, 0.5, 1.01]
+    edges = [0, 0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 1.01]
     for a, b in zip(edges, edges[1:]):
         m = (p >= a) & (p < b)
-        if m.sum() < 20:
+        if m.sum() < 30:
             continue
-        pred, act = p[m].mean(), hit[m].mean()
-        print(f"  [{a:8.0e},{b:8.0e}) {m.sum():7d} {pred * 100:9.4f}% "
-              f"{act * 100:8.1f}%  {(act - pred) * 100:+7.1f} pts")
+        print(f"  [{a:8.2f},{b:8.2f}) {m.sum():7d} {p[m].mean() * 100:9.1f}% "
+              f"{hit[m].mean() * 100:8.1f}%  {(hit[m].mean() - p[m].mean()) * 100:+7.1f} pts")
     corr = float(np.corrcoef(p, hit)[0, 1]) if p.std() > 0 else float("nan")
-    print(f"\n  correlation between prediction and outcome: {corr:+.4f}")
-    if not math.isfinite(corr) or abs(corr) < 0.03:
-        print("  The prediction carries no information about the outcome.")
-        print("  A head can be perfectly calibrated on average and still be")
-        print("  useless if it cannot separate one case from another - this")
-        print("  one is neither.")
+    n = len(p)
+    # A 5s forward window at 10s sampling does NOT overlap the next row's, so
+    # unlike the longer horizons these observations are already independent
+    # and the naive t is honest here. That is only true because r5 is shorter
+    # than the sampling interval - the r300 and r3600 sections below have to
+    # subsample, and do.
+    t = corr * math.sqrt(max(1, n - 2)) / math.sqrt(max(1e-12, 1 - corr * corr))
+    print(f"\n  correlation between prediction and outcome: {corr:+.4f}  "
+          f"(t {t:+.2f} on {len(idx)} samples)")
+    if abs(corr) < 0.03:
+        print("  The head now VARIES but its variation does not track the")
+        print("  outcome. Fixing the label made it learnable; it did not make")
+        print("  it predictive. Those are different problems and only the")
+        print("  first one has been solved.")
+    elif corr > 0:
+        print("  The prediction carries real information about its own label.")
 
 
 def feature_ic(rows):
