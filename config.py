@@ -1115,6 +1115,35 @@ TP_HIT_LABEL_MULT = _env_float("TP_HIT_LABEL_MULT", 1.2)
 # fixed threshold rather than labelling against a half-formed scale.
 TP_HIT_LABEL_MIN_SAMPLES = _env_int("TP_HIT_LABEL_MIN_SAMPLES", 500)
 
+# --- simulated fills under DRY_RUN (2026-08-29) ---------------------------
+# The success head learns only from CLOSED trades. Under DRY_RUN no order is
+# ever sent, so no fill event ever arrives, so no position ever opens or
+# closes, and the head has stayed at its 0.5 fallback with a handful of
+# lifetime samples against BRAIN_HEAD_MIN_SAMPLES=20. It is starved, not
+# broken.
+#
+# With this enabled, DRY_RUN orders are filled against the REAL mainnet
+# prices the bot is already streaming: labels describe the market actually
+# being traded, with nothing at risk and no venue mismatch. Two rules keep
+# it honest - an order never fills on the tick that submitted it (deciding
+# and executing on the same observation is lookahead, and it is the usual
+# way a paper harness invents profit), and every fill is charged adverse
+# slippage plus the taker commission.
+#
+# Has no effect whatsoever when DRY_RUN is false: real fills come from the
+# exchange and this module is never consulted.
+DRY_FILL_ENABLED = _env_bool("DRY_FILL_ENABLED", True)
+# Adverse slippage per fill, in basis points of the fill price. Applied
+# against the order in both directions (a BUY pays up, a SELL sells down).
+DRY_FILL_SLIPPAGE_BPS = _env_float("DRY_FILL_SLIPPAGE_BPS", 1.0)
+# Commission per fill as a fraction of notional. 0.05% is the Binance USD-M
+# taker rate, which is what a MARKET order pays.
+DRY_FILL_TAKER_FEE_PCT = _env_float("DRY_FILL_TAKER_FEE_PCT", 0.0005)
+# Extra latency beyond "a later tick" before a simulated order may fill.
+# The tick throttle (TICK_MIN_INTERVAL_SEC) already guarantees a gap, so 0
+# means "next decision tick"; raise it to model a slower venue.
+DRY_FILL_MIN_DELAY_SEC = _env_float("DRY_FILL_MIN_DELAY_SEC", 0.0)
+
 FEATURE_SHORT_LOOKBACK = 5
 RECENT_TRADE_WINDOW = 20
 TP_HIT_LOOKAHEAD_CANDLES = 8      # how far ahead we check "did price reach TP-ish move"
@@ -1744,6 +1773,10 @@ __all__ = [
     "TP_HIT_LABEL_ADAPTIVE",
     "TP_HIT_LABEL_MULT",
     "TP_HIT_LABEL_MIN_SAMPLES",
+    "DRY_FILL_ENABLED",
+    "DRY_FILL_SLIPPAGE_BPS",
+    "DRY_FILL_TAKER_FEE_PCT",
+    "DRY_FILL_MIN_DELAY_SEC",
     "ENTRY_SCORE_THRESHOLD",
     "SIDEWAYS_ENTRY_SCORE_THRESHOLD",
     "SIDEWAYS_ENTRY_MOMENTUM_ALIGNMENT_ENABLED",

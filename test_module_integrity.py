@@ -25,7 +25,7 @@ MODULES = [
     "edge_requirements.py", "analyze_feature_log.py", "retention.py",
     "optimise_cross_sectional.py", "fetch_funding_universe.py",
     "backtest_xs_funding.py", "ml_features.py", "diagnose_live.py",
-    "exchange.py",
+    "exchange.py", "dry_fills.py",
 ]
 
 passed = failed = 0

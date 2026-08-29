@@ -160,6 +160,9 @@ from config import (
     notional_scaling_report,
     USE_TESTNET,
     DRY_RUN,
+    DRY_FILL_ENABLED,
+    DRY_FILL_SLIPPAGE_BPS,
+    DRY_FILL_TAKER_FEE_PCT,
     I_UNDERSTAND_THIS_IS_REAL_MONEY,
     LIVE_TRADING_CONFIRMATION,
     API_KEY,
@@ -1144,6 +1147,26 @@ async def main() -> None:
     ))
     if DRY_RUN:
         print(color(" *** DRY RUN MODE - no real orders will be sent ***", YELLOW))
+        # 2026-08-29: the success head learns only from closed trades, and
+        # before this a DRY_RUN order never filled - so no position ever
+        # opened, none ever closed, and learn_success() never ran. State the
+        # simulator's configuration at boot so "why is success_p still 0.5?"
+        # is answerable from the first screen of logs.
+        if DRY_FILL_ENABLED:
+            print(color(
+                f"     simulated fills ON - DRY_RUN orders fill against REAL "
+                f"{'testnet' if USE_TESTNET else 'mainnet'} prices on a LATER tick "
+                f"(never the submitting one), charged {DRY_FILL_SLIPPAGE_BPS:.1f}bps "
+                f"adverse slippage + {DRY_FILL_TAKER_FEE_PCT*100:.3f}% taker fee. "
+                f"Positions open and close, so the success head gets labels. "
+                f"No capital is at risk.", GRAY,
+            ))
+        else:
+            print(color(
+                "     simulated fills OFF (DRY_FILL_ENABLED=false) - orders are logged "
+                "and never filled, so no trade ever closes and the success head cannot "
+                "learn. Recording and every other head are unaffected.", YELLOW,
+            ))
     # 2026-08-24: state the recorder's configuration at boot. Without this the
     # only way to confirm it is running is to wait out the 10-minute status
     # loop, which makes "is it on?" needlessly slow to answer - and makes a
