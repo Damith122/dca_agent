@@ -263,6 +263,9 @@ from config import (
     TP_HIT_LABEL_ADAPTIVE,
     TP_HIT_LABEL_MULT,
     TP_HIT_LABEL_MIN_SAMPLES,
+    NOISE_LABEL_ADAPTIVE,
+    NOISE_LABEL_MULT,
+    NOISE_LABEL_MIN_SAMPLES,
     DRY_FILL_ENABLED,
     DRY_FILL_SLIPPAGE_BPS,
     DRY_FILL_TAKER_FEE_PCT,
@@ -1586,7 +1589,11 @@ class EntryEngineV2:
                 f"brain_confidence={conf.confidence_score:.4f} "
                 f"trend_confidence={conf.trend_confidence:.4f} "
                 f"success_p={conf.success_probability:.6f} "
-                f"tp_hit_p={conf.tp_hit_probability:.6f} risk={conf.risk_score:.4f} "
+                f"tp_hit_p={conf.tp_hit_probability:.6f} "
+                # Logged directly rather than left to be solved back out of
+                # confidence_score: this head was saturated near 1.0 for an
+                # unknown span and nothing in the logs said so.
+                f"noise_p={conf.noise_probability:.6f} risk={conf.risk_score:.4f} "
                 f"quality_pred={conf.quality_pred:+.4f} "
                 f"volume_confirmation={volume_confirmation:.4f} "
                 f"raw_momentum={momentum:+.6f} "
@@ -2524,12 +2531,16 @@ class MartingaleManager:
         self._feature_buffer: Deque[Tuple[float, np.ndarray, float]] = deque(
             maxlen=LABEL_HORIZON_TICKS + 1
         )
-        # EWMA of |forward_return| at the label horizon, so the tp_hit
-        # threshold can be expressed relative to what this horizon actually
-        # produces rather than against a take-profit distance that belongs to
-        # a completely different timescale.
-        self._tp_label_scale: float = TAKE_PROFIT_PCT
-        self._tp_label_samples: int = 0
+        # EWMA of |forward_return| at the label horizon. BOTH classifier
+        # labels below - tp_hit ("was this move unusually large") and noise
+        # ("was it unusually small") - are expressed relative to it, so
+        # neither can end up scored against a threshold belonging to a
+        # different timescale. That was the defect in both heads: tp_hit
+        # compared a 2.5-second move to a 35 bps take-profit, and noise
+        # compared it to half a ONE-MINUTE ATR. One shared scale means the
+        # two cannot drift apart again.
+        self._label_move_scale: float = TAKE_PROFIT_PCT
+        self._label_move_samples: int = 0
         self.last_regime: RegimeReading = RegimeReading()
         self.last_confidence: ConfidenceReading = ConfidenceReading()
         self.last_entry_decision: Optional[EntryDecision] = None
@@ -4927,10 +4938,41 @@ class MartingaleManager:
             if old_price:
                 forward_return = (price - old_price) / old_price
                 self.brain.learn_trend(old_features, forward_return)
-                # noise: forward move stayed inside roughly half an ATR band
-                noise_band = max(old_atr_pct * 0.5, 1e-6)
+
+                # The move typical AT THIS HORIZON, tracked once and used by
+                # both labels below. Updated before either of them so they
+                # always see the same scale.
+                self._label_move_scale = (
+                    0.999 * self._label_move_scale
+                    + 0.001 * max(abs(forward_return), 1e-9))
+                self._label_move_samples += 1
+                scale_ready = self._label_move_samples
+
+                # noise: was this move unusually SMALL from here?
+                #
+                # This compared |forward_return| over LABEL_HORIZON_TICKS
+                # against half of atr_pct - but atr_pct is a 14-period ATR
+                # on ONE-MINUTE candles, while the return spans about 2.5
+                # seconds. At a live atr_pct of 0.0012 the band was 6.0 bps
+                # against a median 2.5s move of 0.8 bps, so the label was
+                # True almost always and the head learned to answer "yes"
+                # and be right, which tells the strategy nothing.
+                #
+                # It was also expensive rather than merely useless: noise_p
+                # enters confidence as (1 - 0.5*noise_p), so a head pinned
+                # near 1.0 halved brain_confidence - the heaviest term in
+                # the entry score - on every single tick, capping that score
+                # near 0.55 against a 0.75 bar. No entry could fire.
+                #
+                # NOISE_LABEL_ADAPTIVE=false restores the old ATR band.
+                if (NOISE_LABEL_ADAPTIVE
+                        and scale_ready >= NOISE_LABEL_MIN_SAMPLES):
+                    noise_band = max(NOISE_LABEL_MULT * self._label_move_scale, 1e-9)
+                else:
+                    noise_band = max(old_atr_pct * 0.5, 1e-6)
                 is_noise = abs(forward_return) < noise_band
                 self.brain.learn_noise(old_features, is_noise)
+
                 # tp_hit: was this an unusually large move from here?
                 #
                 # This compared |forward_return| over LABEL_HORIZON_TICKS
@@ -4944,13 +4986,9 @@ class MartingaleManager:
                 # HORIZON, so the question is learnable and the label is
                 # balanced. TP_HIT_LABEL_ADAPTIVE=false restores the old
                 # fixed threshold.
-                self._tp_label_scale = (
-                    0.999 * self._tp_label_scale
-                    + 0.001 * max(abs(forward_return), 1e-9))
-                self._tp_label_samples += 1
                 if (TP_HIT_LABEL_ADAPTIVE
-                        and self._tp_label_samples >= TP_HIT_LABEL_MIN_SAMPLES):
-                    threshold = TP_HIT_LABEL_MULT * self._tp_label_scale
+                        and scale_ready >= TP_HIT_LABEL_MIN_SAMPLES):
+                    threshold = TP_HIT_LABEL_MULT * self._label_move_scale
                 else:
                     threshold = TAKE_PROFIT_PCT
                 tp_was_hit = abs(forward_return) >= threshold

@@ -79,13 +79,13 @@ check("it still saturates for a genuinely huge prediction",
 print("\n[2] The tp_hit label matches its own horizon")
 tsrc = open("trading.py", encoding="utf-8").read()
 check("the threshold scales with the move typical at this horizon",
-      "threshold = TP_HIT_LABEL_MULT * self._tp_label_scale" in tsrc)
+      "threshold = TP_HIT_LABEL_MULT * self._label_move_scale" in tsrc)
 check("...with a warm-up fallback to the fixed distance",
       "threshold = TAKE_PROFIT_PCT" in tsrc)
 check("the old unconditional comparison is gone",
       "tp_was_hit = abs(forward_return) >= TAKE_PROFIT_PCT" not in tsrc)
 check("the tracker is initialised with the buffer it belongs to",
-      "self._tp_label_scale: float = TAKE_PROFIT_PCT" in tsrc)
+      "self._label_move_scale: float = TAKE_PROFIT_PCT" in tsrc)
 check("adaptive labelling can be switched off",
       config.TP_HIT_LABEL_ADAPTIVE is True
       and hasattr(config, "TP_HIT_LABEL_MULT"))

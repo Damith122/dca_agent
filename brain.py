@@ -647,6 +647,10 @@ class BrainV2:
 
     _CLASSIFIER_HEADS = ("noise", "success", "tp_hit")
 
+    # Bumped whenever the noise LABEL definition changes, so a snapshot
+    # trained under the old one can be recognised and rebuilt.
+    _NOISE_LABEL_VERSION = 2
+
     def _head_is_saturated(self, name: str) -> bool:
         model = getattr(self, f"{name}_model", None)
         coef = getattr(model, "coef_", None)
@@ -744,6 +748,13 @@ class BrainV2:
             "tp_hit_labeled_samples": self.tp_hit_labeled_samples,
             "tp_hit_rate_ewma": self.tp_hit_rate_ewma,
             "tp_hit_rate_samples": self.tp_hit_rate_samples,
+            # Which noise LABEL the weights were trained under. 1 = the
+            # half-a-one-minute-ATR band, which was True almost always and
+            # produced a head pinned near 1.0; 2 = the horizon-matched band.
+            # A head trained under 1 cannot be corrected by further updates
+            # at any realistic rate - the two labels disagree on most
+            # samples - so it is rebuilt on load. See from_bytes().
+            "noise_label_version": self._NOISE_LABEL_VERSION,
             "noise_classes_seen": sorted(self._noise_classes_seen),
             "success_classes_seen": sorted(self._success_classes_seen),
             "tp_hit_classes_seen": sorted(self._tp_hit_classes_seen),
@@ -858,6 +869,34 @@ class BrainV2:
                     f"heads. Their positive counts were measured over an unknown "
                     f"span of labels, so weights and both counters restart "
                     f"together on one consistent window.", YELLOW,
+                ))
+            # 2026-08-29: the noise label changed. It used to ask whether
+            # |forward_return| over LABEL_HORIZON_TICKS (about 2.5 seconds)
+            # stayed inside half a 14-period ATR measured on ONE-MINUTE
+            # candles - roughly 6 bps against a median 2.5s move of 0.8 bps,
+            # so it was True almost always. The head learned to answer "yes"
+            # and was right; solved back from live logs its output had a
+            # median of 0.988. Because noise_p enters confidence as
+            # (1 - 0.5*noise_p), that halved brain_confidence on every tick
+            # and held the composite entry score below its threshold, so the
+            # bot could not open a position at all.
+            #
+            # The old and new labels disagree on most samples, so continued
+            # training cannot correct these weights at any realistic rate -
+            # the same reasoning that governs the saturation rebuild below.
+            # The head relearns from live ticks within minutes and reports a
+            # neutral 0.5 until it is reliable again, which is honest; the
+            # restored weights were not.
+            if int(state.get("noise_label_version", 1)) < cls._NOISE_LABEL_VERSION:
+                brain.reset_head("noise")
+                print(color(
+                    f"[brain] noise head rebuilt: this snapshot was trained under "
+                    f"the old ATR-band noise label (version "
+                    f"{state.get('noise_label_version', 1)}), which was true for "
+                    f"almost every sample and pinned the head near 1.0 - halving "
+                    f"brain_confidence on every tick. It restarts under the "
+                    f"horizon-matched label and reports 0.5 until reliable.",
+                    YELLOW,
                 ))
             # 2026-08-21: a snapshot written under the old "optimal" learning
             # rate carries diverged classifier weights. Correcting the

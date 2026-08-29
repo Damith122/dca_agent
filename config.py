@@ -1115,6 +1115,45 @@ TP_HIT_LABEL_MULT = _env_float("TP_HIT_LABEL_MULT", 1.2)
 # fixed threshold rather than labelling against a half-formed scale.
 TP_HIT_LABEL_MIN_SAMPLES = _env_int("TP_HIT_LABEL_MIN_SAMPLES", 500)
 
+# --- noise label calibration (2026-08-29) ---------------------------------
+# The same defect as tp_hit above, in the fourth head, found in live logs.
+#
+#     noise_band = max(old_atr_pct * 0.5, 1e-6)
+#     is_noise   = abs(forward_return) < noise_band
+#
+# forward_return spans LABEL_HORIZON_TICKS - 10 ticks, about 2.5 seconds -
+# while atr_pct is a 14-period ATR on ONE-MINUTE candles. At a live
+# atr_pct of 0.0012 that band is 6.0 bps, against a median 2.5s move of
+# 0.8 bps. The label was therefore True almost always, the head learned to
+# answer "yes, noise" and was right, and its output carried no information.
+#
+# That is not harmless. noise_p enters the confidence blend as
+#
+#     confidence_score = raw_confidence * (1 - 0.5*noise_p) * (1 - 0.4*risk)
+#
+# so a head pinned near 1.0 HALVES brain_confidence on every tick - and
+# brain_confidence is the heaviest term in the composite entry score
+# (ENTRY_WEIGHTS 0.30). Solved back from 201 live entry-debug lines the
+# implied noise_p had a median of 0.988, with 96.5% of ticks above 0.90.
+# The entry score was structurally capped near 0.55 against a 0.75 bar, so
+# no entry could fire even in WEAK_TREND, where the score topped out at
+# 0.5089. This is why the bot had not opened a position.
+#
+# The band is now a multiple of the move actually typical at this horizon,
+# tracked by the same EWMA the tp_hit label uses - one scale, so the two
+# labels cannot drift onto different timescales.
+NOISE_LABEL_ADAPTIVE = _env_bool("NOISE_LABEL_ADAPTIVE", True)
+# Targets a roughly balanced label. Calibrated from our own production
+# measurement rather than an assumed distribution: at TP_HIT_LABEL_MULT=1.2
+# the live tp_hit base rate settled at 0.19-0.21, i.e. P(|r| < 1.2*scale)
+# is about 0.80. Fitting 1 - exp(-k*m) to that point gives k = 1.34, and
+# P(|r| < m*scale) = 0.5 then needs m = ln(2)/1.34 = 0.52. Raise it toward
+# 1.0 to call more moves noise, lower it to call fewer.
+NOISE_LABEL_MULT = _env_float("NOISE_LABEL_MULT", 0.5)
+# Below this many observations the EWMA is still moving; fall back to the
+# old ATR band rather than labelling against a half-formed scale.
+NOISE_LABEL_MIN_SAMPLES = _env_int("NOISE_LABEL_MIN_SAMPLES", 500)
+
 # --- simulated fills under DRY_RUN (2026-08-29) ---------------------------
 # The success head learns only from CLOSED trades. Under DRY_RUN no order is
 # ever sent, so no fill event ever arrives, so no position ever opens or
@@ -1773,6 +1812,9 @@ __all__ = [
     "TP_HIT_LABEL_ADAPTIVE",
     "TP_HIT_LABEL_MULT",
     "TP_HIT_LABEL_MIN_SAMPLES",
+    "NOISE_LABEL_ADAPTIVE",
+    "NOISE_LABEL_MULT",
+    "NOISE_LABEL_MIN_SAMPLES",
     "DRY_FILL_ENABLED",
     "DRY_FILL_SLIPPAGE_BPS",
     "DRY_FILL_TAKER_FEE_PCT",
