@@ -611,3 +611,161 @@ traded. If continuous four-symbol data collection matters more than
 restricting trading, keep all four in `ACTIVE_SYMBOLS` and rely on
 `MAX_ACTIVE_TRADES=1` to limit exposure to one position at a time — the cost
 is that trades will be spread across four symbols instead of two.
+
+---
+
+## 14. Long-term outlook: what this system can and cannot do on its own
+
+Written 2026-08-31, after the first live trading day. Read this before
+deciding to leave the bot running unattended for weeks.
+
+### Will it autonomously learn and become profitable?
+
+**No.** Not "probably not" — the mechanism is not there. Four specific
+reasons, all verifiable in the code:
+
+**1. Almost nothing in the decision is learnable.** The composite entry
+score is
+
+```
+score = 0.30*brain_confidence + 0.20*trend_confidence + 0.12*volume_confirmation
+      + 0.10*volatility_fit   + 0.13*momentum         + 0.10*regime_fit
+      - 0.05*risk_score
+```
+
+Every weight is a hard-coded constant in `ENTRY_WEIGHTS`. So are all the
+thresholds, the ATR floor, the TP/SL distances, the DCA multiplier, the
+position size, the leverage and the symbol list. The only things that move
+on their own are four probability estimates, and three of them
+(`trend_confidence`, `tp_hit_p`, `noise_p`) feed a single term carrying
+0.30 of the score. **The architecture of the decision is frozen. Only its
+inputs drift.**
+
+**2. The heads adapt, they do not optimise.** They use SGD with EWMA
+scaling: they track a moving target and forget the past. That is the right
+design for surviving regime drift, and it is *not* a mechanism for getting
+better. A head that has converged is finished improving; it will then just
+follow the market around. Adaptation is not optimisation, and neither is
+profit-seeking — no head anywhere is maximising PnL.
+
+**3. You cannot learn a signal that is not in the features.** Over 71
+trades the gross edge — before any cost — was **+1.3 bps, indistinguishable
+from zero**. `success_p` can become an excellent predictor of an outcome
+that is itself unpredictable from these inputs, and the answer it converges
+to is "about 50/50", which is the truth. Learning cannot create
+information that the feature set does not contain.
+
+**4. The learning loop is censored, and that is a hard ceiling.**
+`success_p` only ever receives a label from a trade the bot **took**.
+Declined setups produce nothing. So it can slowly get better at ranking
+*within* the region of feature space it already enters, and it can **never**
+discover that a region it rejects was profitable. This is the classic
+bandit-censoring problem, and it means autonomous improvement is bounded
+by the entry rule that was frozen on day one.
+
+### What it CAN do on its own
+
+| Capability | Mechanism | Real? |
+|---|---|---|
+| Re-calibrate labels to changing volatility | `*_LABEL_MULT` × EWMA of actual moves | Yes — proven; `noise_p` self-corrected 0.84 → 0.48 |
+| Track drift in short-horizon price behaviour | SGD on the four heads | Yes, within the frozen feature set |
+| Refuse to trade dead or sideways markets | ATR floor + the 0.85 SIDEWAYS off-switch | Yes — this is doing most of the risk work |
+| Cap per-trade and per-day loss | `MAX_TRADE_NET_LOSS_USDT`, `MAX_DAILY_LOSS_USDT` | Yes — verified firing live |
+| Recover from exchange quirks | reconciliation, PROTECTION_PENDING, algo-fill recovery | Yes — three separate incidents survived |
+| **Find a new edge** | — | **No** |
+| **Change how it decides** | — | **No** |
+| **Size up when winning** | — | **No** |
+
+### Expected trajectory if nothing is touched
+
+```
+as measured, taker  (71 trades)   -0.418 USDT/day   -2.47%/day   half gone in ~28 days
+with maker entry (current config) -0.274 USDT/day   -1.62%/day   half gone in ~43 days
+```
+
+Individual days will be green. The expectation is not.
+
+On the live sample the picture is unusually clean: average win +0.0274,
+average loss −0.0201, so the **break-even win rate is 42.3%** and the bot
+achieved **42.9%**. It is sitting precisely on the coin-flip line. That is
+what "no edge" looks like from the inside, and it is why it feels
+break-even rather than obviously broken.
+
+### What degrades if left alone
+
+- **Absolute-USD thresholds do not follow price or account size.** The nine
+  values in §13 were computed for a $10 notional. Change size, leverage, or
+  let the account grow, and the risk envelope silently stops matching.
+- **Binance changes its API.** This project already hit `-4120` (Algo
+  Service migration), `-5022` (post-only rejection) and `-4509` (TIF GTE),
+  plus a `FINISHED`-without-`actualOrderId` case that cost a trade in the
+  ledger. Expect more.
+- **A head can re-saturate** if the market's move distribution shifts far
+  enough that a label's base rate collapses toward 0 or 1.
+- **Symbols get delisted, fee tiers change, funding regimes flip.**
+
+### The human roadmap
+
+**Tier 0 — hygiene. Do this or do not run it.**
+
+1. **Weekly:** reconcile the bot's `session_total` against Binance trade
+   history. The exchange is the authority; the bot's number is a
+   reconstruction. They have already diverged once.
+2. **Monthly:** run `diagnose_live.py` on the recorded shards. If any head's
+   output collapses to a near-constant, or its label base rate falls outside
+   roughly 5–95%, that head is dead — the label definition needs rescaling,
+   exactly as `tp_hit` and `noise` did.
+3. **On any `*** HIGH SEVERITY ***` line:** investigate the same day.
+4. **Never raise `MAX_DCA_STEPS`.** Martingale sizing is what turns a bad
+   run into a terminal one.
+
+**Tier 1 — the gate that decides everything.**
+
+Do not scale size, add symbols, or loosen thresholds until a feature is
+shown to have a **positive out-of-sample information coefficient against
+forward returns**. Parameter tuning cannot manufacture an edge; it can only
+redistribute a zero one. The recorder archive plus `analyze_feature_log.py`
+and `edge_requirements.py` exist precisely to run that test. If no feature
+clears the bar, the correct action is to stop trading this strategy, not to
+tune it further.
+
+**Tier 2 — structural options, ranked.**
+
+1. **Hold longer.** This is the highest-leverage change that needs no new
+   alpha. Cost is fixed per round trip; move size grows with √time:
+
+   | hold | typical \|move\| | cost | cost as % of move |
+   |---|---|---|---|
+   | ~8 min (current) | 17.5 bps | 7 bps | **40%** |
+   | ~32 min | 35 bps | 7 bps | 20% |
+   | ~2 h | 70 bps | 7 bps | 10% |
+   | ~8.5 h | 140 bps | 7 bps | **5%** |
+
+   It does not create edge — a zero edge stays zero — but it is what makes
+   a *small* edge survivable. At the current 8-minute hold, 40% of every
+   move is consumed by fees before the strategy is even judged.
+
+2. **Funding carry.** The one thing that tested positive across all this
+   work: 5.5–6.3% annualised, delta-neutral, direction-agnostic. It does
+   not need a directional edge at all, which is exactly why it survived.
+   `funding_arb.py` / `backtest_funding.py` implement it. It is a different
+   system — sizing, hedging and rebalancing rather than entry timing — and
+   it has never been run live.
+
+3. **Cut cost further.** Maker exits would take the round trip from ~7 bps
+   to ~4. Safe for the take-profit leg, **not** for the stop leg — a resting
+   stop that does not fill is not a stop.
+
+4. **Stop.** A legitimate outcome. Seven strategy families tested null; the
+   infrastructure is genuinely good and the entry signal genuinely is not.
+
+### The honest summary
+
+The engineering is sound: execution, risk envelope, reconciliation,
+recorder, four working model heads, tested to 48 passing files. What it
+lacks is an edge, and no amount of runtime supplies one. Left alone it will
+adapt to drift, defend its downside competently, and slowly bleed the fee
+differential. **It is a well-built vehicle with no fuel.** The next phase
+is not tuning — it is finding fuel, and the only lead this project produced
+is funding carry.
+
