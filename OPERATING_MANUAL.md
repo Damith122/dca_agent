@@ -443,3 +443,160 @@ kills most naive carry constructions.
 `fetch_funding_universe.py` downloads the data. It is a fundamentally
 different system to this one — position sizing, rebalancing, and hedging
 rather than entry timing — and it has not been run live.
+
+---
+
+## 13. Final live configuration (2026-08-31) and the evidence behind it
+
+### The 71-trade result
+
+Between 2026-08-30 12:15 and 2026-08-31 04:24 UTC the simulated-fill engine
+produced **71 closed trades** across all four symbols. This is the first
+sample large enough to draw a conclusion from.
+
+```
+sym      n   W   win%   net USDT     gross     fees   net bps  gross bps   t-stat
+=================================================================================
+SOL     16   7    44%    -0.3184    0.3140   0.6323      -5.1        4.9    -0.92
+NEAR    22   7    32%    -0.7884    0.0762   0.8646      -9.1        0.9    -1.76
+SUI     20   4    20%    -0.7825    0.0162   0.7992      -9.8        0.2    -1.64
+ETH     13   3    23%    -0.5604   -0.0561   0.5047     -11.1       -1.1    -2.47
+=================================================================================
+ALL     71  21    30%    -2.4497    0.3503   2.8008      -8.7        1.3    -3.23
+```
+
+**The gross edge is +1.3 bps per trade — indistinguishable from zero.** The
+round trip costs 10.0 bps. Net is −8.7 bps per trade at **t = −3.23**, which
+is significant at p < 0.01.
+
+At n=5 this was inconclusive. At n=71 it is not. The strategy does not have
+an edge, and the losses are not caused by fees — fees convert a zero edge
+into a negative result.
+
+**No configuration change fixes a zero gross edge.** Fewer symbols, lower
+leverage and smaller size all scale the same ~zero number. The only lever
+that moves net is execution cost:
+
+| execution | net |
+|---|---|
+| taker in, taker out (as measured) | −8.7 bps |
+| post-only maker entry + taker exit | −5.7 bps |
+| maker both sides (not reachable — exits are MARKET) | −2.7 bps |
+
+### Symbol selection
+
+Per-symbol differences are **not** statistically distinguishable. Welch t of
+each symbol against the pooled rest:
+
+```
+SOL   -5.1 bps vs rest  -9.8 bps   t = +0.75
+NEAR  -9.1 bps vs rest  -8.6 bps   t = -0.08
+SUI   -9.8 bps vs rest  -8.3 bps   t = -0.21
+ETH  -11.1 bps vs rest  -8.2 bps   t = -0.52
+```
+
+Selecting the best of four needs |t| > ~2.5 after Bonferroni. Nothing is
+close. Picking "the two best performers" by PnL would be selecting on noise.
+
+The two symbols were therefore chosen on **structural** grounds that do not
+depend on a small sample:
+
+- **Quantity-step granularity at $10 notional.** SUI (step 0.1 × $0.72 =
+  $0.07) and SOL (step 0.01 × $101 = $1.01) can both express a $10 order
+  precisely. ETH (step 0.001 × $2,430 = $2.43) cannot — a $10 ETH order
+  quantises to 0.004 = $9.72 with no room, and smaller sizes fall under the
+  $5 minimum notional entirely.
+- **ATR relative to the dead-market floor**, which determines whether a
+  symbol trades at all. ETH ran at 19% of the floor; SUI 81%, SOL 60%.
+- ETH is also worst on both net and gross PnL, so excluding it costs nothing
+  even on the noisy measure.
+
+### Position sizing arithmetic
+
+`INITIAL_ENTRY_USDT` is **margin**; notional = margin × leverage. With
+`MAX_DCA_STEPS=1` and `DCA_MULTIPLIER=1.6`, a fully-DCA'd position reaches
+2.6× the initial notional.
+
+```
+LEVERAGE=2, INITIAL_ENTRY_USDT=5      -> initial notional $10
+fully DCA'd                            -> $26 notional, $13 margin
+account $17                            -> $4 buffer (24%)
+$10 notional vs $5 exchange minimum    -> 2x headroom on both symbols
+```
+
+`MAX_ACTIVE_TRADES=1` rather than 2: two concurrent positions would halve
+the margin available to each, pushing initial notional to ~$6.50 — close
+enough to the $5 floor that ordinary price movement could make an order
+illegal — and would leave no margin buffer at all if both DCA'd. The
+portfolio-capacity gate was never observed blocking an entry in any log
+window analysed, so the second slot buys little.
+
+### Every USD-denominated threshold was rescaled
+
+This is the part that would have broken silently. Position notional dropped
+from ~$40 to ~$10, and the risk envelope is configured in **absolute USDT**,
+not percentages. Left unscaled, `MAX_TRADE_NET_LOSS_USDT=0.15` would have
+been 150 bps of a $10 position — far beyond the 2% hard stop — so the
+rr-stop would never have fired and the risk/reward envelope would have been
+inert.
+
+All of these were set from first principles against the $10 notional:
+
+| Variable | Value | = bps of $10 |
+|---|---|---|
+| `MAX_TRADE_NET_LOSS_USDT` | 0.04 | 40 |
+| `MIN_STOP_LOSS_USD` | 0.02 | 20 |
+| `MAX_STOP_LOSS_USD` | 0.06 | 60 |
+| `TARGET_PROFIT_USD` | 0.035 | 35 (matches `TAKE_PROFIT_PCT`) |
+| `MIN_TARGET_PROFIT_USD` | 0.02 | 20 |
+| `SMART_ORDERFLOW_EXIT_MIN_LOSS_USD` | 0.01 | 10 |
+| `SMART_ORDERFLOW_EXIT_MAX_LOSS_USD` | 0.05 | 50 |
+| `DCA_RESCUE_BREAKEVEN_MIN_NET_USD` | 0.01 | 10 |
+| `MAX_TRADE_EXIT_BUFFER_USDT` | 0.02 | 20 |
+
+**If you ever change `INITIAL_ENTRY_USDT` or `LEVERAGE`, rescale all nine of
+these by the same factor.** They are not percentages and will not follow.
+
+### The complete live variable set
+
+```
+ACTIVE_SYMBOLS                     = SOLUSDT,SUIUSDT
+MAX_ACTIVE_TRADES                  = 1
+LEVERAGE                           = 2
+INITIAL_ENTRY_USDT                 = 5          -> $10 notional
+USE_POST_ONLY_LIMIT                = true       -> maker entry, saves ~3 bps
+MAX_DAILY_LOSS_USDT                = 1.50       -> ~9% of a $17 account
+DAILY_PROFIT_TARGET_USDT           = 1.00
+ENTRY_SCORE_THRESHOLD              = 0.60
+MAX_TRADE_NET_LOSS_USDT            = 0.04
+MIN_STOP_LOSS_USD                  = 0.02
+MAX_STOP_LOSS_USD                  = 0.06
+TARGET_PROFIT_USD                  = 0.035
+MIN_TARGET_PROFIT_USD              = 0.02
+SMART_ORDERFLOW_EXIT_MIN_LOSS_USD  = 0.01
+SMART_ORDERFLOW_EXIT_MAX_LOSS_USD  = 0.05
+DCA_RESCUE_BREAKEVEN_MIN_NET_USD   = 0.01
+MAX_TRADE_EXIT_BUFFER_USDT         = 0.02
+DRY_RUN                            = true       <- the only remaining switch
+```
+
+### Expected outcome at this configuration
+
+At the measured −8.7 bps, with ~2.2 trades/hour on two symbols and $10
+notional: **−0.46 USDT/day, about −2.7% of a $17 account per day.** Half the
+account in roughly 25 days. With the post-only maker entry now enabled, the
+better case is −5.7 bps → −0.30 USDT/day, −1.8%/day, half in ~39 days.
+
+Those are projections from a measured negative edge, not forecasts of ruin —
+variance is large and individual days will be positive. But the expectation
+is negative and now measured with n=71.
+
+### One trade-off to be aware of
+
+Restricting `ACTIVE_SYMBOLS` to two coins also **halves feature-recorder
+coverage** — NEAR and ETH stop being recorded. The watchlist governs both
+trading and recording; there is no switch to record more symbols than are
+traded. If continuous four-symbol data collection matters more than
+restricting trading, keep all four in `ACTIVE_SYMBOLS` and rely on
+`MAX_ACTIVE_TRADES=1` to limit exposure to one position at a time — the cost
+is that trades will be spread across four symbols instead of two.
