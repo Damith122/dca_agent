@@ -956,8 +956,8 @@ All thirteen, with the overrides cleared:
 | `MAX_STOP_LOSS_USD` | $0.6750 | 112.5 |
 | `MAX_TRADE_NET_LOSS_USDT` | $0.6750 | 112.5 |
 | `TARGET_PROFIT_USD` | $0.6750 | 112.5 |
-| `PROFIT_LOCK_ACTIVATION_USDT` | $0.3615 | 60.2 |
 | `MIN_TARGET_PROFIT_USD` | $0.2625 | 43.8 |
+| `PROFIT_LOCK_ACTIVATION_USDT` | $0.1275 | 21.3 |
 | `SMART_ORDERFLOW_EXIT_MAX_LOSS_USD` | $0.1500 | 25.0 |
 | `SL_MIN_USD` | $0.0900 | 15.0 |
 | `SMART_ORDERFLOW_EXIT_MIN_LOSS_USD` | $0.0750 | 12.5 |
@@ -966,6 +966,11 @@ All thirteen, with the overrides cleared:
 | `DCA_RESCUE_BREAKEVEN_MIN_NET_USD` | $0.0300 | 5.0 |
 | `MAX_DAILY_LOSS_USDT` | *overridden* $2.50 | — |
 | `DAILY_PROFIT_TARGET_USDT` | *overridden* $1.00 | — |
+
+`PROFIT_LOCK_ACTIVATION_USDT` is the one entry that does not scale purely
+with notional — it derives from `NET_TAKE_PROFIT_PCT`, so it tracks the
+take-profit as well. Confirm it against the startup banner rather than
+against notional arithmetic.
 
 `MIN_STOP_LOSS_USD` is a **dead value** — imported by `trading.py` but never
 read for any decision. The working stop floor is `SL_MIN_USD`. Setting it has
@@ -1024,7 +1029,8 @@ hand-pinned thresholds corrected in §13:
 ### What to watch in the first 48 hours
 
 1. **The startup banner.** It must read `$60.00 = $3.0 x 20x` and
-   `11/13 derived`. Any `OVERRIDDEN` line other than the two daily breakers
+   `11/13 derived`. **Confirmed on the 14:55 UTC deploy.** Any `OVERRIDDEN`
+   line other than the two daily breakers
    means a stale Railway variable survived and is pinning a threshold while
    the rest of the geometry moved.
 2. **`-2019` margin rejections.** Expected occasionally on a second-slot DCA;
