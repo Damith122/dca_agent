@@ -56,8 +56,13 @@ check("ACTIVE_SYMBOLS contains all four coins",
       f"got {config.ACTIVE_SYMBOLS}")
 check("the primary SYMBOL is first in the watchlist",
       config.ACTIVE_SYMBOLS[0] == config.SYMBOL, f"got {config.ACTIVE_SYMBOLS}")
-check("MAX_ACTIVE_TRADES defaults to 1", config.MAX_ACTIVE_TRADES == 1,
-      f"got {config.MAX_ACTIVE_TRADES}")
+# 2026-08-31: was pinned to 1. The point of this check is that the cap is a
+# real, bounded, positive integer that the watchlist cannot exceed - not that
+# it holds one specific value, which is a deployment decision (see manual 15).
+check("MAX_ACTIVE_TRADES is a positive int no larger than the watchlist",
+      isinstance(config.MAX_ACTIVE_TRADES, int)
+      and 1 <= config.MAX_ACTIVE_TRADES <= len(config.ACTIVE_SYMBOLS),
+      f"got {config.MAX_ACTIVE_TRADES} against {len(config.ACTIVE_SYMBOLS)} symbols")
 check("no duplicates in the watchlist",
       len(config.ACTIVE_SYMBOLS) == len(set(config.ACTIVE_SYMBOLS)))
 
@@ -202,8 +207,9 @@ for sym, m in mgrs.items():
 
 check("all four managers share ONE portfolio",
       len({id(m.portfolio) for m in mgrs.values()}) == 1)
-check("a manager built without a portfolio gets its own single-slot one",
-      trading.MartingaleManager(None, "XRPUSDT", filters, 20).portfolio.max_active == 1)
+check("a manager built without a portfolio gets its own default-sized one",
+      trading.MartingaleManager(None, "XRPUSDT", filters, 20).portfolio.max_active
+      == config.MAX_ACTIVE_TRADES)
 
 # No FILE may be claimed by two DIFFERENT symbols. One symbol legitimately
 # maps several logical keys onto the same name - brain_local and

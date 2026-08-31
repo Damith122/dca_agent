@@ -356,9 +356,14 @@ async def round_trip():
     # gross move MINUS both legs' commission. This is the end-to-end proof
     # that the simulated fills are being charged for, rather than a paper
     # round trip booking its full gross move as profit.
-    entry_fee = 101.0101 * 0.2 * config.DRY_FILL_TAKER_FEE_PCT
-    exit_fee = 102.9897 * 0.2 * config.DRY_FILL_TAKER_FEE_PCT
-    gross = (102.9897 - 101.0101) * 0.2
+    # 2026-08-31: these used to hardcode qty=0.2, which was the quantity the
+    # sizing path happened to produce at the INITIAL_ENTRY_USDT default of the
+    # day. Changing that default silently broke an assertion that has nothing
+    # to do with position size - the claim under test is "PnL is booked net of
+    # commission", which must hold at ANY quantity. Read the filled qty.
+    entry_fee = 101.0101 * qty * config.DRY_FILL_TAKER_FEE_PCT
+    exit_fee = 102.9897 * qty * config.DRY_FILL_TAKER_FEE_PCT
+    gross = (102.9897 - 101.0101) * qty
     check("realized PnL was booked at all",
           m.realized_pnl_total != 0.0)
     check("booked PnL is NET of both legs' commission, not the gross move",

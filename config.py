@@ -220,7 +220,7 @@ ACTIVE_SYMBOLS = _parse_symbol_list(
 # to >= 1: a 0 or negative value would silently disable trading entirely,
 # which is a far more surprising outcome than falling back to 1.
 try:
-    MAX_ACTIVE_TRADES = max(1, _env_int("MAX_ACTIVE_TRADES", 1))
+    MAX_ACTIVE_TRADES = max(1, _env_int("MAX_ACTIVE_TRADES", 2))
 except (TypeError, ValueError):
     MAX_ACTIVE_TRADES = 1
 
@@ -369,7 +369,7 @@ MAX_ALLOWED_LEVERAGE = _env_int("MAX_ALLOWED_LEVERAGE", 50)
 MARGIN_TYPE = "CROSSED"
 
 # --- Position sizing (Fixed Amount base, Martingale, now confidence-scaled) -
-INITIAL_ENTRY_USDT = _env_float("INITIAL_ENTRY_USDT", 4)
+INITIAL_ENTRY_USDT = _env_float("INITIAL_ENTRY_USDT", 3)
 # 2026-08 min-notional fix (this value only - DCA_MULTIPLIER, MAX_DCA_STEPS,
 # SIZE_MIN_MULT/MAX_MULT, and every other DCA/TP/Risk-Engine/Daily-Loss-
 # Protection value are unchanged): after reducing LEVERAGE to 20x, the
@@ -381,6 +381,136 @@ INITIAL_ENTRY_USDT = _env_float("INITIAL_ENTRY_USDT", 4)
 # notional and DCA #1 at >= $64 notional even in the worst-case
 # (size_mult=SIZE_MIN_MULT=0.5) scenario - both comfortably above $50.
 # DCA #2/#3 were already well above the minimum and remain so.
+
+# ============================================================================
+# 2026-08-31 AGGRESSIVE SIZING (operator-directed, negative expectancy known)
+#
+# The operator asked for a configuration targeting >= $0.50 net profit per day
+# on a ~$16.92 account, having been shown - and having explicitly accepted -
+# the measured evidence against it. That evidence, unchanged by this block:
+#
+#   71 live/simulated round trips: gross +1.3 bps, net -8.7 bps per trade,
+#   t = -3.23, p < 0.01. The strategy's GROSS edge is statistically
+#   indistinguishable from zero; the net result is the fee line.
+#
+# Nothing below creates edge. Sizing multiplies whatever per-trade expectancy
+# already exists, and that expectancy is negative, so every number here
+# enlarges the expected loss and shortens the time to ruin. Monte Carlo over
+# this configuration returns ~100% probability of account ruin with a median
+# time to ruin of 36-61 days. This block exists so that the reasoning behind
+# each number is recoverable later, not because the numbers are defensible on
+# expectancy grounds.
+#
+# WHAT CHANGED, AND THE ARITHMETIC BEHIND EACH
+#
+#   INITIAL_ENTRY_USDT   5  -> 3     margin per entry
+#   LEVERAGE             2  -> 20
+#   MAX_ACTIVE_TRADES    1  -> 2
+#   => ENTRY_NOTIONAL_USDT $10 -> $60 (6x), portfolio exposure up to $120
+#
+# $3 is not a round number chosen for taste - it is the largest initial margin
+# that still lets BOTH portfolio slots carry their DCA rung on this account:
+#
+#   initial            margin $3.00   notional  $60.00
+#   + DCA #1 (x1.6)    margin $4.80   notional  $96.00
+#   full position      margin $7.80   notional $156.00
+#   x 2 slots          margin $15.60  notional $312.00
+#   balance $16.92  -> free margin $1.32 (8% buffer)
+#
+# $4 initial (the previous default) needs $20.80 at the same fill state and is
+# not fundable. $8 needs $41.60 and is not fundable at any leverage.
+#
+# THE BUFFER IS THIN AND THE FAILURE MODE MATTERS. Confidence-based sizing
+# (confidence_size_multiplier(), bounded by SIZE_MIN_MULT/SIZE_MAX_MULT=1.5)
+# can scale an entry to $4.50 margin and its DCA to $7.20, i.e. $11.70 per
+# slot, $23.40 for two. That does not fit. Under CROSSED margin the
+# consequence is a REJECTED order (Binance -2019), not a liquidation: the
+# second slot's DCA simply fails to place and the existing position keeps its
+# protective stop. That is survivable and self-limiting, which is why
+# SIZE_MAX_MULT is left alone rather than clamped to 1.0 - clamping it would
+# trade a recoverable rejection for the permanent loss of confidence scaling.
+#
+# LIQUIDATION DISTANCE. At the full $312 notional state, maintenance margin is
+# roughly $1.56, so liquidation needs equity below that: about a 4.9% adverse
+# move. The ATR-scaled stop, capped by MAX_STOP_LOSS_USD (derived: $0.675 =
+# 112 bps of notional), fires around 1.1%. The stop is the binding constraint
+# by a factor of four - PROVIDED it executes. The protective stop is the only
+# thing standing between this configuration and the liquidation price, so a
+# stop that fails to place is now an account-level event, not a trade-level
+# one.
+#
+# TAKE PROFIT, AND THE CEILING THE TESTS FOUND. Widening the target is the one
+# change here that improves the trade's economics rather than merely scaling
+# it: round-trip cost is ~7 bps and is FIXED per round trip, so it is 20% of a
+# 35 bps target but only 10% of a 70 bps one. Expected move size grows as the
+# square root of holding time while cost does not grow at all, so wider is the
+# right direction - but only while the target stays reachable.
+#
+# The first attempt at this block set TAKE_PROFIT_PCT to 100 bps.
+# test_algo_update_and_trade_log_recovery_fix.py rejected it, and correctly:
+# it asserts the take-profit must sit within about 5 ATR of the ATR FLOOR
+# (0.08%), because beyond that the position cannot travel the distance before
+# the loss budget or the max-hold timer ends the trade. 100 bps is 12.5 ATR at
+# the floor. In the quiet SIDEWAYS conditions the live logs actually show,
+# that target would essentially never be hit and every trade would resolve at
+# the stop or on max-hold - which is not a more aggressive strategy, it is a
+# worse one wearing an aggressive number.
+#
+# Probing the invariant directly: 0.004 passes, 0.005 fails. So
+# TAKE_PROFIT_PCT = 0.004 (40 bps = 5.0 ATR at the floor) is a HARD CEILING
+# imposed by the design, not a preference, and that is where it sits.
+#
+# The expansion the operator asked for therefore lives in TAKE_PROFIT_MAX_PCT
+# (100 -> 200 bps), which is the right place for it: DYNAMIC_TP_ENABLED
+# interpolates between the two as tick-return volatility runs from TP_VOL_LOW
+# to TP_VOL_HIGH, so the wide target is applied only when the market is
+# actually moving far enough to reach it, and the 40 bps base governs the
+# quiet conditions where it must stay reachable. Note that the base is the
+# value used in quiet markets, which is exactly why it could not simply be
+# raised to the number that sounded most aggressive.
+#
+# WHAT WAS DELIBERATELY NOT CHANGED
+#
+#   ENTRY_SCORE_THRESHOLD stays at its configured value. Size and frequency
+#   multiply: raising both would compound the expected loss rather than add to
+#   it, and the entry gate is the last filter still rejecting trades. Lowering
+#   it is the single fastest available route to ruin.
+#
+#   MAX_DCA_STEPS stays at 1 (see the re-bind further down). 2 steps do not
+#   fit the margin arithmetic above at two slots.
+#
+#   The Brain needs no head reset for the take-profit change.
+#   TAKE_PROFIT_PCT only SEEDS _label_move_scale in trading.py, which is an
+#   EWMA of realised |forward return| decaying at 0.999/tick; within about a
+#   thousand ticks the labels ride the market's own move scale and not this
+#   constant. The tp_hit head's accumulated updates stay valid.
+#
+# THE TWO INTENTIONAL ENV OVERRIDES. Every notional-scaled threshold below is
+# left to derive itself EXCEPT the two daily circuit breakers, which are set
+# explicitly in the deployment environment:
+#
+#   MAX_DAILY_LOSS_USDT       $2.50   (14.8% of a $16.92 account)
+#   DAILY_PROFIT_TARGET_USDT  $1.00   (2x the $0.50/day objective)
+#
+# These two are overridden on principle, not convenience. Notional is the
+# right reference for per-TRADE geometry - a stop governs one position and
+# that position's notional is fixed for its lifetime. It is the wrong
+# reference for a per-DAY budget, which is properly a fraction of ACCOUNT
+# EQUITY and has nothing to do with how large any single entry happens to be.
+# Left derived, the daily loss cap lands at $0.75, which is barely more than a
+# single full stop-out ($0.675) - entries would halt after one losing trade on
+# most days. That directly defeats the operator's standing first priority that
+# data collection must never stop. Note the gate is NEW-ENTRY-only: the tick
+# feature recorder and the tp_hit/noise heads keep learning through a halt
+# either way; it is the success head, which can only be labelled by a closed
+# trade, that goes hungry.
+#
+# TO REVERT: set INITIAL_ENTRY_USDT=5, LEVERAGE=2, MAX_ACTIVE_TRADES=1,
+# TAKE_PROFIT_PCT=0.0035, TAKE_PROFIT_MAX_PCT=0.010, DCA_TRIGGER_PCT=0.002.
+# Every notional-scaled threshold follows automatically; none of them needs a
+# matching edit (see the next block).
+# ============================================================================
+
 
 # ============================================================================
 # 2026-08-21 NOTIONAL-RELATIVE RISK SCALING
@@ -460,13 +590,13 @@ DCA_MULTIPLIER = _env_float("DCA_MULTIPLIER", 1.6)  # reduced from 2.0 (2026-07 
 MAX_DCA_STEPS = _env_int("MAX_DCA_STEPS", 2)        # reduced from 3 (2026-08 $33-account risk fix) - 3 steps required 112% of a $33 account's margin to fully cascade and produced ~45% worst-case single-trade loss; 2 steps fits within the account (~62.5% margin) and cuts worst-case loss to ~25% while keeping the final-DCA low-probability-recovery gate active at the depth where trade evidence showed it protecting against genuine trend moves
 
 # --- Trade management ---------------------------------------------------------
-DCA_TRIGGER_PCT = _env_float("DCA_TRIGGER_PCT", 0.002)    # floor / fallback DCA spacing (also used if ATR unavailable)
-TAKE_PROFIT_PCT = _env_float("TAKE_PROFIT_PCT", 0.0035)   # raised from 0.002 (2026-07 profitability fix) - clears round-trip fee floor with real margin
+DCA_TRIGGER_PCT = _env_float("DCA_TRIGGER_PCT", 0.002)    # floor / fallback DCA spacing (also used if ATR unavailable). Unchanged: at a 40 bps base take-profit the rung still fires once inside the TP distance, which is the intended geometry. It was briefly widened to 0.005 alongside a 100 bps target and reverted with it.
+TAKE_PROFIT_PCT = _env_float("TAKE_PROFIT_PCT", 0.004)    # 2026-08-31 aggressive config: raised from 0.0035, and NO FURTHER. See the AGGRESSIVE SIZING block above - 0.004 is a hard ceiling imposed by reachability at the ATR floor, not a preference. A wider target improves the fee RATIO rather than just scaling both sides of the ledger, but only while it stays reachable; the expansion the operator asked for lives in TAKE_PROFIT_MAX_PCT, which is volatility-gated and so only applies when the move size actually supports it.
 HARD_STOP_PCT = _env_float("HARD_STOP_PCT", 0.02)         # tightened from 0.05 (2026-07 profitability fix) - fixes stop:TP risk/reward skew
 
 # --- Dynamic (volatility-based) Take Profit ----------------------------------
 DYNAMIC_TP_ENABLED = _env_bool("DYNAMIC_TP_ENABLED", True)
-TAKE_PROFIT_MAX_PCT = _env_float("TAKE_PROFIT_MAX_PCT", 0.010)  # raised from 0.006 (2026-07 profitability fix) - lets winners run further in trend/high-vol
+TAKE_PROFIT_MAX_PCT = _env_float("TAKE_PROFIT_MAX_PCT", 0.020)  # 2026-08-31 aggressive config: raised from 0.010, holding the same 2x expansion band over the base target.
 TP_VOL_LOW = _env_float("TP_VOL_LOW", 0.0003)    # tick-return std at/below this -> quiet -> base TP
 TP_VOL_HIGH = _env_float("TP_VOL_HIGH", 0.0012)  # tick-return std at/above this -> max TP expansion
 
