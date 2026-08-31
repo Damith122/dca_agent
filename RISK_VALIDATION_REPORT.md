@@ -1,8 +1,9 @@
 # Risk admission repair and paper validation
 
-This patch does **not** establish profitability. Do not merge it into an
-auto-deploying live branch as a profitability release. No production Railway
-variables, exchange settings, positions or orders were changed during this work.
+This patch does **not** establish profitability. It is not a live profitability
+release. After explicit user approval, the fixes were included in `main` for
+keyless paper deployment. Exchange settings and orders were not changed.
+See the deployment update below for the Railway changes and current scope.
 
 ## Evidence inspected
 
@@ -77,9 +78,11 @@ the documented V2 position schema does not include V3's notional field.
 
 ## Configuration changes
 
-No variables were changed on the original `dca_agent` Railway service.
-This table describes the supplied **paper
-candidate**, not a live recommendation or an optimized strategy.
+Initially no variables were changed on the original `dca_agent` Railway service.
+After approval, three safety variables were changed as detailed below. This
+table describes the supplied **paper candidate**, not a live recommendation
+or an optimized strategy; most values are set inside the paper launcher,
+not written over the saved Railway variables.
 
 | Variable | Last observed run / old default | Paper candidate |
 |---|---|---|
@@ -186,6 +189,34 @@ policy NEVER; it is not running. No location restriction was bypassed.
 The PR also corrects an old misleading mainnet warning that printed even when
 DRY_RUN was true, and stops immediately on HTTP 451 rather than retrying it.
 The latter has an additional offline regression, bringing the new-test total
-to 25. The independent CI run above covers the first 24; check the PR latest
-CI for the final revision. The original live service remains removed/stopped,
-and its main branch and Railway variables remain unchanged.
+to 25. [CI run 33437377319](https://github.com/Damith122/dca_agent/actions/runs/33437377319)
+passed all 25 new tests and 97 fill checks on final repair commit `52f493c`.
+
+## Approved paper deployment update — 2026-08-31 UTC
+
+The user explicitly approved updating `main` and deploying the existing
+`dca_agent` service for the bounded paper test. The repair was fast-forwarded
+to `main`; [PR #1](https://github.com/Damith122/dca_agent/pull/1) is merged.
+The production source remains `Damith122/dca_agent`, branch `main`, in its
+existing region. No region, proxy or market-data endpoint was changed.
+
+Saved Railway variables changed: `DRY_RUN=true`,
+`LIVE_TRADING_CONFIRMATION=false`, `I_UNDERSTAND_THIS_IS_REAL_MONEY=no`.
+All Binance API credentials and the GitHub token were left unchanged and
+were not read. The launcher removes them from its own process environment.
+The service configuration is staged with start command
+`python -u paper_validation.py --minutes 60` and restart policy `NEVER`.
+`Procfile` now uses that same keyless command, and CI runs on `main` pushes.
+
+The first service-scoped redeploy (`be567eb4-9f90-456e-9b5b-e2b9d481cfb1`)
+reused the previous commit `75c1d0d` and its old start command. The disabled
+live confirmation gate stopped it before account activity. A Railway
+SUCCESS status here means a clean process exit, not a running paper test.
+Do not reuse historical deployment images expecting new source code.
+
+An environment-wide staged-change deployment was not performed: the safety
+reviewer rejected its scope. Only the named service's source/configuration
+is being prepared. This document does not claim a completed forward test.
+Current deployment IDs, runtime verification and remaining blockers are
+recorded in the PR description to avoid restarting experiments for log-only
+documentation edits. A 60-minute test is a plumbing check, not proof of profit.
