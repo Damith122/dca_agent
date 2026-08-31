@@ -542,16 +542,33 @@ illegal — and would leave no margin buffer at all if both DCA'd. The
 portfolio-capacity gate was never observed blocking an entry in any log
 window analysed, so the second slot buys little.
 
-### Every USD-denominated threshold was rescaled
+### Every USD-denominated threshold was set explicitly — which was a mistake
 
-This is the part that would have broken silently. Position notional dropped
-from ~$40 to ~$10, and the risk envelope is configured in **absolute USDT**,
-not percentages. Left unscaled, `MAX_TRADE_NET_LOSS_USDT=0.15` would have
-been 150 bps of a $10 position — far beyond the 2% hard stop — so the
-rr-stop would never have fired and the risk/reward envelope would have been
-inert.
+> **CORRECTION (2026-08-31).** An earlier version of this section told you to
+> rescale these thresholds by hand whenever `INITIAL_ENTRY_USDT` or
+> `LEVERAGE` changes, and said they "are not percentages and will not
+> follow." **That was wrong.** Thirteen of them are declared through
+> `_notional_scaled()` in `config.py`, which expresses each one as a fraction
+> of `ENTRY_NOTIONAL_USDT` and therefore *does* follow position size
+> automatically. They only stopped following because the table below was
+> pushed into Railway as explicit environment variables, and an explicit
+> value always wins over the derived one — that is the documented escape
+> hatch, and setting it is precisely what disables the auto-scaling. The
+> startup banner has been telling us so all along, printing `OVERRIDDEN`
+> beside ten of the thirteen. **Do not hand-rescale these. Clear the
+> override instead** (set the Railway variable to an empty string —
+> `_env_raw()` treats empty and whitespace-only as absent, by design) and the
+> correct value is derived. See §15.
 
-All of these were set from first principles against the $10 notional:
+The concern that motivated the table was real even if the remedy was not.
+Position notional dropped from ~$40 to ~$10, and a threshold pinned in
+absolute USDT does silently change meaning in percentage terms when notional
+moves: `MAX_TRADE_NET_LOSS_USDT=0.15` would have been 150 bps of a $10
+position — beyond the 2% hard stop — so the rr-stop would never have fired
+and the risk/reward envelope would have been inert. Pinning every value by
+hand avoided that, but only until the next size change.
+
+These were the explicit values set against the $10 notional:
 
 | Variable | Value | = bps of $10 |
 |---|---|---|
@@ -565,8 +582,11 @@ All of these were set from first principles against the $10 notional:
 | `DCA_RESCUE_BREAKEVEN_MIN_NET_USD` | 0.01 | 10 |
 | `MAX_TRADE_EXIT_BUFFER_USDT` | 0.02 | 20 |
 
-**If you ever change `INITIAL_ENTRY_USDT` or `LEVERAGE`, rescale all nine of
-these by the same factor.** They are not percentages and will not follow.
+**Superseded — see the correction above.** These are auto-scaling thresholds
+that were pinned by explicit overrides. When you change `INITIAL_ENTRY_USDT`
+or `LEVERAGE`, clear the overrides rather than rescaling them; the values
+below are then re-derived at the new notional. The full list of thirteen, and
+the two that are worth overriding on purpose, are in §15.
 
 ### The complete live variable set
 
@@ -769,3 +789,249 @@ differential. **It is a well-built vehicle with no fuel.** The next phase
 is not tuning — it is finding fuel, and the only lead this project produced
 is funding carry.
 
+
+---
+
+## 15. Aggressive configuration (2026-08-31) — operator-directed
+
+This section documents a configuration change that the evidence in §13 and
+§14 argues against, made at the operator's explicit instruction after that
+evidence was presented and accepted. It is written so the reasoning behind
+each number is recoverable, and so reverting is a five-minute job.
+
+### What it is trying to do
+
+Target **≥ $0.50 net profit per day** on a ~$16.92 account. That is 2.96%
+per day, which compounds to roughly 4,134,601% per year.
+
+### What the evidence says will happen instead
+
+The measured per-trade result over 71 round trips is **gross +1.3 bps, net
+−8.7 bps**, t = −3.23, p < 0.01. The gross edge is statistically
+indistinguishable from zero; the net number is the fee line.
+
+Sizing does not create edge — it multiplies whatever expectancy exists, and
+this expectancy is negative. Monte Carlo over this configuration returns:
+
+| Configuration | P(ruin) | Median time to ruin |
+|---|---|---|
+| Previous live config ($10 notional, 1 slot) | 77.9% | — |
+| This aggressive config (and every variant tried) | **100.0%** | **36–61 days** |
+
+For contrast: *if* the strategy had a genuine +5 bps net edge, $21 of
+notional already produces $0.50/day at **0%** ruin. The binding constraint
+has never been position size. It is the sign of the edge.
+
+### The changes
+
+| Variable | Was | Now | Rationale |
+|---|---|---|---|
+| `INITIAL_ENTRY_USDT` | 5 | **3** | Largest initial margin that lets *both* slots carry a DCA rung |
+| `LEVERAGE` | 2 | **20** | Entry notional $10 → $60 |
+| `MAX_ACTIVE_TRADES` | 1 | **2** | Two concurrent positions across SOL/SUI |
+| `TAKE_PROFIT_PCT` | 0.0035 | **0.004** | 35 → 40 bps. A hard ceiling, not a choice — see below |
+| `TAKE_PROFIT_MAX_PCT` | 0.010 | **0.020** | 100 → 200 bps; this is where the expansion lives |
+| `DCA_TRIGGER_PCT` | 0.002 | **0.002** | Unchanged — 40 bps base needs no widening |
+| `MAX_DAILY_LOSS_USDT` | 1.50 | **2.50** | ≈14.8% of account (see below) |
+| `DAILY_PROFIT_TARGET_USDT` | 1.00 | **1.00** | 2× the $0.50/day objective |
+| ten `_notional_scaled` overrides | pinned | **cleared** | Re-derive at $60 notional |
+
+`MAX_DCA_STEPS` stays at **1** and `ENTRY_SCORE_THRESHOLD` stays where it is.
+
+### Why $3, and not more
+
+$3 is not a round number chosen for taste. It is the largest initial margin
+at which both portfolio slots can still carry their DCA rung on this account:
+
+```
+initial            margin $3.00   notional  $60.00
++ DCA #1 (x1.6)    margin $4.80   notional  $96.00
+full position      margin $7.80   notional $156.00
+x 2 slots          margin $15.60  notional $312.00
+balance $16.92  -> free margin $1.32   (8% buffer)
+```
+
+`INITIAL_ENTRY_USDT=4` needs $20.80 in that state and is not fundable.
+`INITIAL_ENTRY_USDT=8` needs $41.60 and is not fundable at any leverage.
+
+**The buffer is thin, and the failure mode matters.** Confidence-based sizing
+(`SIZE_MAX_MULT=1.5`) can scale an entry to $4.50 margin and its DCA to
+$7.20 — $11.70 per slot, $23.40 for two, which does not fit. Under CROSSED
+margin the consequence is a **rejected order** (Binance `-2019`), not a
+liquidation: the second slot's DCA fails to place and the existing position
+keeps its protective stop. That is survivable and self-limiting, which is why
+`SIZE_MAX_MULT` was left alone rather than clamped to 1.0 — clamping trades a
+recoverable rejection for the permanent loss of confidence scaling.
+
+**Liquidation distance.** At the full $312 notional state, maintenance margin
+is roughly $1.56, so liquidation needs equity below that — about a **4.9%**
+adverse move. The ATR-scaled stop, capped by the derived `MAX_STOP_LOSS_USD`
+of $0.675 (112 bps), fires around **1.1%**. The stop binds first by a factor
+of four — *provided it executes*. At 20× leverage the protective stop is the
+only thing between this configuration and the liquidation price, so a stop
+that fails to place is now an account-level event rather than a trade-level
+one. The bookkeeping fix in §13 that reconciles `FINISHED` algo orders
+against the exchange position matters considerably more here than it did at
+2×.
+
+### The take-profit ceiling the test suite found
+
+Widening the target is the one change here that improves the trade's
+economics rather than merely scaling it. Round-trip cost is ~7 bps and is
+**fixed per round trip**, so it is 20% of a 35 bps target but only 10% of a
+70 bps one. Expected move size grows as the square root of holding time while
+cost does not grow at all — so wider is the right direction, *but only while
+the target stays reachable*.
+
+**The first version of this configuration set `TAKE_PROFIT_PCT` to 100 bps,
+and the test suite rejected it.** `test_algo_update_and_trade_log_recovery_fix.py`
+asserts that the take-profit must sit within about **5 ATR of the ATR floor**
+(0.08%), because beyond that distance the position cannot travel far enough
+before the loss budget or the max-hold timer ends the trade. 100 bps is
+**12.5 ATR** at the floor. In the quiet `SIDEWAYS` conditions the live logs
+actually show (atr% 0.17–0.25%), that target would essentially never be hit
+and every trade would resolve at the stop or on max-hold. That is not a more
+aggressive strategy — it is a worse one wearing an aggressive number.
+
+Probing the invariant directly: **0.004 passes, 0.005 fails.** So
+
+```
+TAKE_PROFIT_PCT = 0.004   (40 bps = exactly 5.0 ATR at the floor)
+```
+
+is a hard ceiling imposed by the design, and that is where it sits.
+
+**The expansion the operator asked for lives in `TAKE_PROFIT_MAX_PCT`
+instead**, raised 100 → 200 bps. That is the right home for it:
+`DYNAMIC_TP_ENABLED` interpolates between base and max as tick-return
+volatility runs from `TP_VOL_LOW` to `TP_VOL_HIGH`, so the wide target is
+applied *only when the market is actually moving far enough to reach it*,
+while the 40 bps base governs the quiet conditions where reachability binds.
+The base is the value used in quiet markets — which is precisely why it could
+not simply be set to the number that sounded most aggressive.
+
+`DCA_TRIGGER_PCT` was briefly widened to 0.005 alongside the 100 bps target
+and reverted with it. At a 40 bps base the rung still fires once inside the TP
+distance, which is the intended geometry.
+
+### The Brain needs no reset
+
+`TAKE_PROFIT_PCT` only **seeds** `_label_move_scale` (`trading.py:2548`),
+which is an EWMA of realised `|forward_return|` decaying at 0.999 per tick.
+Within roughly a thousand ticks the `tp_hit` and `noise` labels ride the
+market's own move scale rather than this constant. The `tp_hit` head's
+accumulated updates (2.8M+) stay valid across this change. No
+`reset_head()`, no label-version bump.
+
+### The two intentional overrides
+
+Everything notional-scaled is left to derive itself **except** the two daily
+circuit breakers, which are set explicitly on purpose:
+
+```
+MAX_DAILY_LOSS_USDT       = 2.50    (14.8% of a $16.92 account)
+DAILY_PROFIT_TARGET_USDT  = 1.00    (2x the $0.50/day objective)
+```
+
+Notional is the right reference for per-**trade** geometry: a stop governs
+one position, and that position's notional is fixed for its lifetime. It is
+the wrong reference for a per-**day** budget, which is properly a fraction of
+account equity and has nothing to do with how large any single entry happens
+to be. Left derived, the daily loss cap lands at $0.75 — barely more than a
+single full stop-out at $0.675 — so entries would halt after one losing trade
+on most days, defeating the standing first priority that data collection must
+never stop.
+
+Note the gate is **new-entry-only**. The tick feature recorder and the
+`tp_hit` / `noise` heads keep learning through a halt regardless; it is the
+`success` head, which can only be labelled by a closed trade, that goes
+hungry.
+
+### Derived values at $60 notional
+
+All thirteen, with the overrides cleared:
+
+| Threshold | Value | bps of notional |
+|---|---|---|
+| `MAX_STOP_LOSS_USD` | $0.6750 | 112.5 |
+| `MAX_TRADE_NET_LOSS_USDT` | $0.6750 | 112.5 |
+| `TARGET_PROFIT_USD` | $0.6750 | 112.5 |
+| `PROFIT_LOCK_ACTIVATION_USDT` | $0.3615 | 60.2 |
+| `MIN_TARGET_PROFIT_USD` | $0.2625 | 43.8 |
+| `SMART_ORDERFLOW_EXIT_MAX_LOSS_USD` | $0.1500 | 25.0 |
+| `SL_MIN_USD` | $0.0900 | 15.0 |
+| `SMART_ORDERFLOW_EXIT_MIN_LOSS_USD` | $0.0750 | 12.5 |
+| `MAX_TRADE_EXIT_BUFFER_USDT` | $0.0750 | 12.5 |
+| `MIN_NET_PROFIT_USDT` | $0.0375 | 6.2 |
+| `DCA_RESCUE_BREAKEVEN_MIN_NET_USD` | $0.0300 | 5.0 |
+| `MAX_DAILY_LOSS_USDT` | *overridden* $2.50 | — |
+| `DAILY_PROFIT_TARGET_USDT` | *overridden* $1.00 | — |
+
+`MIN_STOP_LOSS_USD` is a **dead value** — imported by `trading.py` but never
+read for any decision. The working stop floor is `SL_MIN_USD`. Setting it has
+no effect; it can be deleted from Railway.
+
+### What was deliberately not changed
+
+**`ENTRY_SCORE_THRESHOLD`.** Size and frequency multiply rather than add.
+Raising both would compound the expected loss, and the entry gate is the last
+filter still rejecting trades. Lowering it is the single fastest available
+route to ruin. It is the remaining lever, and it is left in the operator's
+hands deliberately.
+
+**`MAX_DCA_STEPS`.** Two steps do not fit the margin arithmetic above at two
+slots.
+
+**`SIZE_MAX_MULT`.** See the rejected-order reasoning above.
+
+### How to revert
+
+Set these seven Railway variables and redeploy (`DCA_TRIGGER_PCT` never
+moved):
+
+```
+INITIAL_ENTRY_USDT       = 5
+LEVERAGE                 = 2
+MAX_ACTIVE_TRADES        = 1
+TAKE_PROFIT_PCT          = 0.0035
+TAKE_PROFIT_MAX_PCT      = 0.010
+MAX_DAILY_LOSS_USDT      = 1.50
+DAILY_PROFIT_TARGET_USDT = 1.00
+```
+
+Every notional-scaled threshold follows automatically. Do **not** re-pin them
+by hand — that is the mistake corrected at the top of §13.
+
+### Test suite result for this change
+
+48 of 53 files pass. The 5 failures are the long-standing pre-existing ones
+documented in §10 (`dca_resync_race`, `dca_spacing`, `dca_time_gate`,
+`fee_net_profitability_guard`, `trade_loss_budget_and_dca_gates`) — verified
+identical against the previous `config.py`, so this change introduces no new
+failures.
+
+Two tests were amended, both because they pinned a *deployment* value into an
+assertion about something else entirely — the same class of mistake as the
+hand-pinned thresholds corrected in §13:
+
+- `test_multi_coin_architecture.py` asserted `MAX_ACTIVE_TRADES == 1`. It now
+  asserts the cap is a positive integer no larger than the watchlist, which is
+  the actual invariant.
+- `test_dry_fills.py` hardcoded `qty=0.2` while proving "PnL is booked net of
+  commission" — a claim that must hold at any quantity. It now reads the
+  filled quantity.
+
+### What to watch in the first 48 hours
+
+1. **The startup banner.** It must read `$60.00 = $3.0 x 20x` and
+   `11/13 derived`. Any `OVERRIDDEN` line other than the two daily breakers
+   means a stale Railway variable survived and is pinning a threshold while
+   the rest of the geometry moved.
+2. **`-2019` margin rejections.** Expected occasionally on a second-slot DCA;
+   harmless. Frequent rejections on *initial* entries mean the account can no
+   longer fund the configuration and `INITIAL_ENTRY_USDT` must come down.
+3. **Protective-stop placement.** Every opened position must show its stop
+   placed. At 20× a missing stop is the account, not the trade.
+4. **The daily-loss halt.** If it fires most days, the loss rate is running
+   ahead of the ruin model and the honest read is that the 36–61 day median
+   is optimistic.
