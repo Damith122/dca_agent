@@ -24,19 +24,26 @@ Read this section once before going live, then act as you see fit.
 
 **What the evidence says about profitability:**
 
-The complete live trading record of this system is 5 simulated round trips
-(NEARUSDT, 2026-08-30, 02:40–05:10 UTC):
+**71 closed trades, 2026-08-30 12:15 → 2026-08-31 04:24 UTC.** Full
+per-symbol breakdown in §13.
 
 ```
-trades 5   wins 1 (20%)
-gross PnL  -0.1023 USDT   (-5.1 bps per trade, BEFORE fees)
-fees        0.1968 USDT   ( 9.8 bps per trade)
-NET        -0.2992 USDT   (-15.0 bps per trade)   t = -2.21
+71 trades   21 wins (30%)
+gross    +0.3503 USDT   ( +1.3 bps per trade)  <- indistinguishable from zero
+fees      2.8008 USDT   (-10.0 bps per trade)
+NET      -2.4497 USDT   ( -8.7 bps per trade)   t = -3.23   p < 0.01
 ```
 
-The strategy lost money *before* costs. Fees made it worse; they are not the
-cause. Average absolute move captured was 12.7 bps against a 9.8 bps round
-trip, so fees consume 77% of the typical move.
+**The strategy has no gross edge.** +1.3 bps is not distinguishable from
+zero. The round trip costs 10.0 bps, which turns a zero edge into a
+significant loss. This is a conclusion, not a suspicion: at n=71 with
+t = −3.23 the negative expectation is established.
+
+The practical consequence: **no configuration change fixes this.** Fewer
+symbols, lower leverage, smaller size and different thresholds all scale a
+zero edge. The only lever that moves net is execution cost, and the best
+reachable version (post-only maker entry, which is now enabled) is
+−5.7 bps — still negative.
 
 Seven strategy families were tested and found null during this work:
 Martingale DCA, tick mean-reversion, orderbook imbalance, Donchian breakout,
@@ -46,8 +53,10 @@ long/short. Two things survived: volatility clustering (corr(atr_pct,
 tradable) and funding carry (5.5–6.3% annualised, delta-neutral, a different
 system to this one).
 
-n = 5 is far too small to be conclusive. But it is not "unknown" either —
-the little evidence there is leans negative.
+What has NOT been established: whether some different strategy on this same
+infrastructure could work. The infrastructure itself — recorder, heads,
+execution, risk envelope, reconciliation — is sound and well tested. It is
+the entry signal that has no edge.
 
 ---
 
@@ -133,10 +142,11 @@ That is the only change required. Everything else is already configured for
 live. Confirm from the boot banner that the `*** DRY RUN MODE ***` line is
 **gone** — if it still prints, no real order will ever be sent.
 
-### Recommended live configuration
+### Live configuration
 
-Sized so a losing run is survivable rather than sudden. At the measured
-−15 bps per trade and ~1 trade/hour, this is a slow bleed you can watch.
+**Superseded by §13, which carries the final values actually set in Railway
+on 2026-08-31 and the arithmetic behind each one.** The table below is the
+earlier generic guidance, kept for the reasoning.
 
 | Variable | Suggested | Why |
 |---|---|---|
