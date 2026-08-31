@@ -161,6 +161,14 @@ class AdmissionIntegration(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(SystemExit):
                 dca2.enforce_safety_gates()
 
+    async def test_restricted_location_is_not_retried(self):
+        request = AsyncMock(side_effect=trading.BinanceApiError(451, {"msg": "restricted location"}))
+        with patch.object(asyncio, "sleep", new_callable=AsyncMock) as sleep:
+            with self.assertRaises(SystemExit):
+                await dca2.retry_with_backoff(request, label="public data")
+        request.assert_awaited_once()
+        sleep.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

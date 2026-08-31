@@ -77,7 +77,8 @@ the documented V2 position schema does not include V3's notional field.
 
 ## Configuration changes
 
-No Railway values were written. This table describes the supplied **paper
+No variables were changed on the original `dca_agent` Railway service.
+This table describes the supplied **paper
 candidate**, not a live recommendation or an optimized strategy.
 
 | Variable | Last observed run / old default | Paper candidate |
@@ -119,7 +120,7 @@ their container; each restart intentionally begins a new experiment.
 
 ## Validation and remaining work
 
-Local: 10 pure admission tests, 13 mocked manager integration tests and one
+Local: 10 pure admission tests, 14 mocked manager integration tests and one
 launcher-isolation test pass. The simulated-fill regression has 97 passing
 checks. Syntax compilation and whitespace checks pass.
 
@@ -153,3 +154,38 @@ chronological holdout periods; never choose thresholds on the evaluation data.
 Require positive results after costs with uncertainty/drawdown estimates, not
 one profitable day. A 60-minute paper run validates plumbing only. There is no
 minimum trade-count shortcut that can guarantee a profitable next month.
+
+## Hosted validation status
+
+[GitHub CI run 33436469987](https://github.com/Damith122/dca_agent/actions/runs/33436469987)
+passed on commit `1969d12c581880ab3fc697ea74e7c740afe8a37e` using actual
+dependencies, including the 24 new tests and 97 dry-fill checks. This resolves
+the local dependency limitation for those checks, not the wider legacy suite.
+
+A separate Railway service `dca-agent-paper-validation` was created from
+`codex/paper-validation-run`; the original stopped `dca_agent` service was not
+changed. Its configured command is `python paper_validation.py --minutes 60`
+and restart policy is `NEVER`. Only this paper service received these variables:
+`DRY_RUN=true`, `USE_TESTNET=false`, `LIVE_TRADING_CONFIRMATION=false`,
+`I_UNDERSTAND_THIS_IS_REAL_MONEY=no`, and empty `BINANCE_API_KEY`,
+`BINANCE_API_SECRET`, `GITHUB_TOKEN`. Its launcher also clears inherited
+settings and loads the documented paper profile.
+
+The create-service API initially reported an unexpected `main` commit in build
+metadata despite its configured source being the paper branch. No credentials
+were supplied. A subsequent branch push selected commit `38d4443745de7e7251d282aeb8b254de29a8a5ef`
+correctly. Deployment `ab63c997-574c-4a54-a296-a6bc3681dda2` then logged
+`Dry-run: True`, a fresh PAPER_LIVE namespace, $15 paper cash, $10 initial
+notional, DCA=0, threshold 0.75 and +$0.50/-$0.30 daily limits.
+
+However, the new service defaulted to San Francisco (`sfo`). Binance denied
+the initial public time request with HTTP 451 (restricted location). No market
+forward test or trade completed. The deployment ended CRASHED with restart
+policy NEVER; it is not running. No location restriction was bypassed.
+
+The PR also corrects an old misleading mainnet warning that printed even when
+DRY_RUN was true, and stops immediately on HTTP 451 rather than retrying it.
+The latter has an additional offline regression, bringing the new-test total
+to 25. The independent CI run above covers the first 24; check the PR latest
+CI for the final revision. The original live service remains removed/stopped,
+and its main branch and Railway variables remain unchanged.

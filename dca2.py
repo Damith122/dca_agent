@@ -321,6 +321,11 @@ async def retry_with_backoff(coro_fn, *args, attempts: int = STARTUP_RETRY_ATTEM
         try:
             return await coro_fn(*args)
         except BinanceApiError as e:
+            if e.status == 451:
+                raise SystemExit(
+                    f"[startup] {label}: Binance denied access from this host (HTTP 451). "
+                    "Stopping; verify service eligibility with Binance before trying again."
+                ) from e
             if e.status in (418, 429):
                 client = getattr(coro_fn, "__self__", None)
                 if not isinstance(client, RestClient):
@@ -1220,7 +1225,9 @@ async def main() -> None:
             " *** breakout engine OFF - validate with backtest_breakout.py "
             "before setting BREAKOUT_ENGINE_ENABLED=true ***", GRAY,
         ))
-    if not USE_TESTNET:
+    if DRY_RUN:
+        print(color(" *** PAPER MODE - SIMULATED ORDERS, NO REAL MONEY EXECUTION ***", GRAY))
+    elif not USE_TESTNET:
         print(color(" *** LIVE MAINNET MODE - REAL MONEY AT RISK ***", RED))
 
     print(color("=" * 78, CYAN))
