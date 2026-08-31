@@ -366,7 +366,7 @@ async def retry_with_backoff(coro_fn, *args, attempts: int = STARTUP_RETRY_ATTEM
 
 
 def enforce_safety_gates() -> None:
-    if not API_KEY or not API_SECRET:
+    if not DRY_RUN and (not API_KEY or not API_SECRET):
         raise SystemExit(
             "Missing BINANCE_API_KEY / BINANCE_API_SECRET environment variables. "
             "Set them in Railway's Variables tab (never hardcode them in this "
@@ -374,7 +374,7 @@ def enforce_safety_gates() -> None:
             "keys at https://testnet.binancefuture.com/ if you don't have them."
         )
 
-    if not USE_TESTNET and not I_UNDERSTAND_THIS_IS_REAL_MONEY:
+    if not DRY_RUN and not USE_TESTNET and not I_UNDERSTAND_THIS_IS_REAL_MONEY:
         raise SystemExit(
             "REFUSING TO START: USE_TESTNET=false (mainnet) but "
             "I_UNDERSTAND_THIS_IS_REAL_MONEY is not set to 'yes'. "
@@ -386,7 +386,7 @@ def enforce_safety_gates() -> None:
     # before mainnet trading is allowed to start. Deliberately checked
     # separately (not merged into the check above) so it prints its own
     # explicit message and can be reasoned about/audited independently.
-    if not USE_TESTNET and not LIVE_TRADING_CONFIRMATION:
+    if not DRY_RUN and not USE_TESTNET and not LIVE_TRADING_CONFIRMATION:
         print(color(
             "[LIVE SAFETY]\n"
             "Mainnet trading blocked.\n"
@@ -409,8 +409,8 @@ def enforce_safety_gates() -> None:
         ))
         LEVERAGE = MAX_ALLOWED_LEVERAGE
 
-    if MAX_DCA_STEPS > 5:
-        raise SystemExit("MAX_DCA_STEPS > 5 is not supported by this script's safety design.")
+    if not 0 <= MAX_DCA_STEPS <= 5:
+        raise SystemExit("MAX_DCA_STEPS must be between 0 (disabled) and 5.")
 
 
 # ============================================================================
@@ -981,7 +981,7 @@ async def setup_symbol(
         usdt = next((b for b in balances if b["asset"] == "USDT"), None)
         manager.available_balance = float(usdt["availableBalance"]) if usdt else 0.0
     else:
-        manager.available_balance = 500.0
+        manager.available_balance = manager.portfolio.paper_wallet
     print(color(f"[setup] [{symbol}] available balance: {manager.available_balance:.2f} USDT", GRAY))
 
     # 2026-08 instant warm-up fix: ONE REST call to GET /fapi/v1/klines
@@ -1058,6 +1058,10 @@ async def main() -> None:
     print(color("=" * 78, CYAN))
     print(color(" Martingale DCA Scalper - Binance USD-M Futures  [Brain V2]", BOLD))
     print(color(f" Symbol: {SYMBOL}   Testnet: {USE_TESTNET}   Dry-run: {DRY_RUN}", GRAY))
+    from config import RUNTIME_ENV, EXPOSURE_GUARD_ENABLED, PAPER_START_BALANCE_USDT
+    print(color(f" State namespace: {RUNTIME_ENV} | exposure admission: {EXPOSURE_GUARD_ENABLED}", GRAY))
+    if DRY_RUN:
+        print(color(f" Paper starting wallet: ${PAPER_START_BALANCE_USDT:.2f}; fresh experiment, no account orders", GRAY))
     # 2026-08-20 multi-coin: make the watchlist and the portfolio cap the
     # first thing visible in a deploy log, so which coins are live and how
     # many can trade at once is never in doubt.
@@ -1221,7 +1225,7 @@ async def main() -> None:
 
     print(color("=" * 78, CYAN))
 
-    client = RestClient(API_KEY, API_SECRET, REST_BASE)
+    client = RestClient("" if DRY_RUN else API_KEY, "" if DRY_RUN else API_SECRET, REST_BASE)
     # 2026-08-20 multi-coin: `managers` is the watchlist registry, SYMBOL ->
     # manager. `manager` remains bound to the PRIMARY symbol's manager so
     # every pre-existing reference below (and the shutdown block) is
@@ -1250,6 +1254,7 @@ async def main() -> None:
             try:
                 managers[sym] = await setup_symbol(client, sym, portfolio)
             except SymbolNotListed as e:
+                portfolio.managers.pop(sym, None)
                 # Its own branch so the log says "not on this venue" rather
                 # than burying it among genuine initialisation failures -
                 # the fix is a watchlist change, not a retry.
@@ -1309,11 +1314,15 @@ async def main() -> None:
         #                           once per symbol would be 4x the REST cost
         #                           for the same number.
         # ------------------------------------------------------------------
-        tasks = [
-            listen_key_keepalive(client),
-            userdata_consumer(client, manager, managers=managers),
-            balance_refresher(client, manager),
-        ]
+        # Paper runs use public market data and their own cash ledger only.
+        # A real user stream must never overwrite simulated positions/balance.
+        tasks = []
+        if not DRY_RUN:
+            tasks.extend([
+                listen_key_keepalive(client),
+                userdata_consumer(client, manager, managers=managers),
+                balance_refresher(client, manager),
+            ])
         for m in managers.values():
             tasks.extend([
                 market_data_consumer(m),

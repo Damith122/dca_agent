@@ -452,6 +452,10 @@ from config import (
 )
 from indicators import clamp, safe_div, ema_series, round_step
 from exchange import BinanceApiError, RestClient, SymbolFilters
+from exposure_guard import assess_add
+from config import (EXPOSURE_GUARD_ENABLED, EXPOSURE_HEADROOM_PCT,
+                    EXPOSURE_MAINTENANCE_FLOOR_PCT, EXPOSURE_COST_RESERVE_PCT,
+                    EXPOSURE_RECHECK_SEC, PAPER_START_BALANCE_USDT)
 # 2026-08 high-frequency orderflow upgrade: OrderFlowTracker is the bounded
 # in-memory ring-buffer data layer defined in websocket.py (the module that
 # owns the market feed it is fed from). websocket.py imports only config +
@@ -1027,7 +1031,7 @@ class FeatureBuilderV2:
                 if position.side == "LONG"
                 else (position.avg_entry_price - price) / position.avg_entry_price
             )
-            dca_ratio = position.dca_step / MAX_DCA_STEPS
+            dca_ratio = position.dca_step / max(MAX_DCA_STEPS, 1)
             if position.opened_at:
                 position_duration_norm = clamp((time.time() - position.opened_at) / 3600.0, 0.0, 4.0) / 4.0
 
@@ -1081,7 +1085,7 @@ class RiskEngine:
         distance_to_liq_pct: Optional[float],
     ) -> float:
         vol_component = clamp(regime.atr_ratio / (REGIME_ATR_HIGH_MULT * 1.5), 0.0, 1.0)
-        dca_component = dca_step / MAX_DCA_STEPS
+        dca_component = dca_step / max(MAX_DCA_STEPS, 1)
         drawdown_component = clamp(pct_move_adverse / HARD_STOP_PCT, 0.0, 1.0)
         liq_component = 0.0
         if distance_to_liq_pct is not None:
@@ -2274,6 +2278,47 @@ class PortfolioCoordinator:
         self.max_active = max(1, int(max_active))
         # symbol -> why it holds the slot ("reserved" then "open")
         self._slots: Dict[str, str] = {}
+        self.managers: Dict[str, "MartingaleManager"] = {}
+        self.order_lock = asyncio.Lock()
+        self.next_exposure_check = 0.0
+        self.paper_wallet = PAPER_START_BALANCE_USDT
+
+    def daily_net_pnl(self) -> float:
+        for manager in self.managers.values():
+            manager._maybe_reset_daily_loss_tracker()
+        return sum(m.daily_realized_pnl for m in self.managers.values())
+
+    def local_notionals(self) -> dict:
+        result = {}
+        for symbol, manager in self.managers.items():
+            p = manager.position
+            if p.total_qty:
+                price = manager.current_price or p.avg_entry_price
+                if not price or not math.isfinite(price) or price <= 0:
+                    raise ValueError("missing price for local exposure")
+                result[symbol] = abs(p.total_qty) * price
+        return result
+
+    def paper_account(self) -> dict:
+        """One cash ledger shared by every paper symbol; no real account reads."""
+        unrealized = margin = 0.0
+        positions = []
+        for symbol, manager in self.managers.items():
+            p = manager.position
+            if not p.total_qty:
+                continue
+            price = manager.current_price or p.avg_entry_price
+            direction = 1 if p.side == "LONG" else -1
+            notional = abs(p.total_qty) * price
+            unrealized += direction * (price - p.avg_entry_price) * abs(p.total_qty)
+            margin += notional / manager.leverage
+            positions.append({"symbol": symbol, "positionAmt": direction * p.total_qty,
+                              "notional": notional, "positionSide": "BOTH", "isolated": False})
+        return {"canTrade": True, "multiAssetsMargin": False,
+                "totalOpenOrderInitialMargin": 0, "totalMaintMargin": 0,
+                "totalCrossWalletBalance": self.paper_wallet, "totalCrossUnPnl": unrealized,
+                "availableBalance": self.paper_wallet + min(unrealized, 0.0) - margin,
+                "positions": positions}
 
     # --- queries ------------------------------------------------------
     def active_count(self) -> int:
@@ -2334,6 +2379,7 @@ class MartingaleManager:
         # test does this) behaves exactly as it did before multi-coin -
         # one symbol, one position, gate always open for itself.
         self.portfolio = portfolio if portfolio is not None else PortfolioCoordinator()
+        self.portfolio.managers[symbol] = self
         self._last_portfolio_block_log_ts: float = 0.0
         # 2026-08-21 tick throttling, these four fields only. Per-instance,
         # so each watchlist symbol throttles on its own clock - a busy book
@@ -5355,78 +5401,24 @@ class MartingaleManager:
             # touch any currently-open position - Hard Stop/TP/Profit Lock/
             # DCA/Max Hold Time all continue exactly as before for a trade
             # that's already running when the limit is hit.
-            # 2026-08 CONTINUOUS 24/7 EXECUTION (this `if
-            # CONTINUOUS_24_7_TRADING` wrapper only - the daily accounting
-            # itself, _maybe_reset_daily_loss_tracker(), daily_realized_pnl,
-            # MAX_DAILY_LOSS_USDT / DAILY_PROFIT_TARGET_USDT and both
-            # diagnostic log lines are all PRESERVED verbatim below): the
-            # bot must keep trading around the clock and must not shut
-            # itself down for the rest of a UTC day on a daily profit or
-            # loss figure. With CONTINUOUS_24_7_TRADING=true (the default)
-            # the two daily halts become periodic informational notices
-            # instead of hard `return`s; setting it to false restores the
-            # previous daily-halt behavior exactly, with no code change.
-            #
-            # Risk is not being discarded here, it is being relocated to
-            # per-trade controls that this same upgrade tightens: the strict
-            # $0.20 fee-net stop (per-trade budget + exchange-native
-            # protective STOP_MARKET), the 1:2 RR target, the Smart
-            # Orderflow Early Exit, and the post-loss cool-off window - all
-            # of which act per trade rather than by freezing the bot for
-            # hours at a time.
-            self._maybe_reset_daily_loss_tracker()
-            if MAX_DAILY_LOSS_USDT > 0 and self.daily_realized_pnl <= -MAX_DAILY_LOSS_USDT:
-                if not CONTINUOUS_24_7_TRADING:
-                    if self._should_log_daily_loss_block():
-                        print(color(
-                            f"{now_str()} [daily-loss] entries halted: today's realized PnL "
-                            f"${self.daily_realized_pnl:+.4f} <= -${MAX_DAILY_LOSS_USDT:.2f} limit - "
-                            f"no new trades until the next UTC day (existing open positions, if any, "
-                            f"are unaffected)", RED,
-                        ))
-                    return
-                if self._should_log_continuous_trading():
+            # Shared across all symbols. A daily loss limit always blocks
+            # new entries, regardless of continuous-operation preference.
+            daily_pnl = self.portfolio.daily_net_pnl()
+            if MAX_DAILY_LOSS_USDT > 0 and daily_pnl <= -MAX_DAILY_LOSS_USDT:
+                if self._should_log_daily_loss_block():
                     print(color(
-                        f"{now_str()} [continuous-24-7] today's realized PnL "
-                        f"${self.daily_realized_pnl:+.4f} is past the -${MAX_DAILY_LOSS_USDT:.2f} "
-                        f"daily-loss reference, but CONTINUOUS_24_7_TRADING is enabled - the bot "
-                        f"keeps trading. Per-trade risk (${MAX_STOP_LOSS_USD:.2f} fee-net stop, "
-                        f"1:{self.rr_ratio():.0f} RR target, orderflow early exit, "
-                        f"{COOL_OFF_PERIOD_MINUTES:.0f}-min post-loss cool-off) governs from here.",
-                        YELLOW,
-                    ))
-
-            # Fee-net Daily Profit Lock: once the configured UTC-day target
-            # has been realized AFTER commissions, preserve it by refusing
-            # new exposure for the remainder of the day. This is symmetric
-            # with Daily Loss Protection above and is deliberately an
-            # entry-only gate: an already-open position is never abandoned
-            # or deprived of TP/Profit-Lock/Smart-Exit/Hard-Stop management.
-            if (
-                DAILY_PROFIT_TARGET_USDT > 0
-                and self.daily_realized_pnl >= DAILY_PROFIT_TARGET_USDT
-            ):
-                # 2026-08 CONTINUOUS 24/7 EXECUTION - same treatment as the
-                # daily-loss gate above: the target and its accounting are
-                # preserved exactly, but hitting it no longer stops the bot
-                # for the remainder of the UTC day.
-                if not CONTINUOUS_24_7_TRADING:
-                    if self._should_log_daily_profit_block():
-                        print(color(
-                            f"{now_str()} [daily-profit] entries halted: today's realized NET PnL "
-                            f"${self.daily_realized_pnl:+.4f} >= +${DAILY_PROFIT_TARGET_USDT:.2f} "
-                            f"target - profit locked, no new trades until the next UTC day "
-                            f"(existing open positions, if any, are unaffected)", GREEN,
-                        ))
-                    return
-                if self._should_log_continuous_trading():
+                        f"{now_str()} [daily-loss] entries halted: portfolio realized NET PnL "
+                        f"${daily_pnl:+.4f} <= -${MAX_DAILY_LOSS_USDT:.2f}; "
+                        f"existing exits remain active", RED))
+                return
+            if (not CONTINUOUS_24_7_TRADING and DAILY_PROFIT_TARGET_USDT > 0
+                    and daily_pnl >= DAILY_PROFIT_TARGET_USDT):
+                if self._should_log_daily_profit_block():
                     print(color(
-                        f"{now_str()} [continuous-24-7] today's realized NET PnL "
-                        f"${self.daily_realized_pnl:+.4f} has passed the "
-                        f"+${DAILY_PROFIT_TARGET_USDT:.2f} daily target, but "
-                        f"CONTINUOUS_24_7_TRADING is enabled - the bot keeps trading instead of "
-                        f"standing down for the rest of the UTC day.", GREEN,
-                    ))
+                        f"{now_str()} [daily-profit] entries halted: portfolio realized NET PnL "
+                        f"${daily_pnl:+.4f} >= +${DAILY_PROFIT_TARGET_USDT:.2f}; "
+                        f"existing exits remain active", GREEN))
+                return
 
             # 2026-08 Startup Warm-up Gate (isolated to entry gating only -
             # DCA/exit management for an already-open position, Brain
@@ -5805,6 +5797,93 @@ class MartingaleManager:
         self, step: int, side_signal: str, size_mult: float = 1.0,
         expected_position: Optional["PositionState"] = None,
     ) -> None:
+        """Serialize exposure increases, read fresh collateral, then submit.
+
+        Exits never take this lock. Pending orders block other additions,
+        avoiding double-spending collateral while a maker order awaits a fill.
+        A failed read never falls back to the wallet/status display value.
+        """
+        if not EXPOSURE_GUARD_ENABLED:
+            return await self._place_step_order_admitted(step, side_signal, size_mult, expected_position)
+        decision_position = self.position
+        if self.portfolio.order_lock.locked():
+            return  # re-evaluate next tick; do not queue stale decisions
+        async with self.portfolio.order_lock:
+            if expected_position is not None and expected_position is not self.position:
+                return
+            if (step < 0 or step > MAX_DCA_STEPS or side_signal not in ("LONG", "SHORT")
+                    or (step == 0 and self.position.status != "FLAT")
+                    or (step > 0 and (self.position.status != "OPEN"
+                                     or self.position.side != side_signal))):
+                return
+            if any(m.position.status in ("ENTERING", "DCA_PENDING", "CLOSING")
+                   or m.position.pending_order_id is not None
+                   for m in self.portfolio.managers.values()):
+                return
+            daily_pnl = self.portfolio.daily_net_pnl()
+            if MAX_DAILY_LOSS_USDT > 0 and daily_pnl <= -MAX_DAILY_LOSS_USDT:
+                return  # applies to DCA as well as initial entries; exits stay active
+            if (not CONTINUOUS_24_7_TRADING and DAILY_PROFIT_TARGET_USDT > 0
+                    and daily_pnl >= DAILY_PROFIT_TARGET_USDT):
+                return
+            if not DRY_RUN and not all(m.position_sync_ready for m in self.portfolio.managers.values()):
+                return
+            now = time.monotonic()
+            if now < self.portfolio.next_exposure_check:
+                return
+            self.portfolio.next_exposure_check = now + max(EXPOSURE_RECHECK_SEC, 1.0)
+            try:
+                account = self.portfolio.paper_account() if DRY_RUN else await self.client.get_account()
+                if self.position is not decision_position:
+                    return
+                if ((step == 0 and self.position.status != "FLAT")
+                        or (step > 0 and self.position.status != "OPEN")
+                        or any(m.position.pending_order_id is not None
+                               or m.position.status in ("ENTERING", "DCA_PENDING", "CLOSING")
+                               for m in self.portfolio.managers.values())):
+                    return
+                if (MAX_DAILY_LOSS_USDT > 0
+                        and self.portfolio.daily_net_pnl() <= -MAX_DAILY_LOSS_USDT):
+                    return
+                if (not CONTINUOUS_24_7_TRADING and DAILY_PROFIT_TARGET_USDT > 0
+                        and self.portfolio.daily_net_pnl() >= DAILY_PROFIT_TARGET_USDT):
+                    return
+                if not DRY_RUN and not all(m.position_sync_ready for m in self.portfolio.managers.values()):
+                    return
+                exchange_qty = sum(float(row["positionAmt"]) for row in account["positions"]
+                                   if row.get("symbol") == self.symbol)
+                local_qty = self.position.total_qty * (1 if self.position.side == "LONG" else -1)
+                if not math.isfinite(exchange_qty) or not math.isclose(
+                        exchange_qty, local_qty, rel_tol=1e-8, abs_tol=self.filters.step_size * 0.1):
+                    print(color(f"{now_str()} [exposure-block] {self.symbol} quantity differs from exchange; await sync", YELLOW))
+                    return
+                price = self.current_price
+                if not price or not math.isfinite(price) or price <= 0:
+                    return
+                qty = round_step(self.notional_for_step(step, size_mult) / price, self.filters.step_size)
+                result = assess_add(
+                    account, symbol=self.symbol, add_notional=qty * price, leverage=self.leverage,
+                    local_notionals=self.portfolio.local_notionals(),
+                    liquidation_buffer=LIQUIDATION_WARNING_BUFFER_PCT,
+                    headroom=EXPOSURE_HEADROOM_PCT,
+                    maintenance_floor=EXPOSURE_MAINTENANCE_FLOOR_PCT,
+                    cost_rate=EXPOSURE_COST_RESERVE_PCT,
+                )
+            except Exception as exc:
+                print(color(f"{now_str()} [exposure-block] account check unavailable ({type(exc).__name__}); no add", YELLOW))
+                return
+            if not result.allowed:
+                print(color(
+                    f"{now_str()} [exposure-block] {self.symbol} step={step}: {result.reason}; "
+                    f"projected_gross=${result.gross_notional:.2f} "
+                    f"required_equity=${result.required_equity:.2f} equity=${result.equity:.2f}; no add", YELLOW))
+                return
+            await self._place_step_order_admitted(step, side_signal, size_mult, decision_position)
+
+    async def _place_step_order_admitted(
+        self, step: int, side_signal: str, size_mult: float = 1.0,
+        expected_position: Optional["PositionState"] = None,
+    ) -> None:
         # item 4 - REST cooldown retry-storm fix (this check only - every
         # other line of this function, including the DRY_RUN branch, the
         # BinanceApiError handler, and every safety gate below, is
@@ -5921,6 +6000,8 @@ class MartingaleManager:
             return
 
         if DRY_RUN:
+            if not self.portfolio.try_reserve(self.symbol):
+                return
             fake_id = -(int(time.time() * 1000) % 1_000_000) - step
             print(color(
                 f"{now_str()} [DRY RUN] would place {step_label} {order_side} {qty} "
@@ -9514,6 +9595,9 @@ class MartingaleManager:
                     )
             if sim.resolve(pf.order_id) is None:
                 continue
+            self.portfolio.paper_wallet += realized - sim.commission(fill_price, pf.qty)
+            for manager in self.portfolio.managers.values():
+                manager.available_balance = self.portfolio.paper_wallet
             print(color(
                 f"{now_str()} [dry-fill] simulated {pf.role.upper()} {pf.side} {pf.qty} "
                 f"{self.symbol} @ {fill_price:.6f} (submitted @ {pf.submitted_price:.6f}, "

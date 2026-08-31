@@ -206,7 +206,7 @@ def func_src(name):
     return ""
 
 
-step_src = func_src("_place_step_order")
+step_src = func_src("_place_step_order_admitted")
 close_src = func_src("_place_reduce_only_close_order")
 resolve_src = func_src("_resolve_dry_fills")
 tick_src = func_src("on_price_tick")

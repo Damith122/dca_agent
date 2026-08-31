@@ -24,6 +24,7 @@
 
 import os
 import random
+import uuid
 
 # ============================================================================
 # CONFIG
@@ -168,6 +169,7 @@ def env_parse_warnings() -> list:
 # meaning/behavior as a safety gate is completely unchanged - it is simply
 # read a few lines earlier than before.
 USE_TESTNET = _env_bool("USE_TESTNET", True)
+DRY_RUN = _env_bool("DRY_RUN", True)
 
 # 2026-08 environment + symbol state isolation: runtime persistence must
 # be isolated by BOTH which Binance environment this process is trading
@@ -178,6 +180,10 @@ USE_TESTNET = _env_bool("USE_TESTNET", True)
 # (already the single source of truth for Testnet vs Live) is reused
 # directly.
 RUNTIME_ENV = "TESTNET" if USE_TESTNET else "LIVE"
+if DRY_RUN:
+    # Each paper process is a separate experiment: no cash reset disguised
+    # as continuation of an older run, and no simulated brain in live state.
+    RUNTIME_ENV = "PAPER_" + RUNTIME_ENV + "_" + uuid.uuid4().hex[:12]
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +346,7 @@ def _warn_if_explicit_path_bypasses_isolation(env_var_name: str) -> None:
         )
 
 # --- Safety gates - read the header above before touching these -------------
-DRY_RUN = _env_bool("DRY_RUN", False)
+# DRY_RUN is parsed above so simulated records never use LIVE state paths.
 I_UNDERSTAND_THIS_IS_REAL_MONEY = os.environ.get(
     "I_UNDERSTAND_THIS_IS_REAL_MONEY", ""
 ).lower() == "yes"
@@ -2176,11 +2182,10 @@ POST_ONLY_MARKET_FALLBACK = (
 # The existing MAX_DAILY_LOSS_USDT / DAILY_PROFIT_TARGET_USDT variables and
 # their entry gates are PRESERVED exactly as they are. This toggle decides
 # whether those two gates still halt new entries for the remainder of a UTC
-# day. Default True = never shut the bot down on a daily profit/loss figure;
-# set CONTINUOUS_24_7_TRADING=false to restore the previous daily-halt
-# behavior with no code change.
+# day. The default now preserves the profit lock. Daily loss is always a
+# hard admission limit, even when continuous operation is explicitly enabled.
 CONTINUOUS_24_7_TRADING = (
-    _env_bool("CONTINUOUS_24_7_TRADING", True)
+    _env_bool("CONTINUOUS_24_7_TRADING", False)
 )
 
 # --- 6. Dynamic post-loss cool-off window -----------------------------------
@@ -2296,3 +2301,15 @@ __all__ = __all__ + [
     "DCA_RESCUE_BREAKEVEN_ENABLED",
     "DCA_RESCUE_BREAKEVEN_MIN_NET_USD",
 ]
+
+# Account-wide admission policy. These are stress reserves, not an exact
+# exchange liquidation formula. Keep exchange-native stops enabled.
+EXPOSURE_GUARD_ENABLED = _env_bool("EXPOSURE_GUARD_ENABLED", True)
+EXPOSURE_HEADROOM_PCT = max(0.0, _env_float("EXPOSURE_HEADROOM_PCT", 0.03))
+EXPOSURE_MAINTENANCE_FLOOR_PCT = max(0.001, _env_float("EXPOSURE_MAINTENANCE_FLOOR_PCT", 0.01))
+EXPOSURE_COST_RESERVE_PCT = max(0.0, _env_float("EXPOSURE_COST_RESERVE_PCT", 0.002))
+EXPOSURE_RECHECK_SEC = max(1.0, _env_float("EXPOSURE_RECHECK_SEC", 10.0))
+PAPER_START_BALANCE_USDT = max(0.0, _env_float("PAPER_START_BALANCE_USDT", 15.0))
+__all__ += ["EXPOSURE_GUARD_ENABLED", "EXPOSURE_HEADROOM_PCT",
+            "EXPOSURE_MAINTENANCE_FLOOR_PCT", "EXPOSURE_COST_RESERVE_PCT",
+            "EXPOSURE_RECHECK_SEC", "PAPER_START_BALANCE_USDT"]

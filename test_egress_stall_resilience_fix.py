@@ -369,7 +369,7 @@ READ_ONLY = ["/fapi/v2/balance", "/fapi/v2/positionRisk", "/fapi/v1/userTrades",
              "/fapi/v1/openAlgoOrders"]
 call_sites = [l for l in src.splitlines()
               if "retry_stale_timestamp=True" in l and not l.lstrip().startswith("#")]
-check("all 7 read-only signed GETs opt into the retry", len(call_sites) == 7,
+check("all 8 read-only signed GETs opt into the retry", len(call_sites) == 8,
       f"found {len(call_sites)}")
 check("retry_stale_timestamp defaults to False (opt-in, not opt-out)",
       "retry_stale_timestamp: bool = False" in src)

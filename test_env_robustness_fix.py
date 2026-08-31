@@ -160,7 +160,7 @@ check("...and cannot themselves abort boot", "except Exception" in src)
 r = subprocess.run([sys.executable, "-u", "main.py"],
                    capture_output=True, text=True, timeout=60,
                    env={**os.environ, "BINANCE_API_KEY": "", "BINANCE_API_SECRET": "",
-                        "SYMBOL": "SOLUSDT", "ACTIVE_SYMBOLS": "SOLUSDT"})
+                        "DRY_RUN": "false", "SYMBOL": "SOLUSDT", "ACTIVE_SYMBOLS": "SOLUSDT"})
 check("beacons appear on stdout", "[boot" in r.stdout)
 check("...and independently on stderr", "[boot" in r.stderr)
 check("a missing-key exit still reports itself rather than hanging silently",

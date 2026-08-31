@@ -469,6 +469,15 @@ class RestClient:
             "GET", "/fapi/v2/balance", signed=True, retry_stale_timestamp=True
         )
 
+    async def get_account(self) -> dict:
+        """Read-only snapshot for account-wide exposure admission.
+
+        https://developers.binance.com/docs/derivatives/usds-margined-futures/account/rest-api/Account-Information-V2
+        """
+        return await self._request(
+            "GET", "/fapi/v2/account", signed=True, retry_stale_timestamp=True
+        )
+
     async def set_leverage(self, symbol: str, leverage: int) -> dict:
         return await self._request(
             "POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage}, signed=True

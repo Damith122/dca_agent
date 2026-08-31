@@ -1,0 +1,32 @@
+name: Offline risk validation
+on:
+  pull_request:
+  push:
+    branches: [codex/risk-admission-paper-validation]
+permissions:
+  contents: read
+jobs:
+  offline-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      BINANCE_API_KEY: ""
+      BINANCE_API_SECRET: ""
+      GITHUB_TOKEN: ""
+      DRY_RUN: "true"
+      LIVE_TRADING_CONFIRMATION: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Admission policy and mocked execution
+        run: |
+          python -m unittest -v test_exposure_guard.py test_admission_integration.py test_paper_launcher.py
+          python -m compileall -q config.py dca2.py exchange.py trading.py exposure_guard.py audit_trade_evidence.py
+      - name: Simulated fill and accounting regressions
+        env:
+          EXPOSURE_GUARD_ENABLED: "false"
+        run: python test_dry_fills.py
