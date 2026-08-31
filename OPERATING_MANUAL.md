@@ -991,7 +991,7 @@ slots.
 
 ### How to revert
 
-Set these seven Railway variables and redeploy (`DCA_TRIGGER_PCT` never
+Set these eight Railway variables and redeploy (`DCA_TRIGGER_PCT` never
 moved):
 
 ```
@@ -1002,10 +1002,63 @@ TAKE_PROFIT_PCT          = 0.0035
 TAKE_PROFIT_MAX_PCT      = 0.010
 MAX_DAILY_LOSS_USDT      = 1.50
 DAILY_PROFIT_TARGET_USDT = 1.00
+SL_ATR_MULT              = 1.2
 ```
 
 Every notional-scaled threshold follows automatically. Do **not** re-pin them
 by hand — that is the mistake corrected at the top of §13.
+
+### Amendment (2026-08-31, after the first two live trades): `SL_ATR_MULT` 1.2 → 2.5
+
+The first two entries under this configuration were both stopped out by
+ordinary tick noise — SUI in **5 seconds** (−$0.1458) and SOL in **63
+seconds** (−$0.1382), both `rr_stop_loss`. Protective stops placed correctly
+on both; the execution path was not at fault.
+
+**The cause was a clamp changing hands, not a stop changing value.**
+`SL_MIN_USD` carries an *absolute* floor of $0.05. At the previous $10
+notional that floor was what actually set the stop, forcing it out to
+**2.55 ATR**. At $60 notional the floor stops binding and the stop falls back
+to its designed `SL_ATR_MULT × ATR` = **1.20 ATR**. A 6× size increase
+silently halved the stop distance in volatility terms, and nobody chose that
+— it is not visible anywhere in the configuration diff.
+
+`SL_ATR_MULT` is therefore raised to **2.5**, restoring the width the account
+was really trading at and matching `TP_ATR_MULT` so both legs sit at 2.5 ATR:
+
+| | Stop | Take-profit |
+|---|---|---|
+| Before (1.2) | $0.1388 — 1.20 ATR | 49 bps — 2.50 ATR |
+| After (2.5) | $0.2891 — 2.50 ATR | 49 bps — 2.50 ATR |
+
+*(SOL trade: notional $59.06, atr 0.196%. The model reproduces the actual
+−$0.1382 loss to within $0.0006.)*
+
+**This does not create edge.** Under random-walk pricing the 1.2 ATR and
+2.5 ATR geometries are within ~1.3 bps of each other and both are negative —
+you cannot escape a zero edge by rearranging reward:risk. What it buys is
+**holding time**: trades that resolve in minutes rather than seconds. That
+cuts trade frequency, and frequency is what multiplies a negative expectancy
+into a burn rate.
+
+**Ordering with the exchange-side stop is preserved, and was checked.** The
+client-side rr-stop is not the resting `STOP_MARKET` on Binance —
+`_compute_protective_stop_price()` derives that one from
+`MAX_TRADE_NET_LOSS_USDT − MAX_TRADE_EXIT_BUFFER_USDT` (−$0.60 fee-net),
+independently of this multiplier. (Verified against the live SOL fill: the
+formula reproduces the logged 102.63 trigger exactly.) At current volatility
+the client stop ($0.289) still fires well ahead of the backstop ($0.60).
+Above ~0.40% ATR the backstop would trigger first — still protective, simply
+a tighter close than intended — and `MAX_STOP_LOSS_USD` ($0.675) caps both.
+
+**Cost:** the per-trade loss ceiling roughly doubles, so `MAX_DAILY_LOSS_USDT`
+($2.50) now binds after about **9** stopped-out trades instead of about 18.
+Expect the daily circuit breaker to fire on most losing days. That is the
+protection working, and it is the clearest early signal that the loss rate is
+running ahead of the 36–61 day ruin median.
+
+**Railway:** `SL_ATR_MULT = 2.5`. To revert, set it to `1.2` (or clear it —
+`config.py` now carries 2.5 as its default).
 
 ### Test suite result for this change
 
