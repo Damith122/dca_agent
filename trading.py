@@ -6874,11 +6874,70 @@ class MartingaleManager:
                     child, context="ALGO_UPDATE FINISHED (verified)",
                 )
                 return
-            # No child id anywhere -> it did not trigger, so FINISHED means
-            # canceled. Treat exactly like CANCELED.
+            # No child id anywhere. This used to be treated as proof the algo
+            # never triggered - "FINISHED with no actualOrderId means
+            # canceled". That assumption is wrong, and it cost a real trade.
+            #
+            # Observed live 2026-08-31 12:42:56 UTC on SUIUSDT: the stop
+            # triggered and its child MARKET order filled 9.9997 USDT at
+            # 0.7194 - the EXACT trigger price - realizing -0.00902 with
+            # 0.00500 commission. Both the ALGO_UPDATE and the REST re-query
+            # reported FINISHED with an empty actualOrderId. Taking the
+            # "canceled" branch meant the close was never booked: missing
+            # from trades_log and session_total, no Brain label for a real
+            # loss, and the bot's reported total drifted +0.0190 USDT
+            # optimistic against the exchange. No risk was created - the
+            # position really was closed and reconciliation reached FLAT -
+            # but the accounting silently diverged from Binance.
+            #
+            # An absent actualOrderId is therefore UNKNOWN, not "canceled".
+            # Resolve it against the one source that cannot be ambiguous:
+            # whether the position still exists on the exchange.
+            exchange_state = await self._fetch_exchange_position()
+            if exchange_state is None:
+                # Could not ask. Never guess in either direction: leave the
+                # tracking in place (clearing it would assert the algo is
+                # gone) and stay PROTECTION_PENDING so the sweep retries.
+                print(color(
+                    f"{now_str()} [protective-stop] algo FINISHED with no actualOrderId AND the "
+                    f"position could not be fetched - outcome UNKNOWN. Not finalizing and not "
+                    f"clearing tracking; the protective sweep and the periodic resync will "
+                    f"resolve it.", RED,
+                ))
+                if matches_tracked and p.status in ("OPEN", "DCA_PENDING") and p.total_qty > 0:
+                    self._mark_protection_pending(
+                        "protective algo stop FINISHED with an unverifiable outcome"
+                    )
+                return
+
+            exchange_side, remaining_qty = exchange_state
+            still_open = (
+                exchange_side is not None
+                and round_step(remaining_qty, self.filters.step_size) > 0
+                and exchange_side == p.side
+            )
+            believed_open = p.status in ("OPEN", "DCA_PENDING", "CLOSING") and p.total_qty > 0
+
+            if believed_open and not still_open:
+                # The position is gone from the exchange while we believed it
+                # open, and the only thing that could have closed it is this
+                # algo. It DID trigger; Binance just never told us the child
+                # id. Recover the fill from the user-trade history so the
+                # trade is booked exactly like any other close.
+                print(color(
+                    f"{now_str()} [protective-stop] algo FINISHED with no actualOrderId, but the "
+                    f"exchange position is GONE - the stop DID trigger. Recovering the fill from "
+                    f"user trades so it is booked (this is the case that used to be silently "
+                    f"dropped).", CYAN,
+                ))
+                await self._finalize_untracked_algo_close(context="ALGO_UPDATE FINISHED")
+                return
+
+            # Position still open -> the algo genuinely was canceled.
             print(color(
-                f"{now_str()} [protective-stop] algo FINISHED with no actualOrderId - this is a "
-                f"CANCELED outcome, not a fill; not finalizing any trade.", YELLOW,
+                f"{now_str()} [protective-stop] algo FINISHED with no actualOrderId and the "
+                f"position is still open on the exchange - a genuine CANCEL, not a fill; "
+                f"re-arming.", YELLOW,
             ))
             if matches_tracked:
                 self._clear_protective_stop_tracking()
@@ -6887,6 +6946,103 @@ class MartingaleManager:
                         "protective algo stop FINISHED/canceled without triggering - re-arming"
                     )
             return
+
+    async def _finalize_untracked_algo_close(self, context: str) -> None:
+        """Books a protective-stop close whose child order id Binance never
+        reported, by reading the fills back from the user-trade history.
+
+        Only ever called once the exchange has CONFIRMED the position is
+        gone, so the question is not "did it close" but "at what price, for
+        what realized PnL and what commission". Mirrors the fee/PnL
+        accounting in _try_recover_close_fill()'s FILLED path exactly, so a
+        trade recovered here is indistinguishable from one booked by the
+        websocket, and routes through the same _on_close_filled().
+
+        Dedup: the algo id is used as the close-order key, so a late
+        ALGO_UPDATE or REST retry carrying the same algo cannot finalize a
+        second time. _register_protective_child_order() is separately
+        guarded by position status, so a child id arriving after this has
+        reset the position to FLAT is ignored rather than replayed.
+        """
+        p = self.position
+        algo_key = p.protective_stop_algo_id
+        if self._close_order_already_finalized(algo_key):
+            print(color(
+                f"{now_str()} [protective-stop] algo {algo_key} was already finalized - "
+                f"ignoring this duplicate recovery ({context}).", YELLOW,
+            ))
+            return
+        try:
+            fills = await self.client.get_user_trades(self.symbol, limit=100)
+        except (BinanceApiError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+            print(color(
+                f"{now_str()} [protective-stop] *** the stop filled but userTrades lookup FAILED "
+                f"({e}) - cannot book this close yet. Leaving state for the periodic "
+                f"reconciliation, which fetches the same history; PnL will be recovered there.",
+                RED,
+            ))
+            return
+
+        # Only fills this process has not already accounted for, on the side
+        # that reduces the position we were holding.
+        closing_side = "SELL" if p.side == "LONG" else "BUY"
+        new_fills = []
+        for t in fills or []:
+            try:
+                tid = int(t.get("id"))
+            except (TypeError, ValueError):
+                continue
+            if tid <= self._last_live_trade_id:
+                continue
+            is_buyer = bool(t.get("buyer"))
+            side = "BUY" if is_buyer else "SELL"
+            if side != closing_side:
+                continue
+            new_fills.append((tid, t))
+
+        if not new_fills:
+            print(color(
+                f"{now_str()} [protective-stop] the stop filled but no unaccounted {closing_side} "
+                f"fill was found in the last 100 user trades - leaving this to the periodic "
+                f"reconciliation rather than booking a trade that cannot be sized ({context}).",
+                RED,
+            ))
+            return
+
+        qty = sum(float(t.get("qty", 0.0) or 0.0) for _, t in new_fills)
+        notional = sum(
+            float(t.get("qty", 0.0) or 0.0) * float(t.get("price", 0.0) or 0.0)
+            for _, t in new_fills
+        )
+        fill_price = safe_div(notional, qty, 0.0)
+        total_rp = sum(float(t.get("realizedPnl", 0.0) or 0.0) for _, t in new_fills)
+        total_fee = 0.0
+        for _, t in new_fills:
+            c = float(t.get("commission", 0.0) or 0.0)
+            if t.get("commissionAsset") in (None, "USDT"):
+                total_fee += c
+            else:
+                self._position_fees_reliable = False
+        if qty <= 0 or fill_price <= 0:
+            print(color(
+                f"{now_str()} [protective-stop] recovered fills had no usable qty/price - not "
+                f"booking a trade that cannot be sized ({context}).", RED,
+            ))
+            return
+
+        self._last_live_trade_id = max(
+            self._last_live_trade_id, max(tid for tid, _ in new_fills)
+        )
+        self._position_fees_accum += total_fee
+        self._exit_commission_accum += total_fee
+        self._pending_exit_reason = "protective_stop"
+        print(color(
+            f"{now_str()} [fill-trace] path=algo_finished_recovery algo_id={algo_key} "
+            f"qty={qty} avg_price={fill_price:.6f} rp={total_rp:+.6f} fee={total_fee:.6f} "
+            f"-> routing to _on_close_filled() ({context})", CYAN,
+        ))
+        self._clear_protective_stop_tracking()
+        await self._on_close_filled(fill_price, total_rp, order_id=algo_key)
 
     def _clear_protective_stop_tracking(self) -> None:
         """Clears every locally-tracked protective-stop identifier. Used only

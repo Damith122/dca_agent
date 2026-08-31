@@ -341,6 +341,7 @@ horizon needs a full hour to close — that is normal, not a stall.
 
 ## 8. Symptom → knob
 
+| `session_total` disagrees with Binance | a protective stop filled but Binance reported FINISHED with no `actualOrderId` | **fixed 2026-08-31** — the outcome is now resolved against the exchange position and the fill recovered from userTrades. Binance is always the authority; if they ever diverge again, trust the exchange |
 | Symptom | Cause to check | Knob |
 |---|---|---|
 | No trades at all | `dead_market_blocked` dominating `[entry-debug]` | `LOW_VOLATILITY_ATR_PCT_THRESHOLD` (0.0008) |

@@ -110,7 +110,7 @@ class RecordingClient:
     async def get_user_trades(self, symbol, limit=100, order_id=None, from_id=None,
                               start_time_ms=None):
         self.calls.append(("GET", "/fapi/v1/userTrades", {"symbol": symbol}))
-        return []
+        return getattr(self, "user_trades", [])
 
     # --- algo endpoints (conditional / protective stop) -------------------
     async def place_algo_order(self, **kw):
@@ -371,7 +371,10 @@ async def test_07_algo_status_handling():
 # 8: FINISHED must not finalize without proof
 # ============================================================================
 async def test_08_finished_does_not_finalize_without_proof():
-    # FINISHED with no actualOrderId anywhere == canceled, NOT a fill.
+    # FINISHED with no actualOrderId, POSITION STILL OPEN on the exchange
+    # == a genuine cancel, NOT a fill. (An absent actualOrderId on its own is
+    # NOT proof of a cancel - see the second case below, which is the live
+    # 2026-08-31 incident.)
     m, client = await make_manager()
     await m._place_or_replace_protective_stop(reason="INITIAL filled")
     aid, cid = m.position.protective_stop_algo_id, m.position.protective_stop_client_algo_id
@@ -381,12 +384,41 @@ async def test_08_finished_does_not_finalize_without_proof():
         await m.handle_algo_update(algo_event(aid, "FINISHED", cid))
     assert m.trade_count == trades_before, "FINISHED alone must never finalize a trade"
     assert m.position.status == "OPEN", "position must not be closed on an ambiguous FINISHED"
-    assert "CANCELED outcome, not a fill" in cap.text, cap.text
+    assert "genuine CANCEL, not a fill" in cap.text, cap.text
+    assert "still open on the exchange" in cap.text, (
+        "the cancel verdict must be justified by the exchange position, not assumed"
+    )
     assert ("GET", "/fapi/v1/algoOrder") in [(c[0], c[1]) for c in client.calls], (
         "FINISHED must be verified against the algo record via REST"
     )
     print("FINISHED with no actualOrderId -> verified by REST, treated as CANCELED, no trade "
           "finalized")
+
+    # FINISHED with no actualOrderId but the POSITION IS GONE -> the stop did
+    # trigger and Binance simply never reported the child id. This is the
+    # 2026-08-31 SUIUSDT incident: treating it as a cancel dropped a real
+    # closed trade from trades_log/session_total and denied the Brain a
+    # label, leaving the reported total +0.0190 USDT optimistic.
+    m, client = await make_manager()
+    await m._place_or_replace_protective_stop(reason="INITIAL filled")
+    aid, cid = m.position.protective_stop_algo_id, m.position.protective_stop_client_algo_id
+    client.algo_query_result = {"algoId": aid, "algoStatus": "FINISHED", "actualOrderId": ""}
+    client.report_flat = True                      # exchange says the position is gone
+    closing_side_is_buyer = (m.position.side == "SHORT")
+    client.user_trades = [{
+        "id": 999001, "qty": str(m.position.total_qty),
+        "price": str(m.position.protective_stop_price or m.position.avg_entry_price),
+        "realizedPnl": "-0.00902", "commission": "0.00499983",
+        "commissionAsset": "USDT", "buyer": closing_side_is_buyer,
+    }]
+    trades_before = m.trade_count
+    await m.handle_algo_update(algo_event(aid, "FINISHED", cid))
+    assert m.trade_count == trades_before + 1, (
+        "a triggered stop whose child id was never reported MUST still be booked"
+    )
+    assert m.position.status == "FLAT", "the position must be finalized, not left open"
+    print("FINISHED with no actualOrderId + exchange FLAT -> fill recovered from userTrades "
+          "and booked (2026-08-31 regression)")
 
     # FINISHED that really did trigger -> child registered, then its fill closes.
     m, client = await make_manager()
