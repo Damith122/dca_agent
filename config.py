@@ -849,7 +849,43 @@ PROFIT_LOCK_SLIPPAGE_ATR_MULT = _env_float("PROFIT_LOCK_SLIPPAGE_ATR_MULT", 0.25
 #   The pre-existing dollar/percent values are retained as CAPS, per the agreed
 #   design - see the deployment notes about the cap binding at high ATR.
 ATR_RISK_SCALING_ENABLED = _env_bool("ATR_RISK_SCALING_ENABLED", True)
-SL_ATR_MULT = _env_float("SL_ATR_MULT", 1.2)
+# 2026-08-31: raised 1.2 -> 2.5 after the first two live trades under the
+# aggressive sizing config (see manual 15) were both stopped out by ordinary
+# tick noise in 5s and 63s respectively, for -$0.1458 and -$0.1382.
+#
+# This is the failure documented three lines above, recurring for a NEW
+# reason. The stop did not change - the notional did, and that moved which
+# clamp was binding. SL_MIN_USD carries an ABSOLUTE floor of $0.05, and at
+# the previous $10 notional that floor was what actually set the stop,
+# forcing it out to 2.55 ATR. At $60 notional the floor stops binding and the
+# stop falls back to SL_ATR_MULT x ATR = 1.2 ATR - less than half as wide in
+# volatility terms, without anyone choosing that. A 6x size change silently
+# halved the stop distance.
+#
+# Setting SL_ATR_MULT to 2.5 restores the effective width the account was
+# actually trading at ($0.289 vs $0.1388 at atr 0.196%, notional $59), and
+# matches TP_ATR_MULT so both legs move together at 2.5 ATR - which is what
+# "keeps the risk:reward ratio stable across regimes" above was always meant
+# to deliver. It does NOT create edge: under random-walk pricing the 1.2 ATR
+# and 2.5 ATR geometries are within ~1.3 bps of each other, both negative.
+# What it buys is holding time - trades that resolve in minutes rather than
+# seconds - which cuts trade frequency, and frequency is what multiplies a
+# negative expectancy into a burn rate.
+#
+# ORDERING WITH THE EXCHANGE-SIDE STOP is preserved and was checked. The
+# client-side rr-stop here is not the same thing as the protective
+# STOP_MARKET resting on Binance: _compute_protective_stop_price() derives
+# that one from MAX_TRADE_NET_LOSS_USDT - MAX_TRADE_EXIT_BUFFER_USDT
+# (-$0.60 fee-net), independently of this multiplier. At the current ATR the
+# client stop ($0.289) still fires well ahead of the exchange backstop
+# ($0.60), which is the intended ordering. Above roughly 0.40% ATR the client
+# stop would exceed the backstop and the exchange would trigger first - still
+# protective, simply a tighter close than intended, and it is capped by
+# MAX_STOP_LOSS_USD ($0.675) either way.
+#
+# COST: the per-trade loss ceiling roughly doubles, so MAX_DAILY_LOSS_USDT
+# ($2.50) now binds after about 9 stopped-out trades instead of about 18.
+SL_ATR_MULT = _env_float("SL_ATR_MULT", 2.5)
 # FLOOR on the ATR-scaled stop. Caught by test_new_features.py during
 # implementation: with the dollar value used purely as a CAP, a dead tape
 # (atr 0.02%) produced 1.2 x 0.0002 x $80 = a $0.02 stop - smaller than the
