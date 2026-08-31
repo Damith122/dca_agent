@@ -1,1 +1,1 @@
-worker: python -u main.py
+worker: python -u paper_validation.py --minutes 60
