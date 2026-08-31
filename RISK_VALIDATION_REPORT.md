@@ -77,7 +77,8 @@ the documented V2 position schema does not include V3's notional field.
 
 ## Configuration changes
 
-No Railway values were written. This table describes the supplied **paper
+No variables were changed on the original `dca_agent` Railway service.
+This table describes the supplied **paper
 candidate**, not a live recommendation or an optimized strategy.
 
 | Variable | Last observed run / old default | Paper candidate |
@@ -153,3 +154,24 @@ chronological holdout periods; never choose thresholds on the evaluation data.
 Require positive results after costs with uncertainty/drawdown estimates, not
 one profitable day. A 60-minute paper run validates plumbing only. There is no
 minimum trade-count shortcut that can guarantee a profitable next month.
+
+## Hosted validation status
+
+[GitHub CI run 33436469987](https://github.com/Damith122/dca_agent/actions/runs/33436469987)
+passed on commit `1969d12c581880ab3fc697ea74e7c740afe8a37e` using actual
+dependencies, including the 24 new tests and 97 dry-fill checks. This resolves
+the local dependency limitation for those checks, not the wider legacy suite.
+
+A separate Railway service `dca-agent-paper-validation` was created from
+`codex/paper-validation-run`; the original stopped `dca_agent` service was not
+changed. Its configured command is `python paper_validation.py --minutes 60`
+and restart policy is `NEVER`. Only this paper service received these variables:
+`DRY_RUN=true`, `USE_TESTNET=false`, `LIVE_TRADING_CONFIRMATION=false`,
+`I_UNDERSTAND_THIS_IS_REAL_MONEY=no`, and empty `BINANCE_API_KEY`,
+`BINANCE_API_SECRET`, `GITHUB_TOKEN`. Its launcher also clears inherited
+settings and loads the documented paper profile.
+
+The create-service API initially reported an unexpected `main` commit in build
+metadata despite its configured source being the paper branch. No credentials
+were supplied. Runtime/commit verification is required before this can be
+counted as a completed paper test.
