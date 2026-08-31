@@ -2,7 +2,7 @@ name: Offline risk validation
 on:
   pull_request:
   push:
-    branches: [codex/risk-admission-paper-validation]
+    branches: [main, codex/risk-admission-paper-validation]
 permissions:
   contents: read
 jobs:
