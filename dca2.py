@@ -476,6 +476,7 @@ from trading import (
 from websocket import market_data_consumer, userdata_consumer, listen_key_keepalive
 import websocket as _websocket_module
 _websocket_module.initialize_sync = initialize_sync
+from paper_summary import print_paper_summary
 
 
 # ============================================================================
@@ -1346,6 +1347,16 @@ async def main() -> None:
             ])
         await asyncio.gather(*tasks)
     finally:
+        # A timer-driven paper run may end with a simulated position still
+        # open. Emit its fee-net mark-to-market BEFORE any optional shutdown
+        # I/O so the experiment always has an economic result even if later
+        # persistence/cleanup is interrupted. Never force-close at the
+        # arbitrary cutoff: that would train the Brain on a synthetic label.
+        if DRY_RUN:
+            try:
+                print_paper_summary(portfolio, managers, PAPER_START_BALANCE_USDT)
+            except Exception as e:  # noqa: BLE001 - diagnostics must not block shutdown
+                print(color(f"[paper-summary] failed: {_exc_text(e)}", YELLOW))
         # 2026-08-24: flush recorded rows before shutdown so an in-flight
         # shard is not lost when the container is reclaimed.
         for m in managers.values():
