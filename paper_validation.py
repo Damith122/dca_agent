@@ -42,7 +42,7 @@ def paper_environment(environ):
     result.update(DRY_RUN="true", USE_TESTNET="false", LIVE_TRADING_CONFIRMATION="false",
                   I_UNDERSTAND_THIS_IS_REAL_MONEY="no", BINANCE_API_KEY="", BINANCE_API_SECRET="",
                   GITHUB_TOKEN=github_token, GITHUB_REPO=github_repo,
-                  GITHUB_BRANCH="paper-research")
+                  GITHUB_BRANCH="brain-state")
     return result
 
 
