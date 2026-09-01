@@ -1,7 +1,9 @@
-"""Run a bounded, keyless paper experiment: python paper_validation.py --minutes 60.
+"""Run a bounded, exchange-keyless paper experiment.
 
 This entry point cannot enable live execution, even if inherited Railway
 variables request it. Each process gets fresh paper state and starting cash.
+GitHub credentials may be retained only to archive namespaced paper evidence
+on a branch that Railway does not deploy from.
 """
 import argparse
 import ast
@@ -13,6 +15,12 @@ from pathlib import Path
 def paper_environment(environ):
     root = Path(__file__).resolve().parent
     result = dict(environ)
+    # Keep the repository writer available for paper evidence only. Binance
+    # credentials remain unconditionally blank below, so this cannot turn a
+    # paper run into a live exchange process. A dedicated branch prevents the
+    # runtime commits from triggering Railway's main-branch auto-deploy.
+    github_token = str(environ.get("GITHUB_TOKEN", "") or "")
+    github_repo = str(environ.get("GITHUB_REPO", "") or "")
     # Do not inherit hidden live overrides. Read names without importing
     # config (which freezes configuration and state paths at import time).
     tree = ast.parse((root / "config.py").read_text())
@@ -33,7 +41,8 @@ def paper_environment(environ):
     # Hard boundary, independent of profile edits.
     result.update(DRY_RUN="true", USE_TESTNET="false", LIVE_TRADING_CONFIRMATION="false",
                   I_UNDERSTAND_THIS_IS_REAL_MONEY="no", BINANCE_API_KEY="", BINANCE_API_SECRET="",
-                  GITHUB_TOKEN="", GITHUB_REPO="")
+                  GITHUB_TOKEN=github_token, GITHUB_REPO=github_repo,
+                  GITHUB_BRANCH="paper-research")
     return result
 
 
