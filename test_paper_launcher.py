@@ -21,7 +21,7 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(result["BINANCE_API_SECRET"], "")
         self.assertEqual(result["GITHUB_TOKEN"], "ARCHIVE_TOKEN")
         self.assertEqual(result["GITHUB_REPO"], "owner/repo")
-        self.assertEqual(result["GITHUB_BRANCH"], "paper-research")
+        self.assertEqual(result["GITHUB_BRANCH"], "brain-state")
         self.assertNotIn("BRAIN_LOCAL_PATH", result)
         self.assertNotIn("TRADE_LOG_JSON_PATH", result)
         self.assertNotIn("BREAKOUT_ENGINE_ENABLED", result)
@@ -33,7 +33,7 @@ class LauncherTests(unittest.TestCase):
         result = paper_environment({"PATH": "/usr/bin"})
         self.assertEqual(result["GITHUB_TOKEN"], "")
         self.assertEqual(result["GITHUB_REPO"], "")
-        self.assertEqual(result["GITHUB_BRANCH"], "paper-research")
+        self.assertEqual(result["GITHUB_BRANCH"], "brain-state")
         self.assertEqual(result["BINANCE_API_KEY"], "")
         self.assertEqual(result["BINANCE_API_SECRET"], "")
 
