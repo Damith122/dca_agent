@@ -25,7 +25,7 @@ jobs:
       - name: Admission policy and mocked execution
         run: |
           python -m unittest -v test_exposure_guard.py test_admission_integration.py test_paper_launcher.py
-          python -m compileall -q config.py dca2.py exchange.py trading.py exposure_guard.py audit_trade_evidence.py
+          python -m compileall -q config.py dca2.py exchange.py trading.py exposure_guard.py audit_trade_evidence.py paper_summary.py
       - name: Simulated fill and accounting regressions
         env:
           EXPOSURE_GUARD_ENABLED: "false"
