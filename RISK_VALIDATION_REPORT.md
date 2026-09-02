@@ -439,3 +439,26 @@ $0.05. Final paper admission additionally requires positive net PnL, PF >=
 at least $0.05 and estimated monthly PnL at least $0.15. Failure means no paper
 runner and no live deployment. The validator removes Binance credentials and
 imports no order client.
+
+### 4H breakout result
+
+Deployment `825fbc21-55a8-42ab-8f0c-2f9df15ffdf5` ran commit
+`e33ec2497eb64df011e86f5eecdfe532d333038d` and emitted the structured
+`[htf-breakout-summary]`. All six rules were rejected on training, so the
+sealed final 25% was not opened and no paper runner was built.
+
+The strongest combined training result was `BRK40_EXIT20`: 89 closed
+simulated trades over 782.5 days, 47 wins / 42 losses, fee/funding-net
+`+$4.3637`, PF `1.3946`, average win `+$0.3281`, average loss
+`-$0.2633`, and estimated monthly PnL `+$0.1698`. It still failed because
+max drawdown was `26.44%` and only one of three chronological folds was
+positive: `-$2.2694`, `-$0.7523`, `+$5.0723`. Its uncorrected sign-flip
+p-value was `0.3111`, far above the six-rule Bonferroni threshold
+`0.00833`. The nearby volume-filtered rule showed the same regime
+concentration; shorter and longer breakouts also failed their gates.
+
+This is useful negative evidence: the apparent full-training profit came from
+one recent segment and did not demonstrate a stable 4H edge. Railway exited
+cleanly, the engine's timing/safety regression tests passed, credentials were
+removed, and live orders sent were zero. Software validation does not turn a
+rejected trading hypothesis into a profitable one.
