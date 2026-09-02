@@ -324,3 +324,21 @@ opened and no intraday runner was deployed. The evidence shows that producing
 5–10 signals per day is easy, but those signals do not forecast the required
 move. Increasing leverage or forcing entries would scale a negative edge.
 The Railway service must remain non-live; this research sent zero orders.
+
+
+## Frozen higher-timeframe validation specification — 2026-09-02 UTC
+
+The user approved a new research-only 1H-entry, 4H-trend and 1D-regime
+candidate. Its rules were frozen before reading the historical result:
+completed-candle signals only, next-hour-open fills, one active position,
+DCA=0, $10 notional, 5x margin cap, 1.5 ATR stop, 3 ATR target, 48-hour
+maximum hold, 7 bps per side and exact historical funding. The validator
+removes Binance credentials from its process and imports no exchange order
+client.
+
+Admission requires a positive untouched final 40%, profit factor at least
+1.15, at least 30 holdout trades, positive expectancy, average winner at
+least $0.05, chronological and neighbouring-rule robustness, positive
+10-bps-per-side stress, drawdown below 20%, and at least $0.15 estimated
+monthly PnL on the $15 replay. No paper or live runner is permitted unless
+every gate passes.
