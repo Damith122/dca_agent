@@ -1,1 +1,1 @@
-worker: python -u paper_validation.py --minutes 1440
+worker: python -u backtest_funding.py --symbols BTCUSDT,ETHUSDT,SOLUSDT,SUIUSDT --months 12
