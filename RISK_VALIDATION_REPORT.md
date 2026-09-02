@@ -220,3 +220,43 @@ is being prepared. This document does not claim a completed forward test.
 Current deployment IDs, runtime verification and remaining blockers are
 recorded in the PR description to avoid restarting experiments for log-only
 documentation edits. A 60-minute test is a plumbing check, not proof of profit.
+
+
+## Fee-net validation update — 2026-09-02 UTC
+
+The completed 24-hour keyless paper run produced 17 closed trades (9 wins,
+8 losses). Simulated equity fell from $15.00 to $14.77640552: net
+`-$0.22359448` (`-1.49%`). The average win was about `+$0.0190`; the
+average loss was about `-$0.0494`, so one loss erased about 2.6 wins. Gross
+price PnL was also negative (about `-$0.058`); approximately `$0.1657` of
+simulated fees made it worse but did not create the loss. SOL contributed
+about `-$0.1288` and SUI about `-$0.0948`. No position remained open and
+no real order was sent.
+
+Offline replay could not find a fixed stop, take-profit, maximum hold,
+profit-lock, score threshold, EMA-structure gate or four-hour direction gate
+that was fee-net positive in both the first and second chronological halves.
+This rules out treating an exit-parameter change as evidence of an edge.
+
+A fresh 12-month Binance public-funding walk-forward (1,096 settled funding
+prints per symbol) also invalidated the previously attractive carry estimate.
+At VIP0-style 30 bps full-cycle cost, annualised return on capital was:
+BTC `+0.17%`, ETH `-0.04%`, SOL `-1.31%`, SUI `-0.57%`; the four-symbol
+mean was `-0.4%` and only 1/4 symbols was profitable. Deployment
+`34e45438-bde1-453c-81ba-8ed3dae2fb9c` completed this keyless calculation.
+
+Even an optimistic 19 bps cycle (7.5 bps per spot side, assuming the BNB fee
+discount, plus 2 bps per perpetual side, assuming maker fills) produced only:
+BTC `+0.83%`, ETH `+0.48%`, SOL `-0.65%`, SUI `+0.16%`; mean
+`+0.2%` annualised. Deployment
+`47e78ddc-172c-4ef3-9cdb-246f11fed4de` completed that keyless calculation.
+Those discounts/fills are assumptions, not verified account entitlements,
+and the repository does not contain a production-safe two-leg spot/perpetual
+executor. At $15, a 0.2% annual return is roughly $0.03 per year; it cannot
+support a $0.30 daily target.
+
+The directional bot is therefore not live-ready and must not be enabled by
+raising leverage or position size. `main` is intentionally left on the
+one-shot funding validation command, Railway restart policy is `NEVER`, and
+the last deployment exited successfully. Railway `SUCCESS` here means the
+validation process ended; it does not mean a profitable or running bot.
