@@ -388,3 +388,31 @@ estimated monthly PnL, a positive IC t-stat of at least 2.0 with shuffled-rank
 p-value at most 0.05, effective breadth at least 2, and absolute market beta
 at most 0.20. The keyless validator cannot send orders. No pair paper/live
 runner is permitted unless every gate passes.
+
+
+## Relative-strength pair result — 2026-09-02 UTC
+
+Deployment `f061614a-deb5-48c6-89f8-9ca515a7cad3` completed the frozen
+36-month keyless validation on commit `af31e553`. Each of SOL, SUI, BNB,
+XRP, TRX and DOGE supplied 1,096 completed daily bars and 3,287 funding
+prints. The process imported no order client and sent zero orders.
+
+The untouched final 40% closed 16 pair trades (6 wins, 10 losses). The $15
+wallet ended at `$13.5509`: fee/funding-net PnL `-$1.4491`, profit factor
+`0.61`, drawdown `15.63%`, and estimated monthly PnL `-$0.1053`.
+Average winner and loser were approximately `+$0.3728` and `-$0.3686`.
+Exit counts were eight pair stops, two targets, five rank rotations and one
+maximum hold. Exact funding contributed `+$0.1508`; fees were `$0.2303`,
+so costs did not create the negative edge.
+
+The forecast itself failed independently of PnL: 59 untouched weekly
+cross-sections had mean Spearman IC `-0.0073`, IC t-stat `-0.12`, and
+shuffled-rank p-value `0.624`. Effective breadth was only `1.77` across
+the six correlated assets, below the precommitted minimum of 2. Market beta
+was acceptably small at `-0.045`, but neutrality cannot rescue a ranking
+with no predictive information.
+
+Only one of four chronological periods was positive. Every neighbouring rule
+and the 10-bps-per-side stress were negative. The candidate is rejected; no
+relative-strength paper/live runner was deployed. Structured evidence is on
+`brain-state` at `brain/XS_PAIR_20260902_validation_summary.json`.
