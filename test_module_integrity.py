@@ -25,7 +25,9 @@ MODULES = [
     "edge_requirements.py", "analyze_feature_log.py", "retention.py",
     "optimise_cross_sectional.py", "fetch_funding_universe.py",
     "backtest_xs_funding.py", "ml_features.py", "diagnose_live.py",
-    "exchange.py", "dry_fills.py",
+    "exchange.py", "dry_fills.py", "tsmom.py", "backtest_tsmom.py",
+    "paper_tsmom.py", "intraday.py", "backtest_intraday.py",
+    "backtest_intraday_family.py",
 ]
 
 passed = failed = 0

@@ -255,8 +255,72 @@ and the repository does not contain a production-safe two-leg spot/perpetual
 executor. At $15, a 0.2% annual return is roughly $0.03 per year; it cannot
 support a $0.30 daily target.
 
-The directional bot is therefore not live-ready and must not be enabled by
-raising leverage or position size. `main` is intentionally left on the
-one-shot funding validation command, Railway restart policy is `NEVER`, and
-the last deployment exited successfully. Railway `SUCCESS` here means the
-validation process ended; it does not mean a profitable or running bot.
+The directional bot was therefore not live-ready and was not enabled by
+raising leverage or position size. At that checkpoint `main` remained on the
+one-shot funding validation command and the last deployment exited
+successfully. Railway `SUCCESS` there meant the validation process ended; it
+did not mean a profitable or running bot.
+
+## Low-minimum TSMOM candidate — 2026-09-02 UTC
+
+A fixed 30-day, volatility-scaled, long/cash time-series momentum rule was
+retested on SOL, SUI, BNB, XRP, TRX and DOGE because all six currently have a
+$5 USD-M minimum notional and can be sized inside a $15 paper wallet. It holds
+at most one position, uses next-day-open fills, includes 7 bps per side plus
+historical funding, risks 2% at its stop, and caps leverage at 1x.
+
+Across 3.33 aligned years the primary rule returned `+17.47%` (`+5.12%`
+CAGR, profit factor `1.53`, max drawdown `13.00%`). The untouched final 40%
+returned `+5.75%` (`+4.43%` CAGR, profit factor `1.49`, max drawdown `3.58%`).
+All three chronological periods were positive; 30-day and 90-day neighbours
+were positive on holdout, while the 60-day neighbour was slightly negative.
+At a stressed 10 bps per side the primary holdout remained `+5.41%`.
+
+A separate $15 replay from 2025-05-01 through the completed 2026-09-01 UTC
+candle applied current market quantity steps and $5 minimum notionals. It
+closed 10 simulated trades (8 wins, 2 losses), used a bounded minimum-order
+floor six times only when stop risk stayed at or below 3%, blocked 24 entries
+that could not fit safely, and produced estimated fee/funding-net equity of
+`$16.5670` (`+10.45%` over 16 months, about `7.7%` annualised). No live order
+code is imported by the paper runner, and Binance credentials are removed
+from its process.
+
+This candidate clears the repository's historical admission hurdles for a
+paper trial, not for live capital. Its evidence is nowhere near 40–50% per
+month. Trying to force that target by leverage would turn a modest edge into
+ruin risk; the 4-hour breakout pool's quarter-Kelly ceiling was about 1.5%
+risk per trade and 3% risk already produced a simulated 6.5% probability of
+halving the account over 200 trades. The next step is frozen-settings paper
+evidence, not a live switch or a profit promise.
+
+## Intraday 3–4 cent target rejection — 2026-09-02 UTC
+
+The requested economics were frozen before evaluation: $10 notional, 7 bps
+per side (0.050% taker fee plus 2 bps adverse slippage), a 0.25% stop and a
+0.55% target. A target hit nets about `$0.041`; a full stop loses about
+`$0.039`, so the strategy needs approximately a 49% win rate before any
+max-hold exits. It holds one symbol, uses no DCA, respects the existing
+`-$0.30` daily loss gate and never imports exchange order code.
+
+Twelve months of public 15-minute candles and exact funding prints were
+tested for SOL, SUI, BNB, XRP, TRX and DOGE. The fixed 15m breakout with
+completed 1h EMA confirmation produced 22.7 candidates and 5.38 executed
+trades per day on the final 40%, but only a 31.1% win rate. It lost
+`$11.029` from a $15 wallet (profit factor `0.47`, drawdown `74%`) across
+781 trades. All four chronological periods and every neighbouring rule were
+negative; 10 bps-per-side cost stress was worse.
+
+The first 80% was then used for eight precommitted, fundamentally different
+hypotheses: trend pullbacks, momentum impulses, range reversion, and long-only
+versions. The final 20% was sealed unless a rule first cleared train-only
+hurdles. None did. The closest frequency match, long-only impulse, generated
+5.9 candidates and 2.64 trades per day but lost `$11.948` (profit factor
+`0.42`); each of its three training periods was negative. Selective pullback
+generated 6.3 candidates per day and lost `$14.005` (profit factor `0.36`).
+Range reversion traded less and remained gross- and fee-net negative.
+
+Because no hypothesis qualified on training data, the final 20% was never
+opened and no intraday runner was deployed. The evidence shows that producing
+5–10 signals per day is easy, but those signals do not forecast the required
+move. Increasing leverage or forcing entries would scale a negative edge.
+The Railway service must remain non-live; this research sent zero orders.

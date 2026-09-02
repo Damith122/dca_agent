@@ -150,6 +150,53 @@ class TSMOMTests(unittest.TestCase):
                   p=p, trade_start=20, trade_end=24)
         self.assertTrue(any(t.reason == "trail" for t in sim.trades))
 
+    def test_paper_snapshot_keeps_open_position_and_estimates_exit_fee(self):
+        closes = [100 + i * .4 for i in range(60)]
+        p = TSMOMParams(lookback=5, vol_lookback=5, atr_period=3,
+                        signal_threshold=0.0, rebalance_bars=1,
+                        risk_pct=1.0, annual_vol_target=10.0,
+                        max_leverage=1.0, stop_atr=20.0,
+                        trail_start_atr=100.0, cost_bps_per_side=10.0,
+                        allow_short=False)
+        sim = run({"SOLUSDT": bars(closes)}, p=p, trade_start=20,
+                  liquidate_at_end=False)
+        self.assertIsNotNone(sim.open_position)
+        self.assertFalse(any(t.reason == "end" for t in sim.trades))
+        self.assertGreater(sim.estimated_exit_fee, 0.0)
+
+    def test_exchange_filters_round_down_and_block_undersized_order(self):
+        closes = [100 + i * .4 for i in range(60)]
+        p = TSMOMParams(lookback=5, vol_lookback=5, atr_period=3,
+                        signal_threshold=0.0, rebalance_bars=1,
+                        risk_pct=1.0, annual_vol_target=10.0,
+                        max_leverage=1.0, stop_atr=20.0,
+                        trail_start_atr=100.0, allow_short=False)
+        sim = run({"SOLUSDT": bars(closes)}, p=p, starting_equity=15.0,
+                  trade_start=20, liquidate_at_end=False,
+                  min_notional_by_symbol={"SOLUSDT": 20.0},
+                  qty_step_by_symbol={"SOLUSDT": 0.1})
+        self.assertIsNone(sim.open_position)
+        self.assertEqual(sim.trades, [])
+        self.assertGreater(sim.blocked_min_notional, 0)
+
+    def test_minimum_order_may_round_up_only_inside_explicit_risk_cap(self):
+        closes = [100 + i * .1 for i in range(60)]
+        p = TSMOMParams(lookback=5, vol_lookback=5, atr_period=3,
+                        signal_threshold=0.0, rebalance_bars=1,
+                        risk_pct=0.001, annual_vol_target=0.01,
+                        max_leverage=1.0, stop_atr=1.0,
+                        trail_start_atr=100.0, allow_short=False)
+        kwargs = dict(p=p, starting_equity=15.0, trade_start=20,
+                      liquidate_at_end=False,
+                      min_notional_by_symbol={"SUIUSDT": 5.0},
+                      qty_step_by_symbol={"SUIUSDT": 0.1})
+        blocked = run({"SUIUSDT": bars(closes)}, **kwargs)
+        floored = run({"SUIUSDT": bars(closes)},
+                      min_notional_max_risk_pct=0.03, **kwargs)
+        self.assertGreater(blocked.blocked_min_notional, 0)
+        self.assertGreater(floored.floored_min_notional, 0)
+        self.assertIsNotNone(floored.open_position)
+
 
 if __name__ == "__main__":
     unittest.main()

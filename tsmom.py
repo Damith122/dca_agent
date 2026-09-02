@@ -99,6 +99,10 @@ class Simulation:
     final_equity: float
     total_fees: float
     total_funding: float
+    open_position: Optional[Position] = None
+    estimated_exit_fee: float = 0.0
+    blocked_min_notional: int = 0
+    floored_min_notional: int = 0
 
 
 def align_candles(series: Mapping[str, Sequence[Candle]]) -> Tuple[List[float], Dict[str, List[Candle]]]:
@@ -191,7 +195,11 @@ def _close_position(pos: Position, price: float, ts: float, reason: str,
 def run(series: Mapping[str, Sequence[Candle]],
         funding_bps_by_day: Optional[Mapping[str, Mapping[int, float]]] = None,
         p: Optional[TSMOMParams] = None, *, starting_equity: float = 1000.0,
-        trade_start: int = 0, trade_end: Optional[int] = None) -> Simulation:
+        trade_start: int = 0, trade_end: Optional[int] = None,
+        liquidate_at_end: bool = True,
+        min_notional_by_symbol: Optional[Mapping[str, float]] = None,
+        qty_step_by_symbol: Optional[Mapping[str, float]] = None,
+        min_notional_max_risk_pct: Optional[float] = None) -> Simulation:
     """Run the strategy with previous-close signals and next-open fills.
 
     Funding values are the sum of the settled rates, in basis points, for the
@@ -216,6 +224,8 @@ def run(series: Mapping[str, Sequence[Candle]],
     curve_ts: List[float] = []
     total_fees = 0.0
     total_funding = 0.0
+    blocked_min_notional = 0
+    floored_min_notional = 0
 
     for i in range(n):
         ts = times[i]
@@ -250,6 +260,34 @@ def run(series: Mapping[str, Sequence[Candle]],
                 bar = aligned[pending.symbol][i]
                 notional = max(0.0, wallet * pending.leverage)
                 qty = notional / bar.open if bar.open > 0 else 0.0
+                desired_notional = notional
+                step = float((qty_step_by_symbol or {}).get(pending.symbol, 0.0))
+                if step > 0 and qty > 0:
+                    qty = math.floor(qty / step + 1e-12) * step
+                    notional = qty * bar.open
+                minimum = float((min_notional_by_symbol or {}).get(
+                    pending.symbol, 0.0))
+                if desired_notional > 0 and notional + 1e-12 < minimum:
+                    min_qty = minimum / bar.open if bar.open > 0 else 0.0
+                    if step > 0 and min_qty > 0:
+                        min_qty = math.ceil(min_qty / step - 1e-12) * step
+                    min_size = min_qty * bar.open
+                    stop_fraction = p.stop_atr * pending.atr / bar.open
+                    floor_risk = (min_size * stop_fraction / wallet
+                                  if wallet > 0 else float("inf"))
+                    floor_leverage = min_size / wallet if wallet > 0 else float("inf")
+                    can_floor = (
+                        min_notional_max_risk_pct is not None
+                        and min_notional_max_risk_pct > 0
+                        and floor_risk <= min_notional_max_risk_pct
+                        and floor_leverage <= p.max_leverage
+                    )
+                    if can_floor:
+                        qty, notional = min_qty, min_size
+                        floored_min_notional += 1
+                    else:
+                        qty = 0.0
+                        blocked_min_notional += 1
                 if qty > 0:
                     entry_fee = notional * p.cost_bps_per_side / 1e4
                     entry_equity = wallet
@@ -257,7 +295,7 @@ def run(series: Mapping[str, Sequence[Candle]],
                     total_fees += entry_fee
                     stop = (bar.open - pending.side * p.stop_atr * pending.atr)
                     pos = Position(pending.symbol, pending.side, i, ts, bar.open,
-                                   qty, pending.leverage, pending.atr, stop,
+                                   qty, notional / entry_equity, pending.atr, stop,
                                    bar.open, entry_fee, entry_equity)
         elif active and pending_ready and pending is None and pos is not None:
             bar = aligned[pos.symbol][i]
@@ -342,7 +380,8 @@ def run(series: Mapping[str, Sequence[Candle]],
             pending = choose_target(aligned, atrs, i, p)
             pending_ready = True
 
-    if pos is not None and curve_ts:
+    estimated_exit_fee = 0.0
+    if pos is not None and curve_ts and liquidate_at_end:
         i = min(end, n) - 1
         price = aligned[pos.symbol][i].close
         wallet, t = _close_position(pos, price, times[i], "end", wallet, p)
@@ -350,9 +389,17 @@ def run(series: Mapping[str, Sequence[Candle]],
         trades.append(t)
         if curve:
             curve[-1] = wallet
+    elif pos is not None and curve_ts:
+        i = min(end, n) - 1
+        price = aligned[pos.symbol][i].close
+        estimated_exit_fee = abs(pos.qty * price) * p.cost_bps_per_side / 1e4
+        wallet = wallet + pos.side * pos.qty * (price - pos.entry) - estimated_exit_fee
+        if curve:
+            curve[-1] = wallet
 
     return Simulation(trades, curve or [starting_equity], curve_ts, wallet,
-                      total_fees, total_funding)
+                      total_fees, total_funding, pos, estimated_exit_fee,
+                      blocked_min_notional, floored_min_notional)
 
 
 def stats(sim: Simulation, starting_equity: float = 1000.0) -> Dict[str, float]:

@@ -286,7 +286,8 @@ def stats(trades: Sequence[Trade], curve: Sequence[float], p: BreakoutParams) ->
     if not trades:
         return {"trades": 0, "win_rate": 0.0, "total_return_pct": 0.0,
                 "profit_factor": 0.0, "max_drawdown_pct": 0.0,
-                "avg_win_pct": 0.0, "avg_loss_pct": 0.0, "expectancy_pct": 0.0}
+                "avg_win_pct": 0.0, "avg_loss_pct": 0.0, "expectancy_pct": 0.0,
+                "avg_win_r": 0.0, "avg_loss_r": 0.0}
     fee = p.fee_bps_round_trip / 1e4
     nets = [t.gross_pct - fee for t in trades]
     wins = [x for x in nets if x > 0]

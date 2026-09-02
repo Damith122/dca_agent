@@ -107,7 +107,7 @@ r = boot({"LEVERAGE": "twenty"},
          code="import config; print('|'.join(config.env_parse_warnings()))")
 check("a malformed value IS reported", "LEVERAGE" in r.stdout)
 check("...naming the offending value", "'twenty'" in r.stdout)
-check("...and the default it fell back to", "20" in r.stdout)
+check("...and the safe default it fell back to", "5" in r.stdout)
 
 r = boot({"DYNAMIC_TP_ENABLED": "flase"},
          code="import config; print(config.DYNAMIC_TP_ENABLED, "
@@ -122,12 +122,14 @@ r = boot({"INITIAL_ENTRY_USDT": "2", "LEVERAGE": "20"},
          code="import config; print(config.INITIAL_ENTRY_USDT, "
               "config.ENTRY_NOTIONAL_USDT, len(config.env_parse_warnings()))")
 check("a valid float is used verbatim", r.stdout.split()[0] == "2.0")
-check("...and derived values follow it", r.stdout.split()[1] == "40.0")
+check("...and unsafe leverage is capped before derived sizing",
+      r.stdout.split()[1] == "20.0")
 check("...with no spurious warning", r.stdout.split()[2] == "0")
 
 r = boot({"MAX_DCA_STEPS": "3.0"},
          code="import config; print(config.MAX_DCA_STEPS)")
-check("an int knob accepts '3.0' without complaint", r.stdout.strip() == "3")
+check("an int knob accepts '3.0' and the DCA safety cap still wins",
+      r.stdout.strip() == "1")
 
 for raw, want in (("true", "True"), ("1", "True"), ("yes", "True"),
                   ("on", "True"), ("false", "False"), ("0", "False"),

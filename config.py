@@ -226,7 +226,7 @@ ACTIVE_SYMBOLS = _parse_symbol_list(
 # to >= 1: a 0 or negative value would silently disable trading entirely,
 # which is a far more surprising outcome than falling back to 1.
 try:
-    MAX_ACTIVE_TRADES = max(1, _env_int("MAX_ACTIVE_TRADES", 2))
+    MAX_ACTIVE_TRADES = 1
 except (TypeError, ValueError):
     MAX_ACTIVE_TRADES = 1
 
@@ -370,8 +370,8 @@ API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
 # EXACT SAME default values as before, so an unconfigured Railway deploy
 # behaves identically to today - only an operator explicitly setting one of
 # these env vars changes anything.
-LEVERAGE = _env_int("LEVERAGE", 20)
-MAX_ALLOWED_LEVERAGE = _env_int("MAX_ALLOWED_LEVERAGE", 50)
+MAX_ALLOWED_LEVERAGE = min(10, max(1, _env_int("MAX_ALLOWED_LEVERAGE", 10)))
+LEVERAGE = min(MAX_ALLOWED_LEVERAGE, max(1, _env_int("LEVERAGE", 5)))
 MARGIN_TYPE = "CROSSED"
 
 # --- Position sizing (Fixed Amount base, Martingale, now confidence-scaled) -
@@ -593,7 +593,7 @@ def notional_scaling_report() -> list:
 
 
 DCA_MULTIPLIER = _env_float("DCA_MULTIPLIER", 1.6)  # reduced from 2.0 (2026-07 profitability fix) - less notional/fee blowup per DCA rung
-MAX_DCA_STEPS = _env_int("MAX_DCA_STEPS", 2)        # reduced from 3 (2026-08 $33-account risk fix) - 3 steps required 112% of a $33 account's margin to fully cascade and produced ~45% worst-case single-trade loss; 2 steps fits within the account (~62.5% margin) and cuts worst-case loss to ~25% while keeping the final-DCA low-probability-recovery gate active at the depth where trade evidence showed it protecting against genuine trend moves
+MAX_DCA_STEPS = min(1, max(0, _env_int("MAX_DCA_STEPS", 1)))        # capped at one rescue step; paper momentum runner uses none
 
 # --- Trade management ---------------------------------------------------------
 DCA_TRIGGER_PCT = _env_float("DCA_TRIGGER_PCT", 0.002)    # floor / fallback DCA spacing (also used if ATR unavailable). Unchanged: at a 40 bps base take-profit the rung still fires once inside the TP distance, which is the intended geometry. It was briefly widened to 0.005 alongside a 100 bps target and reverted with it.
@@ -1397,7 +1397,7 @@ BRAIN_HEAD_MIN_SAMPLES = _env_int("BRAIN_HEAD_MIN_SAMPLES", 20)
 # is_ready() gate) are completely unchanged.
 
 # --- Entry Engine V2 ---------------------------------------------------------
-ENTRY_SCORE_THRESHOLD = _env_float("ENTRY_SCORE_THRESHOLD", 0.75)  # raised from 0.60 (2026-07 profitability fix)
+ENTRY_SCORE_THRESHOLD = min(0.95, max(0.70, _env_float("ENTRY_SCORE_THRESHOLD", 0.75)))
 # 2026-08-18: raised 0.60 -> 0.63. This is the threshold that actually gated
 # the losing streak - all three trades were SIDEWAYS, so ENTRY_SCORE_THRESHOLD
 # (0.75) never applied. The accepted scores were 0.6021 / 0.6093 / 0.6251
@@ -2108,7 +2108,7 @@ USE_POST_ONLY_LIMIT = _env_bool("USE_POST_ONLY_LIMIT", True)
 # This assignment shadows the earlier one at import time; every consumer
 # (trading.py's DCA gates, sanitize_recovered_dca_step(), the DCA-state
 # snapshot clamps) reads this final value.
-MAX_DCA_STEPS = _env_int("MAX_DCA_STEPS", 1)
+MAX_DCA_STEPS = min(1, max(0, _env_int("MAX_DCA_STEPS", 1)))
 
 # --- 2. High-frequency market-data layer (websocket.py) ---------------------
 # Binance publishes partial book depth in fixed sizes (5/10/20) and at
