@@ -368,3 +368,23 @@ The candidate failed the profit-factor, chronological consistency, stressed
 cost and minimum monthly-PnL gates. It is rejected; no HTF paper or live
 runner was deployed. Structured evidence is archived on `brain-state` as
 `brain/HTF_1H4H1D_20260902_validation_summary.json`.
+
+
+## Frozen small-wallet relative-strength specification — 2026-09-02 UTC
+
+The user approved a research-only cross-sectional pair after both directional
+intraday and higher-timeframe candidates failed. The rule was frozen before
+reading its historical result: completed daily candles; 30-day
+volatility-adjusted momentum ending three days ago; weekly ranking; strongest
+asset long and weakest short; one active pair; $5 per leg; DCA=0; next-day-open
+fills; 7 bps per side per leg; exact funding; a -$0.30 fee-net pair stop,
++$0.60 target, and 28-day maximum hold. Minimum-order rounding may raise total
+notional only to $10.50.
+
+Admission requires positive untouched-final-40% fee-net PnL, profit factor at
+least 1.15, at least 20 pair trades, robust chronological and neighbouring
+rules, positive 10-bps-per-side stress, drawdown below 20%, at least $0.15
+estimated monthly PnL, a positive IC t-stat of at least 2.0 with shuffled-rank
+p-value at most 0.05, effective breadth at least 2, and absolute market beta
+at most 0.20. The keyless validator cannot send orders. No pair paper/live
+runner is permitted unless every gate passes.
