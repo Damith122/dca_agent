@@ -9,10 +9,10 @@
  `if __name__ == "__main__":` guard.
 
  dca2.py's own entrypoint guard is untouched, so `python dca2.py` still
- works exactly as before - Railway's existing start command does not need
- to change. This file is an additional, equivalent entrypoint: if you point
- Railway's start command at `python main.py` instead, behavior is identical,
- since both ultimately just call the same run_forever().
+ works exactly as before. For Railway deployment this repository uses
+ `python -u main.py` via Procfile so the long-running bot supervisor,
+ boot diagnostics, and trading loop are started instead of a one-shot
+ historical backtest script.
 ================================================================================
 """
 
