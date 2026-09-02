@@ -111,8 +111,24 @@ class TSMOMTests(unittest.TestCase):
         sim = run({"BTCUSDT": bars(closes)}, p=p,
                   trade_start=20, trade_end=30)
         self.assertTrue(sim.trades)
-        # Global signal day is index 21; the next-open fill is index 22.
+        # Unix day 21 is Thursday modulo seven; the next-open fill is day 22.
         self.assertEqual(sim.trades[0].entry_ts, 22 * 86400.0)
+
+    def test_rebalance_schedule_survives_history_prefix_change(self):
+        closes = [100 + i * .4 for i in range(70)]
+        p = TSMOMParams(lookback=5, vol_lookback=5, atr_period=3,
+                        signal_threshold=0.0, rebalance_bars=7,
+                        rebalance_offset=0, risk_pct=1.0,
+                        annual_vol_target=10.0, max_leverage=1.0,
+                        stop_atr=20.0, trail_start_atr=100.0,
+                        allow_short=False)
+        full = run({"BTCUSDT": bars(closes)}, p=p,
+                   trade_start=20, trade_end=30)
+        prefixed_bars = bars(closes)
+        # Dropping early history changes array indices but not candle times.
+        trimmed = run({"BTCUSDT": prefixed_bars[2:]}, p=p,
+                      trade_start=18, trade_end=28)
+        self.assertEqual(full.trades[0].entry_ts, trimmed.trades[0].entry_ts)
 
     def test_ambiguous_trailing_bar_takes_adverse_path(self):
         closes = [100 + i for i in range(30)]

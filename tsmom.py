@@ -28,6 +28,10 @@ class TSMOMParams:
     atr_period: int = 20
     signal_threshold: float = 0.25
     rebalance_bars: int = 7
+    # UTC-day modulo ``rebalance_bars``.  Day zero is 1970-01-01, so offset
+    # zero with a seven-day schedule is Thursday.  A timestamp anchor is
+    # reproducible in live trading; an array-index anchor is not.
+    rebalance_offset: int = 0
     risk_pct: float = 0.02
     annual_vol_target: float = 0.50
     max_leverage: float = 1.0
@@ -331,7 +335,10 @@ def run(series: Mapping[str, Sequence[Candle]],
         # bar's open.  Anchor the schedule to the global aligned history.  If
         # every validation fold reset its own weekday, the folds would test
         # different rules and could not be compared.
-        if i + 1 < end and active and (i % max(1, p.rebalance_bars) == 0):
+        cadence = max(1, p.rebalance_bars)
+        day_number = int(ts // 86400)
+        if (i + 1 < end and active and
+                day_number % cadence == p.rebalance_offset % cadence):
             pending = choose_target(aligned, atrs, i, p)
             pending_ready = True
 
