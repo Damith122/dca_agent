@@ -462,3 +462,31 @@ one recent segment and did not demonstrate a stable 4H edge. Railway exited
 cleanly, the engine's timing/safety regression tests passed, credentials were
 removed, and live orders sent were zero. Software validation does not turn a
 rejected trading hypothesis into a profitable one.
+
+
+## Frozen 4H/1H EMA-RSI-ATR continuation study — 2026-09-02 UTC
+
+The user-proposed multi-timeframe continuation hypothesis was made objective
+before reading study data. The primary rule requires completed 4H close above
+or below EMA(200), aligned 1H close versus EMA(200), EMA(20)/EMA(50) trend,
+a pullback candle intersecting the EMA20-50 zone within 0.10 ATR, an exactly
+defined engulfing or pinbar, and RSI(14) in 45-65 for longs or 35-55 for
+shorts. It fills at the next 1H open, uses a 1.5 ATR stop, 2R target and 120h
+time exit. Intrabar stop/target ambiguity is resolved adversely.
+
+The simulated wallet starts at $15, targets at most $10 notional, caps leverage
+at 5x and reduces/blocks size so stop loss plus round-trip cost stays within 2%
+of equity. It holds one position, uses DCA=0, daily +$0.50/-$0.30 gates,
+current exchange minimum/quantity filters, 7 bps per side, exact funding and a
+10-bps-per-side stress. No order-capable module is imported and Binance keys
+are removed.
+
+After warm-up, the first 75% is training with three chronological folds. The
+untouched final 25% opens exactly once only if the primary is fee-net positive,
+PF >= 1.15, has at least 50 trades, at least two positive folds, positive stress,
+DD < 20%, average win >= $0.05 and >= 1.5R, p <= 0.10, and at least two of four
+predeclared neighbours are positive. Final paper admission requires positive
+net/PF >= 1.15, at least 15 trades, two positive final halves, positive stress,
+DD < 20%, average win >= $0.05 and >= 1.5R, and estimated monthly PnL >= $0.15.
+The separate 30% monthly target is reported, never assumed. Failure means no
+paper runner and no live deployment.
