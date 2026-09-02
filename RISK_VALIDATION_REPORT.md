@@ -342,3 +342,29 @@ least $0.05, chronological and neighbouring-rule robustness, positive
 10-bps-per-side stress, drawdown below 20%, and at least $0.15 estimated
 monthly PnL on the $15 replay. No paper or live runner is permitted unless
 every gate passes.
+
+
+## Higher-timeframe result — 2026-09-02 UTC
+
+Deployment `6c619a53-d452-4089-aa41-1f48b28cb7be` completed the frozen
+36-month public-data validation on source commit `830eda20`. Each of SOL,
+SUI, BNB, XRP, TRX and DOGE contributed 26,301 completed hourly bars and
+3,287 historical funding prints. The validator sent zero orders.
+
+The untouched final 40% closed 273 simulated trades at a 37.7% win rate. The
+$15 wallet ended at `$15.140` (fee/funding-net `+$0.140`), but profit
+factor was only `1.01` and estimated monthly PnL only `+$0.010`. Exit
+counts were 169 stops, 101 targets and 3 maximum-hold exits. Exposure,
+daily-lock and minimum-notional controls all activated as designed.
+
+The small holdout gain was not robust. All four chronological periods were
+negative (`-$1.305`, `-$10.822`, `-$0.331`, `-$0.869`). Across the
+full aligned history, equity fell from $15 to `$0.953` with 94.3% drawdown.
+At the precommitted 10-bps-per-side stress, the final 40% lost `$1.401`
+(profit factor `0.94`, drawdown 21.2%). Only two of four neighbouring rules
+were positive, and neither had a convincing profit factor.
+
+The candidate failed the profit-factor, chronological consistency, stressed
+cost and minimum monthly-PnL gates. It is rejected; no HTF paper or live
+runner was deployed. Structured evidence is archived on `brain-state` as
+`brain/HTF_1H4H1D_20260902_validation_summary.json`.
