@@ -416,3 +416,26 @@ Only one of four chronological periods was positive. Every neighbouring rule
 and the 10-bps-per-side stress were negative. The candidate is rejected; no
 relative-strength paper/live runner was deployed. Structured evidence is on
 `brain-state` at `brain/XS_PAIR_20260902_validation_summary.json`.
+
+
+## Frozen 4H breakout / completed-1D regime study — 2026-09-02 UTC
+
+Before downloading the study data, the next distinct hypothesis was frozen as
+a six-rule Donchian family on completed 4-hour candles, filtered by completed
+UTC-day EMA regime. Signals fill no earlier than the next 4-hour open. Exits
+use a fixed ATR stop, pessimistically ordered ATR trail, prior-channel exit or
+time limit. The portfolio holds one $10 simulated position across SOL, SUI,
+BNB, XRP, TRX and DOGE; DCA is zero; maximum leverage is 5x; planned stop loss
+plus round-trip cost may not exceed 3% of current $15 equity. Current exchange
+minimums/quantity steps, 7 bps per side and exact historical funding are
+included; 10 bps per side is the cost stress.
+
+The first 75% after warm-up is training only, split into three chronological
+folds. A rule may open the untouched final 25% exactly once only if training
+is fee-net positive, PF >= 1.15, has at least 30 trades, at least two positive
+folds, positive 10-bps stress, drawdown below 20%, and average winner at least
+$0.05. Final paper admission additionally requires positive net PnL, PF >=
+1.15, at least 10 trades, positive stress, drawdown below 20%, average winner
+at least $0.05 and estimated monthly PnL at least $0.15. Failure means no paper
+runner and no live deployment. The validator removes Binance credentials and
+imports no order client.
