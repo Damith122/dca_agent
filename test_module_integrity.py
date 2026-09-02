@@ -29,6 +29,7 @@ MODULES = [
     "paper_tsmom.py", "intraday.py", "backtest_intraday.py",
     "backtest_intraday_family.py", "htf.py", "backtest_htf.py",
     "xs_pair.py", "backtest_xs_pair.py",
+    "htf_breakout.py", "backtest_htf_breakout.py",
 ]
 
 passed = failed = 0
