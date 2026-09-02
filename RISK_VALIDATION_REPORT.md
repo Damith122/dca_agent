@@ -490,3 +490,28 @@ net/PF >= 1.15, at least 15 trades, two positive final halves, positive stress,
 DD < 20%, average win >= $0.05 and >= 1.5R, and estimated monthly PnL >= $0.15.
 The separate 30% monthly target is reported, never assumed. Failure means no
 paper runner and no live deployment.
+
+### 4H/1H EMA-RSI-ATR continuation result
+
+Deployment `50b49baa-fad4-4688-960e-9c7c6b6fd631` ran frozen commit
+`3d69fa3a050ae1551fbc48d440e9c692534e954a` and emitted the structured
+`[mtf-continuation-summary]`. The primary and all three neighbours failed
+training, so the final 25% remained sealed and no paper/live runner was built.
+
+Over the 793.04-day training segment the primary closed 653 simulated trades:
+224 wins and 429 losses (34.30%), fee/funding-net `-$7.5590`, final equity
+`$7.4410`, PF `0.8863`, max drawdown `67.00%`, average win `+$0.2631`
+(`1.70R`) and average loss `-$0.1550` (`1.00R`). Gross price PnL before
+fees/funding was only about `+$0.7022`; commissions/slippage cost `$7.9160`
+and funding was `-$0.3452`. Estimated monthly net was `-$0.2901`.
+Chronological folds were `+$1.8879`, `-$6.3952`, and `-$1.9079`; only one
+of three was positive. Ten-bps-side stress was `-$7.8321`. The relaxed-RSI,
+wider-zone and 2.5R neighbours were all negative.
+
+The rule generated 3.03 raw candidates/day but only 0.82 completed trades/day
+under one-position and safety controls. Non-overlapping forward returns were
+`-15.53 bps` at 6h (t=`-2.38`), `-1.66 bps` at 24h, and `+36.99 bps` mean
+at 72h, but the 72h median was slightly negative and t=`0.71`, so it did not
+show reliable positive forward evidence. Daily loss/target locks activated 31
+and 22 times; exposure blocked 1,045 competing signals. Live orders sent were
+zero. The code/timing safety tests passed, but the trading hypothesis failed.
