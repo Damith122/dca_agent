@@ -328,9 +328,10 @@ def run(series: Mapping[str, Sequence[Candle]],
             curve_ts.append(ts)
 
         # Decide only after this bar has closed; the earliest fill is the next
-        # bar's open.  Rebalance on a fixed calendar within the evaluation
-        # window, not whenever a result happens to look attractive.
-        if i + 1 < end and active and ((i - trade_start) % max(1, p.rebalance_bars) == 0):
+        # bar's open.  Anchor the schedule to the global aligned history.  If
+        # every validation fold reset its own weekday, the folds would test
+        # different rules and could not be compared.
+        if i + 1 < end and active and (i % max(1, p.rebalance_bars) == 0):
             pending = choose_target(aligned, atrs, i, p)
             pending_ready = True
 

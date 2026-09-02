@@ -101,6 +101,19 @@ class TSMOMTests(unittest.TestCase):
         self.assertEqual(len(sim.trades), 1)
         self.assertEqual(sim.trades[0].reason, "end")
 
+    def test_rebalance_calendar_does_not_reset_at_fold_start(self):
+        closes = [100 + i * .4 for i in range(60)]
+        p = TSMOMParams(lookback=5, vol_lookback=5, atr_period=3,
+                        signal_threshold=0.0, rebalance_bars=7,
+                        risk_pct=1.0, annual_vol_target=10.0,
+                        max_leverage=1.0, stop_atr=20.0,
+                        trail_start_atr=100.0, allow_short=False)
+        sim = run({"BTCUSDT": bars(closes)}, p=p,
+                  trade_start=20, trade_end=30)
+        self.assertTrue(sim.trades)
+        # Global signal day is index 21; the next-open fill is index 22.
+        self.assertEqual(sim.trades[0].entry_ts, 22 * 86400.0)
+
     def test_ambiguous_trailing_bar_takes_adverse_path(self):
         closes = [100 + i for i in range(30)]
         opens = closes.copy()
