@@ -1,6 +1,7 @@
 import math
 import unittest
 
+import backtest_breakout
 from breakout import Candle
 from tsmom import TSMOMParams, momentum_score, position_leverage, run, stats
 
@@ -14,6 +15,9 @@ def bars(closes, *, opens=None, lows=None, highs=None):
 
 
 class TSMOMTests(unittest.TestCase):
+    def test_shared_public_fetcher_supports_daily_bars(self):
+        self.assertEqual(backtest_breakout.MS["1d"], 86_400_000)
+
     def test_score_has_no_future_lookahead(self):
         p = TSMOMParams(lookback=5, vol_lookback=5)
         a = [100, 101, 102, 103, 104, 106, 107]

@@ -40,7 +40,8 @@ from typing import Dict, List
 from breakout import BreakoutParams, Candle, run, stats
 
 FAPI = "https://fapi.binance.com/fapi/v1/klines"
-MS = {"15m": 900_000, "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000}
+MS = {"15m": 900_000, "30m": 1_800_000, "1h": 3_600_000,
+      "4h": 14_400_000, "1d": 86_400_000}
 
 
 def fetch(symbol: str, interval: str, months: float, verbose: bool = True) -> List[Candle]:
