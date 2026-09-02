@@ -1,0 +1,149 @@
+{
+  "schema": 1,
+  "strategy": "htf_1h_entry_4h_trend_1d_regime",
+  "source_commit": "830eda20bd64edf1b23d5603e18e11aad203d1c8",
+  "successful_deployment": "6c619a53-d452-4089-aa41-1f48b28cb7be",
+  "duplicate_removed_deployment": "a52fb5a7-3549-43dc-b8cc-02cf79315075",
+  "simulation_only": true,
+  "live_orders_sent": 0,
+  "credentials_removed": true,
+  "months": 36,
+  "symbols": [
+    "SOLUSDT",
+    "SUIUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "TRXUSDT",
+    "DOGEUSDT"
+  ],
+  "profile": {
+    "starting_equity": 15,
+    "notional_usd": 10,
+    "max_leverage": 5,
+    "max_active_trades": 1,
+    "dca_steps": 0,
+    "cost_bps_per_side": 7,
+    "stress_cost_bps_per_side": 10,
+    "stop_atr": 1.5,
+    "target_atr": 3,
+    "max_hold_hours": 48,
+    "daily_profit_target": 0.5,
+    "daily_loss_gate": -0.3
+  },
+  "data": {
+    "hourly_bars_per_symbol": 26301,
+    "funding_prints_per_symbol": 3287
+  },
+  "all_history": {
+    "trades": 395,
+    "win_rate_pct": 32.4,
+    "net_pnl": -14.047,
+    "final_equity": 0.953,
+    "profit_factor": 0.72,
+    "max_drawdown_pct": 94.3,
+    "avg_win": 0.285,
+    "avg_loss": -0.189,
+    "candidate_signals_per_day": 1.88,
+    "trades_per_day": 0.38,
+    "estimated_monthly_pnl": -0.41
+  },
+  "final_40pct": {
+    "trades": 273,
+    "win_rate_pct": 37.7,
+    "net_pnl": 0.14,
+    "final_equity": 15.14,
+    "profit_factor": 1.01,
+    "max_drawdown_pct": 17.1,
+    "avg_win": 0.226,
+    "avg_loss": -0.136,
+    "candidate_signals_per_day": 1.93,
+    "trades_per_day": 0.65,
+    "estimated_monthly_pnl": 0.01,
+    "exit_reasons": {
+      "max_hold": 3,
+      "stop": 169,
+      "target": 101
+    },
+    "blocks": {
+      "exposure": 243,
+      "daily_loss": 4,
+      "daily_target": 4,
+      "min_notional": 6
+    },
+    "lock_hits": {
+      "loss": 7,
+      "target": 4
+    }
+  },
+  "chronological_periods": [
+    {
+      "period": 1,
+      "trades": 183,
+      "net_pnl": -1.305,
+      "profit_factor": 0.94,
+      "max_drawdown_pct": 27
+    },
+    {
+      "period": 2,
+      "trades": 180,
+      "net_pnl": -10.822,
+      "profit_factor": 0.58,
+      "max_drawdown_pct": 75.5
+    },
+    {
+      "period": 3,
+      "trades": 172,
+      "net_pnl": -0.331,
+      "profit_factor": 0.98,
+      "max_drawdown_pct": 15.4
+    },
+    {
+      "period": 4,
+      "trades": 167,
+      "net_pnl": -0.869,
+      "profit_factor": 0.93,
+      "max_drawdown_pct": 18.1
+    }
+  ],
+  "neighbors": {
+    "ema_12_48": {
+      "net_pnl": 1.764,
+      "profit_factor": 1.09
+    },
+    "ema_24_72": {
+      "net_pnl": -0.224,
+      "profit_factor": 0.99
+    },
+    "rr_tighter": {
+      "net_pnl": -2.375,
+      "profit_factor": 0.89
+    },
+    "rr_wider": {
+      "net_pnl": 0.029,
+      "profit_factor": 1
+    }
+  },
+  "stress_10bps_side": {
+    "trades": 273,
+    "net_pnl": -1.401,
+    "final_equity": 13.599,
+    "profit_factor": 0.94,
+    "max_drawdown_pct": 21.2,
+    "estimated_monthly_pnl": -0.102
+  },
+  "checks": {
+    "holdout_fee_net_positive": true,
+    "holdout_profit_factor_at_least_1_15": false,
+    "holdout_at_least_30_trades": true,
+    "holdout_positive_expectancy": true,
+    "average_winner_at_least_5_cents": true,
+    "candidate_frequency_0_1_to_2_per_day": true,
+    "at_least_3_of_4_periods_positive": false,
+    "at_least_3_of_5_neighbor_rules_positive": true,
+    "positive_at_stressed_cost": false,
+    "holdout_drawdown_below_20pct": true,
+    "estimated_monthly_pnl_at_least_15_cents": false
+  },
+  "passed": false,
+  "decision": "REJECTED_DO_NOT_DEPLOY"
+}
