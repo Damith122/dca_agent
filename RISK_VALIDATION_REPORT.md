@@ -515,3 +515,10 @@ at 72h, but the 72h median was slightly negative and t=`0.71`, so it did not
 show reliable positive forward evidence. Daily loss/target locks activated 31
 and 22 times; exposure blocked 1,045 competing signals. Live orders sent were
 zero. The code/timing safety tests passed, but the trading hypothesis failed.
+
+
+## Pre-data protocol — 24h cross-sectional reversal (2026-09-03)
+
+This candidate is deliberately the opposite of the rejected cross-sectional momentum pair. At the completed 23:00 UTC 1h close, rank trailing 24h returns across SOLUSDT, SUIUSDT, BNBUSDT, XRPUSDT, TRXUSDT, and DOGEUSDT; when strongest-minus-weakest dispersion is at least 3%, enter the weakest long and strongest short at the next 1h open with equal $5 target notionals. One pair maximum, DCA=0, 5x leverage cap, maximum rounded gross notional $10.50, 24h maximum hold, -$0.30 fee-net pair stop, +$0.50 target, and daily +$0.50/-$0.30 locks. Costs are 7 bps per side per leg (0.050% taker fee plus 2 bps adverse fill), stressed at 10 bps; published funding prints are included with an hourly-open notional proxy.
+
+The first 75% is development data and the final 25% is sealed. The final slice is opened only if development net PnL is positive, PF >=1.15, at least 100 trades, average winner >=$0.03, at least 2/3 chronological folds and 3/5 neighbouring rules are positive, 10-bps stress remains positive, drawdown is below 20%, estimated monthly PnL is at least $0.15, the gross reversal edge clears the 14-bps round-trip cost with t >=2, shuffle and sign-flip p-values are <=0.10, and absolute market beta is <=0.20. The final slice has separate profitability, trade-count, two-half stability, stress, drawdown, winner-size, and monthly-PnL gates. Failure means no paper or live deployment.
