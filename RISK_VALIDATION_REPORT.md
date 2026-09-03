@@ -522,3 +522,16 @@ zero. The code/timing safety tests passed, but the trading hypothesis failed.
 This candidate is deliberately the opposite of the rejected cross-sectional momentum pair. At the completed 23:00 UTC 1h close, rank trailing 24h returns across SOLUSDT, SUIUSDT, BNBUSDT, XRPUSDT, TRXUSDT, and DOGEUSDT; when strongest-minus-weakest dispersion is at least 3%, enter the weakest long and strongest short at the next 1h open with equal $5 target notionals. One pair maximum, DCA=0, 5x leverage cap, maximum rounded gross notional $10.50, 24h maximum hold, -$0.30 fee-net pair stop, +$0.50 target, and daily +$0.50/-$0.30 locks. Costs are 7 bps per side per leg (0.050% taker fee plus 2 bps adverse fill), stressed at 10 bps; published funding prints are included with an hourly-open notional proxy.
 
 The first 75% is development data and the final 25% is sealed. The final slice is opened only if development net PnL is positive, PF >=1.15, at least 100 trades, average winner >=$0.03, at least 2/3 chronological folds and 3/5 neighbouring rules are positive, 10-bps stress remains positive, drawdown is below 20%, estimated monthly PnL is at least $0.15, the gross reversal edge clears the 14-bps round-trip cost with t >=2, shuffle and sign-flip p-values are <=0.10, and absolute market beta is <=0.20. The final slice has separate profitability, trade-count, two-half stability, stress, drawdown, winner-size, and monthly-PnL gates. Failure means no paper or live deployment.
+
+
+## Result — 24h cross-sectional reversal (2026-09-03)
+
+**REJECTED on development data; sealed final 25% remained unopened. No paper runner or live strategy was deployed.** Runtime deployment `5985c4f0-7420-4a46-817c-a4f5597ac52f` used source commit `5b16b81c503151b864e9c38571784a1402c3a2f9` and emitted the structured `[xs-reversal-summary]` before exiting.
+
+- Development span: 819.58 days; 371 simulated pairs, 184 wins / 187 losses (49.60%). Gross price PnL **-$4.4115**, fees **-$5.3069**, funding proxy **+$0.0418**, fee-net PnL **-$9.6766**, and $15 -> **$5.3234**. PF 0.769, maximum drawdown 72.19%, estimated monthly PnL -$0.3594.
+- Average winner +$0.1750 versus average loser -$0.2239. Exits: 266 max-hold, 87 pair-stop, and 18 pair-target.
+- All three chronological development folds were negative (-$4.1791, -$3.7364, -$2.0472), all four neighbouring rules were negative, and 10-bps/side stress produced -$11.3796.
+- Forward evidence: 716 qualifying dispersion events; mean gross reversal spread -12.80 bps, fee-net before funding -26.80 bps, t=-1.263, shuffle p=0.892, and beta to the equal-weight market 0.013. There is no statistically credible reversal edge in this liquid six-coin universe.
+- Safety evidence: 102 dispersion blocks, 256 execution-size/minimum-notional blocks, 72 daily-loss blocks, 18 daily-target blocks, 69 loss-lock hits, 16 target-lock hits, and zero exposure-overlap blocks. Live orders sent: **0**.
+
+The candidate loses before fees and after fees, so relaxing stops, costs, or admission gates would not repair it. The Railway start command was restored to the safe TSMOM validator after evidence archival on `brain-state` at `brain/XS_REVERSAL_20260903_validation_summary.json`.
