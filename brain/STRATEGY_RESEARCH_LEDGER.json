@@ -1,0 +1,105 @@
+{
+  "schema": 1,
+  "updated_utc": "2026-09-03",
+  "objective": "Find a robust paper-trading candidate for a $15 wallet without optimizing to a profit target.",
+  "current_best": {
+    "strategy": "30-day long/cash TSMOM",
+    "status": "historically admitted; forward paper only",
+    "evidence_summary": "3.33y +17.47%, PF 1.53; final 40% +5.75%, PF 1.49; $15 replay about 7.7% annualized",
+    "caveat": "Not evidence for $5/month or 30-50% monthly profit."
+  },
+  "constraints": {
+    "starting_equity_usd": 15,
+    "normal_target_notional_usd": 5,
+    "absolute_entry_notional_cap_usd": 10,
+    "max_open_positions": 1,
+    "dca_steps": 0,
+    "adverse_slippage_bps_per_fill": 2,
+    "taker_fee_bps_per_fill": 5,
+    "base_cost_bps_per_side": 7,
+    "stress_cost_bps_per_side": 10,
+    "daily_profit_target_usd": 0.5,
+    "daily_loss_gate_usd": -0.3,
+    "funding": "Include exact settled funding when applicable.",
+    "live_orders": "Forbidden during research.",
+    "deploy_branch": "Never write runtime evidence to main; use brain-state."
+  },
+  "rejected_families": [
+    {
+      "strategy": "24h directional paper bot",
+      "reason": "17 trades, fee-net -$0.2236; gross also negative",
+      "evidence": "PAPER_LIVE_3fec05136496 evidence"
+    },
+    {
+      "strategy": "delta-neutral funding carry",
+      "reason": "About 0.2% annualized under assumptions; economically immaterial at $15",
+      "evidence": "RISK_VALIDATION_REPORT.md"
+    },
+    {
+      "strategy": "higher-timeframe EMA/RSI/ATR",
+      "reason": "Development failed profitability and stability gates",
+      "evidence": "RISK_VALIDATION_REPORT.md"
+    },
+    {
+      "strategy": "relative-strength long/short pair",
+      "reason": "Final fee/funding-net -$1.4491, PF 0.61",
+      "evidence": "brain/XS_PAIR_20260902_validation_summary.json"
+    },
+    {
+      "strategy": "4H Donchian + daily regime",
+      "reason": "Apparent training profit concentrated in one segment; drawdown 26.44%",
+      "evidence": "RISK_VALIDATION_REPORT.md"
+    },
+    {
+      "strategy": "4H/1H continuation",
+      "reason": "653 development trades, fee/funding-net -$7.5590, PF 0.886",
+      "evidence": "RISK_VALIDATION_REPORT.md"
+    },
+    {
+      "strategy": "24h cross-sectional reversal",
+      "reason": "371 pairs, fee/funding-net -$9.6766, PF 0.769",
+      "evidence": "brain/XS_REVERSAL_20260903_validation_summary.json"
+    },
+    {
+      "strategy": "30d/90d TSMOM consensus",
+      "reason": "+$0.0012 but PF 1.001, stress negative, p=0.511",
+      "evidence": "brain/TSMOM_CONSENSUS_20260903_validation_summary.json"
+    },
+    {
+      "strategy": "completed-daily Donchian",
+      "reason": "Development positive but 30-34% drawdowns; final sealed",
+      "evidence": "brain/DAILY_BREAKOUT_20260903_validation_summary.json"
+    },
+    {
+      "strategy": "daily Donchian profit trail",
+      "reason": "Inner validation stress -$0.858; outer final sealed",
+      "evidence": "brain/DAILY_TRAIL_20260903_validation_summary.json"
+    },
+    {
+      "strategy": "4H long-only boosted-tree screen",
+      "reason": "1110 OOS signals, all six symbols negative, PF 0.674",
+      "evidence": "brain/ML_4H_SCREEN_20260903_validation_summary.json"
+    },
+    {
+      "strategy": "7/14/21-day long-only TSMOM",
+      "reason": "Positive but too few trades and statistically weak; all executable trades concentrated in TRX",
+      "evidence": "brain/SHORT_TSMOM_20260903_validation_summary.json"
+    }
+  ],
+  "research_rules": [
+    "Test one genuinely distinct pre-registered family per research iteration.",
+    "Use completed candles, next-open fills, pessimistic intrabar ordering and gap-through-stop prices.",
+    "Use development selection, chronological folds, cost stress and one sealed final evaluation.",
+    "Correct for multiple testing; never tune on the sealed final.",
+    "Reject a signal screen before building execution code when raw cost-adjusted expectancy is negative.",
+    "Do not infer monthly profit from a small sample.",
+    "A pass permits paper validation only; live requires separate explicit approval."
+  ],
+  "next_queue": [
+    "BTC market-regime and six-coin breadth overlay on the admitted 30-day TSMOM rule",
+    "Spot-versus-perpetual long/cash momentum comparison under actual minimums and fees",
+    "Volatility-managed dual momentum with a cash state and no shorts",
+    "Trend plus funding-crowding ensemble using only individually known-at-decision features",
+    "Portfolio ensemble only after two independently admitted, low-correlation components exist"
+  ]
+}
