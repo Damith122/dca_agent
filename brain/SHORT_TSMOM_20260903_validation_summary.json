@@ -1,0 +1,940 @@
+{
+  "cost_bps_per_side": 7,
+  "development_family_positive": 5,
+  "final_checks": null,
+  "holdout": null,
+  "holdout_stress": null,
+  "live_orders_sent": 0,
+  "months": 36,
+  "passed": false,
+  "schema": 1,
+  "selected": null,
+  "simulation_only": true,
+  "split": {
+    "bars": 1095,
+    "final_opened": false,
+    "train_end": 829,
+    "warm": 31
+  },
+  "starting_equity": 15,
+  "strategy": "short_horizon_long_only_tsmom",
+  "stress_cost_bps_per_side": 10,
+  "symbols": [
+    "SOLUSDT",
+    "SUIUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "TRXUSDT",
+    "DOGEUSDT"
+  ],
+  "train_results": {
+    "MOM07": {
+      "checks": {
+        "at_least_15_trades": false,
+        "at_least_2_of_3_folds_positive": true,
+        "at_least_3_of_5_family_positive": true,
+        "average_winner_at_least_5c": true,
+        "drawdown_below_20pct": true,
+        "fee_net_positive": true,
+        "positive_at_10bps_side": true,
+        "profit_factor_at_least_1_20": true,
+        "sign_flip_p_at_most_0_20": false
+      },
+      "combined": {
+        "avg_loss": -0.11934148546492004,
+        "avg_win": 0.12772130148211752,
+        "blocked_min_notional": 73,
+        "cagr_pct": 1.2879423859623929,
+        "days": 797,
+        "estimated_monthly_pnl": 0.01623452603408344,
+        "exit_reasons": {
+          "end": 1,
+          "flat_signal": 1,
+          "signal": 8,
+          "stop": 2,
+          "trail": 1
+        },
+        "expectancy_pct": 0.21981329414721015,
+        "fees": 0.0934357007752142,
+        "final_equity": 15.425062984532342,
+        "floored_min_notional": 12,
+        "funding": -0.06987385071270008,
+        "losses": 5,
+        "max_drawdown_pct": 3.588713475849601,
+        "net_pnl": 0.42506298453234237,
+        "profit_factor": 1.712347400196029,
+        "symbols": {
+          "TRXUSDT": 13
+        },
+        "total_return_pct": 2.8337532302156188,
+        "trades": 13,
+        "win_rate": 61.53846153846154,
+        "wins": 8
+      },
+      "eligible": false,
+      "folds": [
+        {
+          "avg_loss": -0.027036696705700237,
+          "avg_win": 0.22622867507815048,
+          "blocked_min_notional": 28,
+          "cagr_pct": 3.6763481217304106,
+          "days": 265,
+          "estimated_monthly_pnl": 0.04576153827665978,
+          "exit_reasons": {
+            "signal": 4
+          },
+          "expectancy_pct": 0.6615481410213229,
+          "fees": 0.028648074000000003,
+          "final_equity": 15.398383956744903,
+          "floored_min_notional": 4,
+          "funding": -0.07504796925510002,
+          "losses": 2,
+          "max_drawdown_pct": 1.7781688277688623,
+          "net_pnl": 0.3983839567449028,
+          "profit_factor": 8.367467281254589,
+          "symbols": {
+            "TRXUSDT": 4
+          },
+          "total_return_pct": 2.655893044966029,
+          "trades": 4,
+          "win_rate": 50,
+          "wins": 2
+        },
+        {
+          "avg_loss": 0,
+          "avg_win": 0.07925054790859419,
+          "blocked_min_notional": 26,
+          "cagr_pct": 2.922394073300505,
+          "days": 265,
+          "estimated_monthly_pnl": 0.03641338382396384,
+          "exit_reasons": {
+            "signal": 2,
+            "stop": 1,
+            "trail": 1
+          },
+          "expectancy_pct": 0.5255531810961199,
+          "fees": 0.028713272665799525,
+          "final_equity": 15.317002191634376,
+          "floored_min_notional": 3,
+          "funding": 0.011894513158000001,
+          "losses": 0,
+          "max_drawdown_pct": 1.7351317979943812,
+          "net_pnl": 0.3170021916343764,
+          "profit_factor": null,
+          "symbols": {
+            "TRXUSDT": 4
+          },
+          "total_return_pct": 2.1133479442291714,
+          "trades": 4,
+          "win_rate": 100,
+          "wins": 4
+        },
+        {
+          "avg_loss": -0.11837513529719987,
+          "avg_win": 0.1257010094158313,
+          "blocked_min_notional": 21,
+          "cagr_pct": 1.2235449047608205,
+          "days": 265,
+          "estimated_monthly_pnl": 0.01528052201807185,
+          "exit_reasons": {
+            "end": 1,
+            "signal": 1,
+            "stop": 1
+          },
+          "expectancy_pct": 0.297630740691986,
+          "fees": 0.021653892109414655,
+          "final_equity": 15.133026883534463,
+          "floored_min_notional": 3,
+          "funding": -0.0043108092342,
+          "losses": 1,
+          "max_drawdown_pct": 2.1807425084946166,
+          "net_pnl": 0.13302688353446257,
+          "profit_factor": 2.123773866872272,
+          "symbols": {
+            "TRXUSDT": 3
+          },
+          "total_return_pct": 0.8868458902297593,
+          "trades": 3,
+          "win_rate": 66.66666666666666,
+          "wins": 2
+        }
+      ],
+      "params": {
+        "allow_short": false,
+        "annual_vol_target": 0.5,
+        "atr_period": 20,
+        "confirmation_lookback": 0,
+        "cooldown_bars": 3,
+        "cost_bps_per_side": 7,
+        "funding_lookback_days": 0,
+        "lookback": 7,
+        "max_leverage": 1,
+        "max_trailing_funding_bps": null,
+        "rebalance_bars": 7,
+        "rebalance_offset": 0,
+        "risk_pct": 0.02,
+        "signal_threshold": 0.25,
+        "stop_atr": 3,
+        "trail_atr": 2.5,
+        "trail_start_atr": 3,
+        "vol_lookback": 20
+      },
+      "sign_flip_pvalue": 0.23008849557522124,
+      "stress": {
+        "avg_loss": -0.12237905086492003,
+        "avg_win": 0.12461429588701677,
+        "blocked_min_notional": 73,
+        "cagr_pct": 1.1674367766593141,
+        "days": 797,
+        "estimated_monthly_pnl": 0.014705121446381073,
+        "exit_reasons": {
+          "end": 1,
+          "flat_signal": 1,
+          "signal": 8,
+          "stop": 2,
+          "trail": 1
+        },
+        "expectancy_pct": 0.19978564792714373,
+        "fees": 0.13347957253602027,
+        "final_equity": 15.385019112771541,
+        "floored_min_notional": 12,
+        "funding": -0.06987385071270008,
+        "losses": 5,
+        "max_drawdown_pct": 3.644321678864517,
+        "net_pnl": 0.3850191127715412,
+        "profit_factor": 1.629223890936222,
+        "symbols": {
+          "TRXUSDT": 13
+        },
+        "total_return_pct": 2.5667940851435977,
+        "trades": 13,
+        "win_rate": 61.53846153846154,
+        "wins": 8
+      }
+    },
+    "MOM14": {
+      "checks": {
+        "at_least_15_trades": false,
+        "at_least_2_of_3_folds_positive": false,
+        "at_least_3_of_5_family_positive": true,
+        "average_winner_at_least_5c": true,
+        "drawdown_below_20pct": true,
+        "fee_net_positive": true,
+        "positive_at_10bps_side": true,
+        "profit_factor_at_least_1_20": true,
+        "sign_flip_p_at_most_0_20": false
+      },
+      "combined": {
+        "avg_loss": -0.19000728502428618,
+        "avg_win": 0.13848279087475254,
+        "blocked_min_notional": 75,
+        "cagr_pct": 0.636770545333909,
+        "days": 797,
+        "estimated_monthly_pnl": 0.007995766693896079,
+        "exit_reasons": {
+          "end": 1,
+          "flat_signal": 1,
+          "signal": 6,
+          "stop": 3
+        },
+        "expectancy_pct": 0.13306305320335102,
+        "fees": 0.08021512463238939,
+        "final_equity": 15.209350396026123,
+        "floored_min_notional": 9,
+        "funding": -0.06380966846920005,
+        "losses": 4,
+        "max_drawdown_pct": 4.838051195796699,
+        "net_pnl": 0.2093503960261227,
+        "profit_factor": 1.2754504860160554,
+        "symbols": {
+          "TRXUSDT": 11
+        },
+        "total_return_pct": 1.3956693068408077,
+        "trades": 11,
+        "win_rate": 63.63636363636363,
+        "wins": 7
+      },
+      "eligible": false,
+      "folds": [
+        {
+          "avg_loss": 0,
+          "avg_win": 0.20743582250103385,
+          "blocked_min_notional": 30,
+          "cagr_pct": 5.758620994482211,
+          "days": 265,
+          "estimated_monthly_pnl": 0.07148316721054482,
+          "exit_reasons": {
+            "end": 1,
+            "signal": 2
+          },
+          "expectancy_pct": 1.3656922733447407,
+          "fees": 0.021717304,
+          "final_equity": 15.6223074675031,
+          "floored_min_notional": 3,
+          "funding": -0.0743352284969,
+          "losses": 0,
+          "max_drawdown_pct": 1.7745095121593606,
+          "net_pnl": 0.6223074675031004,
+          "profit_factor": null,
+          "symbols": {
+            "TRXUSDT": 3
+          },
+          "total_return_pct": 4.148716450020662,
+          "trades": 3,
+          "win_rate": 100,
+          "wins": 3
+        },
+        {
+          "avg_loss": -0.29456285450087183,
+          "avg_win": 0.041292575219317854,
+          "blocked_min_notional": 23,
+          "cagr_pct": -1.5639244651272421,
+          "days": 265,
+          "estimated_monthly_pnl": -0.019606246498031724,
+          "exit_reasons": {
+            "signal": 2,
+            "stop": 2
+          },
+          "expectancy_pct": -0.28093453204796187,
+          "fees": 0.02904822739163017,
+          "final_equity": 14.829314871157083,
+          "floored_min_notional": 2,
+          "funding": 0.021095396219899996,
+          "losses": 1,
+          "max_drawdown_pct": 3.0900859337216384,
+          "net_pnl": -0.17068512884291742,
+          "profit_factor": 0.42054768198067866,
+          "symbols": {
+            "TRXUSDT": 4
+          },
+          "total_return_pct": -1.1379008589527784,
+          "trades": 4,
+          "win_rate": 75,
+          "wins": 3
+        },
+        {
+          "avg_loss": -0.13007604354284974,
+          "avg_win": 0.1257010094158313,
+          "blocked_min_notional": 23,
+          "cagr_pct": -0.08033769437251204,
+          "days": 265,
+          "estimated_monthly_pnl": -0.0010051021798225326,
+          "exit_reasons": {
+            "end": 1,
+            "signal": 2,
+            "stop": 1
+          },
+          "expectancy_pct": -0.010997529040767274,
+          "fees": 0.028987512109414654,
+          "final_equity": 14.99124993174596,
+          "floored_min_notional": 4,
+          "funding": -0.010054141022699999,
+          "losses": 2,
+          "max_drawdown_pct": 3.0971828386475977,
+          "net_pnl": -0.008750068254039789,
+          "profit_factor": 0.9663655658039966,
+          "symbols": {
+            "TRXUSDT": 4
+          },
+          "total_return_pct": -0.05833378836026526,
+          "trades": 4,
+          "win_rate": 50,
+          "wins": 2
+        }
+      ],
+      "params": {
+        "allow_short": false,
+        "annual_vol_target": 0.5,
+        "atr_period": 20,
+        "confirmation_lookback": 0,
+        "cooldown_bars": 3,
+        "cost_bps_per_side": 7,
+        "funding_lookback_days": 0,
+        "lookback": 14,
+        "max_leverage": 1,
+        "max_trailing_funding_bps": null,
+        "rebalance_bars": 7,
+        "rebalance_offset": 0,
+        "risk_pct": 0.02,
+        "signal_threshold": 0.25,
+        "stop_atr": 3,
+        "trail_atr": 2.5,
+        "trail_start_atr": 3,
+        "vol_lookback": 20
+      },
+      "sign_flip_pvalue": 0.3744312784360782,
+      "stress": {
+        "avg_loss": -0.19316577411724029,
+        "avg_win": 0.135376511705478,
+        "blocked_min_notional": 75,
+        "cagr_pct": 0.5325324863906689,
+        "days": 797,
+        "estimated_monthly_pnl": 0.00668276343499142,
+        "exit_reasons": {
+          "end": 1,
+          "flat_signal": 1,
+          "signal": 6,
+          "stop": 3
+        },
+        "expectancy_pct": 0.11248112712491996,
+        "fees": 0.11459303518912772,
+        "final_equity": 15.174972485469388,
+        "floored_min_notional": 9,
+        "funding": -0.06380966846920005,
+        "losses": 4,
+        "max_drawdown_pct": 4.939636043160884,
+        "net_pnl": 0.1749724854693877,
+        "profit_factor": 1.2264537885515718,
+        "symbols": {
+          "TRXUSDT": 11
+        },
+        "total_return_pct": 1.1664832364625788,
+        "trades": 11,
+        "win_rate": 63.63636363636363,
+        "wins": 7
+      }
+    },
+    "MOM14_THR015": {
+      "checks": {
+        "at_least_15_trades": false,
+        "at_least_2_of_3_folds_positive": false,
+        "at_least_3_of_5_family_positive": true,
+        "average_winner_at_least_5c": true,
+        "drawdown_below_20pct": true,
+        "fee_net_positive": true,
+        "positive_at_10bps_side": true,
+        "profit_factor_at_least_1_20": true,
+        "sign_flip_p_at_most_0_20": false
+      },
+      "combined": {
+        "avg_loss": -0.19000728502428618,
+        "avg_win": 0.13848279087475254,
+        "blocked_min_notional": 77,
+        "cagr_pct": 0.636770545333909,
+        "days": 797,
+        "estimated_monthly_pnl": 0.007995766693896079,
+        "exit_reasons": {
+          "end": 1,
+          "flat_signal": 1,
+          "signal": 6,
+          "stop": 3
+        },
+        "expectancy_pct": 0.13306305320335102,
+        "fees": 0.08021512463238939,
+        "final_equity": 15.209350396026123,
+        "floored_min_notional": 9,
+        "funding": -0.06380966846920005,
+        "losses": 4,
+        "max_drawdown_pct": 4.838051195796699,
+        "net_pnl": 0.2093503960261227,
+        "profit_factor": 1.2754504860160554,
+        "symbols": {
+          "TRXUSDT": 11
+        },
+        "total_return_pct": 1.3956693068408077,
+        "trades": 11,
+        "win_rate": 63.63636363636363,
+        "wins": 7
+      },
+      "eligible": false,
+      "folds": [
+        {
+          "avg_loss": 0,
+          "avg_win": 0.20743582250103385,
+          "blocked_min_notional": 30,
+          "cagr_pct": 5.758620994482211,
+          "days": 265,
+          "estimated_monthly_pnl": 0.07148316721054482,
+          "exit_reasons": {
+            "end": 1,
+            "signal": 2
+          },
+          "expectancy_pct": 1.3656922733447407,
+          "fees": 0.021717304,
+          "final_equity": 15.6223074675031,
+          "floored_min_notional": 3,
+          "funding": -0.0743352284969,
+          "losses": 0,
+          "max_drawdown_pct": 1.7745095121593606,
+          "net_pnl": 0.6223074675031004,
+          "profit_factor": null,
+          "symbols": {
+            "TRXUSDT": 3
+          },
+          "total_return_pct": 4.148716450020662,
+          "trades": 3,
+          "win_rate": 100,
+          "wins": 3
+        },
+        {
+          "avg_loss": -0.29456285450087183,
+          "avg_win": 0.041292575219317854,
+          "blocked_min_notional": 23,
+          "cagr_pct": -1.5639244651272421,
+          "days": 265,
+          "estimated_monthly_pnl": -0.019606246498031724,
+          "exit_reasons": {
+            "signal": 2,
+            "stop": 2
+          },
+          "expectancy_pct": -0.28093453204796187,
+          "fees": 0.02904822739163017,
+          "final_equity": 14.829314871157083,
+          "floored_min_notional": 2,
+          "funding": 0.021095396219899996,
+          "losses": 1,
+          "max_drawdown_pct": 3.0900859337216384,
+          "net_pnl": -0.17068512884291742,
+          "profit_factor": 0.42054768198067866,
+          "symbols": {
+            "TRXUSDT": 4
+          },
+          "total_return_pct": -1.1379008589527784,
+          "trades": 4,
+          "win_rate": 75,
+          "wins": 3
+        },
+        {
+          "avg_loss": -0.13007604354284974,
+          "avg_win": 0.1257010094158313,
+          "blocked_min_notional": 25,
+          "cagr_pct": -0.08033769437251204,
+          "days": 265,
+          "estimated_monthly_pnl": -0.0010051021798225326,
+          "exit_reasons": {
+            "end": 1,
+            "signal": 2,
+            "stop": 1
+          },
+          "expectancy_pct": -0.010997529040767274,
+          "fees": 0.028987512109414654,
+          "final_equity": 14.99124993174596,
+          "floored_min_notional": 4,
+          "funding": -0.010054141022699999,
+          "losses": 2,
+          "max_drawdown_pct": 3.0971828386475977,
+          "net_pnl": -0.008750068254039789,
+          "profit_factor": 0.9663655658039966,
+          "symbols": {
+            "TRXUSDT": 4
+          },
+          "total_return_pct": -0.05833378836026526,
+          "trades": 4,
+          "win_rate": 50,
+          "wins": 2
+        }
+      ],
+      "params": {
+        "allow_short": false,
+        "annual_vol_target": 0.5,
+        "atr_period": 20,
+        "confirmation_lookback": 0,
+        "cooldown_bars": 3,
+        "cost_bps_per_side": 7,
+        "funding_lookback_days": 0,
+        "lookback": 14,
+        "max_leverage": 1,
+        "max_trailing_funding_bps": null,
+        "rebalance_bars": 7,
+        "rebalance_offset": 0,
+        "risk_pct": 0.02,
+        "signal_threshold": 0.15,
+        "stop_atr": 3,
+        "trail_atr": 2.5,
+        "trail_start_atr": 3,
+        "vol_lookback": 20
+      },
+      "sign_flip_pvalue": 0.3744312784360782,
+      "stress": {
+        "avg_loss": -0.19316577411724029,
+        "avg_win": 0.135376511705478,
+        "blocked_min_notional": 77,
+        "cagr_pct": 0.5325324863906689,
+        "days": 797,
+        "estimated_monthly_pnl": 0.00668276343499142,
+        "exit_reasons": {
+          "end": 1,
+          "flat_signal": 1,
+          "signal": 6,
+          "stop": 3
+        },
+        "expectancy_pct": 0.11248112712491996,
+        "fees": 0.11459303518912772,
+        "final_equity": 15.174972485469388,
+        "floored_min_notional": 9,
+        "funding": -0.06380966846920005,
+        "losses": 4,
+        "max_drawdown_pct": 4.939636043160884,
+        "net_pnl": 0.1749724854693877,
+        "profit_factor": 1.2264537885515718,
+        "symbols": {
+          "TRXUSDT": 11
+        },
+        "total_return_pct": 1.1664832364625788,
+        "trades": 11,
+        "win_rate": 63.63636363636363,
+        "wins": 7
+      }
+    },
+    "MOM14_THR035": {
+      "checks": {
+        "at_least_15_trades": false,
+        "at_least_2_of_3_folds_positive": false,
+        "at_least_3_of_5_family_positive": true,
+        "average_winner_at_least_5c": true,
+        "drawdown_below_20pct": true,
+        "fee_net_positive": true,
+        "positive_at_10bps_side": true,
+        "profit_factor_at_least_1_20": true,
+        "sign_flip_p_at_most_0_20": false
+      },
+      "combined": {
+        "avg_loss": -0.19000728502428618,
+        "avg_win": 0.13848279087475254,
+        "blocked_min_notional": 73,
+        "cagr_pct": 0.636770545333909,
+        "days": 797,
+        "estimated_monthly_pnl": 0.007995766693896079,
+        "exit_reasons": {
+          "end": 1,
+          "flat_signal": 1,
+          "signal": 6,
+          "stop": 3
+        },
+        "expectancy_pct": 0.13306305320335102,
+        "fees": 0.08021512463238939,
+        "final_equity": 15.209350396026123,
+        "floored_min_notional": 9,
+        "funding": -0.06380966846920005,
+        "losses": 4,
+        "max_drawdown_pct": 4.838051195796699,
+        "net_pnl": 0.2093503960261227,
+        "profit_factor": 1.2754504860160554,
+        "symbols": {
+          "TRXUSDT": 11
+        },
+        "total_return_pct": 1.3956693068408077,
+        "trades": 11,
+        "win_rate": 63.63636363636363,
+        "wins": 7
+      },
+      "eligible": false,
+      "folds": [
+        {
+          "avg_loss": 0,
+          "avg_win": 0.20743582250103385,
+          "blocked_min_notional": 28,
+          "cagr_pct": 5.758620994482211,
+          "days": 265,
+          "estimated_monthly_pnl": 0.07148316721054482,
+          "exit_reasons": {
+            "end": 1,
+            "signal": 2
+          },
+          "expectancy_pct": 1.3656922733447407,
+          "fees": 0.021717304,
+          "final_equity": 15.6223074675031,
+          "floored_min_notional": 3,
+          "funding": -0.0743352284969,
+          "losses": 0,
+          "max_drawdown_pct": 1.7745095121593606,
+          "net_pnl": 0.6223074675031004,
+          "profit_factor": null,
+          "symbols": {
+            "TRXUSDT": 3
+          },
+          "total_return_pct": 4.148716450020662,
+          "trades": 3,
+          "win_rate": 100,
+          "wins": 3
+        },
+        {
+          "avg_loss": -0.29456285450087183,
+          "avg_win": 0.041292575219317854,
+          "blocked_min_notional": 23,
+          "cagr_pct": -1.5639244651272421,
+          "days": 265,
+          "estimated_monthly_pnl": -0.019606246498031724,
+          "exit_reasons": {
+            "signal": 2,
+            "stop": 2
+          },
+          "expectancy_pct": -0.28093453204796187,
+          "fees": 0.02904822739163017,
+          "final_equity": 14.829314871157083,
+          "floored_min_notional": 2,
+          "funding": 0.021095396219899996,
+          "losses": 1,
+          "max_drawdown_pct": 3.0900859337216384,
+          "net_pnl": -0.17068512884291742,
+          "profit_factor": 0.42054768198067866,
+          "symbols": {
+            "TRXUSDT": 4
+          },
+          "total_return_pct": -1.1379008589527784,
+          "trades": 4,
+          "win_rate": 75,
+          "wins": 3
+        },
+        {
+          "avg_loss": -0.13007604354284974,
+          "avg_win": 0.1257010094158313,
+          "blocked_min_notional": 23,
+          "cagr_pct": -0.08033769437251204,
+          "days": 265,
+          "estimated_monthly_pnl": -0.0010051021798225326,
+          "exit_reasons": {
+            "end": 1,
+            "signal": 2,
+            "stop": 1
+          },
+          "expectancy_pct": -0.010997529040767274,
+          "fees": 0.028987512109414654,
+          "final_equity": 14.99124993174596,
+          "floored_min_notional": 4,
+          "funding": -0.010054141022699999,
+          "losses": 2,
+          "max_drawdown_pct": 3.0971828386475977,
+          "net_pnl": -0.008750068254039789,
+          "profit_factor": 0.9663655658039966,
+          "symbols": {
+            "TRXUSDT": 4
+          },
+          "total_return_pct": -0.05833378836026526,
+          "trades": 4,
+          "win_rate": 50,
+          "wins": 2
+        }
+      ],
+      "params": {
+        "allow_short": false,
+        "annual_vol_target": 0.5,
+        "atr_period": 20,
+        "confirmation_lookback": 0,
+        "cooldown_bars": 3,
+        "cost_bps_per_side": 7,
+        "funding_lookback_days": 0,
+        "lookback": 14,
+        "max_leverage": 1,
+        "max_trailing_funding_bps": null,
+        "rebalance_bars": 7,
+        "rebalance_offset": 0,
+        "risk_pct": 0.02,
+        "signal_threshold": 0.35,
+        "stop_atr": 3,
+        "trail_atr": 2.5,
+        "trail_start_atr": 3,
+        "vol_lookback": 20
+      },
+      "sign_flip_pvalue": 0.3744312784360782,
+      "stress": {
+        "avg_loss": -0.19316577411724029,
+        "avg_win": 0.135376511705478,
+        "blocked_min_notional": 73,
+        "cagr_pct": 0.5325324863906689,
+        "days": 797,
+        "estimated_monthly_pnl": 0.00668276343499142,
+        "exit_reasons": {
+          "end": 1,
+          "flat_signal": 1,
+          "signal": 6,
+          "stop": 3
+        },
+        "expectancy_pct": 0.11248112712491996,
+        "fees": 0.11459303518912772,
+        "final_equity": 15.174972485469388,
+        "floored_min_notional": 9,
+        "funding": -0.06380966846920005,
+        "losses": 4,
+        "max_drawdown_pct": 4.939636043160884,
+        "net_pnl": 0.1749724854693877,
+        "profit_factor": 1.2264537885515718,
+        "symbols": {
+          "TRXUSDT": 11
+        },
+        "total_return_pct": 1.1664832364625788,
+        "trades": 11,
+        "win_rate": 63.63636363636363,
+        "wins": 7
+      }
+    },
+    "MOM21": {
+      "checks": {
+        "at_least_15_trades": false,
+        "at_least_2_of_3_folds_positive": true,
+        "at_least_3_of_5_family_positive": true,
+        "average_winner_at_least_5c": true,
+        "drawdown_below_20pct": true,
+        "fee_net_positive": true,
+        "positive_at_10bps_side": true,
+        "profit_factor_at_least_1_20": false,
+        "sign_flip_p_at_most_0_20": false
+      },
+      "combined": {
+        "avg_loss": -0.19663734563481863,
+        "avg_win": 0.13658060969657532,
+        "blocked_min_notional": 74,
+        "cagr_pct": 0.28343683342206827,
+        "days": 797,
+        "estimated_monthly_pnl": 0.0035516265902723874,
+        "exit_reasons": {
+          "signal": 4,
+          "stop": 4
+        },
+        "expectancy_pct": 0.08593207176100646,
+        "fees": 0.057416066847495235,
+        "final_equity": 15.09299101157842,
+        "floored_min_notional": 8,
+        "funding": -0.09394556085300002,
+        "losses": 3,
+        "max_drawdown_pct": 5.271802491689109,
+        "net_pnl": 0.0929910115784196,
+        "profit_factor": 1.1576353858897133,
+        "symbols": {
+          "TRXUSDT": 8
+        },
+        "total_return_pct": 0.6199400771894625,
+        "trades": 8,
+        "win_rate": 62.5,
+        "wins": 5
+      },
+      "eligible": false,
+      "folds": [
+        {
+          "avg_loss": -0.22406754255797817,
+          "avg_win": 0.16406926259655474,
+          "blocked_min_notional": 26,
+          "cagr_pct": -1.1001893039918387,
+          "days": 265,
+          "estimated_monthly_pnl": -0.013783755788873364,
+          "exit_reasons": {
+            "end": 1,
+            "signal": 1,
+            "stop": 2
+          },
+          "expectancy_pct": -0.1875185562718577,
+          "fees": 0.02836020974934413,
+          "final_equity": 14.880003440077154,
+          "floored_min_notional": 4,
+          "funding": -0.1092617063794,
+          "losses": 2,
+          "max_drawdown_pct": 5.271802491689109,
+          "net_pnl": -0.1199965599228463,
+          "profit_factor": 0.7322312759961712,
+          "symbols": {
+            "TRXUSDT": 4
+          },
+          "total_return_pct": -0.7999770661523131,
+          "trades": 4,
+          "win_rate": 50,
+          "wins": 2
+        },
+        {
+          "avg_loss": 0,
+          "avg_win": 0.06652266291307717,
+          "blocked_min_notional": 27,
+          "cagr_pct": 1.2237148142819843,
+          "days": 265,
+          "estimated_monthly_pnl": 0.015282640445841857,
+          "exit_reasons": {
+            "signal": 1,
+            "stop": 1
+          },
+          "expectancy_pct": 0.44250550141303285,
+          "fees": 0.01439381857363407,
+          "final_equity": 15.133045325826153,
+          "floored_min_notional": 2,
+          "funding": 0.026681182065400003,
+          "losses": 0,
+          "max_drawdown_pct": 1.9128882119062802,
+          "net_pnl": 0.1330453258261528,
+          "profit_factor": null,
+          "symbols": {
+            "TRXUSDT": 2
+          },
+          "total_return_pct": 0.8869688388410291,
+          "trades": 2,
+          "win_rate": 100,
+          "wins": 2
+        },
+        {
+          "avg_loss": -0.14177695178849964,
+          "avg_win": 0.1257010094158313,
+          "blocked_min_notional": 21,
+          "cagr_pct": 1.0080060735892182,
+          "days": 265,
+          "estimated_monthly_pnl": 0.012592403927523916,
+          "exit_reasons": {
+            "signal": 2,
+            "stop": 1
+          },
+          "expectancy_pct": 0.24648393145131337,
+          "fees": 0.021855030109414655,
+          "final_equity": 15.109625067043162,
+          "floored_min_notional": 3,
+          "funding": -0.010591487725499999,
+          "losses": 1,
+          "max_drawdown_pct": 2.6489764446542865,
+          "net_pnl": 0.10962506704316155,
+          "profit_factor": 1.7732220622622759,
+          "symbols": {
+            "TRXUSDT": 3
+          },
+          "total_return_pct": 0.730833780287754,
+          "trades": 3,
+          "win_rate": 66.66666666666666,
+          "wins": 2
+        }
+      ],
+      "params": {
+        "allow_short": false,
+        "annual_vol_target": 0.5,
+        "atr_period": 20,
+        "confirmation_lookback": 0,
+        "cooldown_bars": 3,
+        "cost_bps_per_side": 7,
+        "funding_lookback_days": 0,
+        "lookback": 21,
+        "max_leverage": 1,
+        "max_trailing_funding_bps": null,
+        "rebalance_bars": 7,
+        "rebalance_offset": 0,
+        "risk_pct": 0.02,
+        "signal_threshold": 0.25,
+        "stop_atr": 3,
+        "trail_atr": 2.5,
+        "trail_start_atr": 3,
+        "vol_lookback": 20
+      },
+      "sign_flip_pvalue": 0.4385280735963202,
+      "stress": {
+        "avg_loss": -0.1996629267491931,
+        "avg_win": 0.13347458120684325,
+        "blocked_min_notional": 74,
+        "cagr_pct": 0.20852729777813828,
+        "days": 797,
+        "estimated_monthly_pnl": 0.0026118102747117447,
+        "exit_reasons": {
+          "signal": 4,
+          "stop": 4
+        },
+        "expectancy_pct": 0.06552771044905814,
+        "fees": 0.08202295263927892,
+        "final_equity": 15.068384125786638,
+        "floored_min_notional": 8,
+        "funding": -0.09394556085300002,
+        "losses": 3,
+        "max_drawdown_pct": 5.312422644511036,
+        "net_pnl": 0.068384125786638,
+        "profit_factor": 1.1141659544246751,
+        "symbols": {
+          "TRXUSDT": 8
+        },
+        "total_return_pct": 0.45589417191091997,
+        "trades": 8,
+        "win_rate": 62.5,
+        "wins": 5
+      }
+    }
+  }
+}
