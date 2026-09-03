@@ -535,3 +535,10 @@ The first 75% is development data and the final 25% is sealed. The final slice i
 - Safety evidence: 102 dispersion blocks, 256 execution-size/minimum-notional blocks, 72 daily-loss blocks, 18 daily-target blocks, 69 loss-lock hits, 16 target-lock hits, and zero exposure-overlap blocks. Live orders sent: **0**.
 
 The candidate loses before fees and after fees, so relaxing stops, costs, or admission gates would not repair it. The Railway start command was restored to the safe TSMOM validator after evidence archival on `brain-state` at `brain/XS_REVERSAL_20260903_validation_summary.json`.
+
+
+## Frozen 30d/90d funding-aware TSMOM consensus — 2026-09-03
+
+This study extends the only historically admitted strategy family without changing its default engine behaviour. The primary is long/cash, requires both 30-day and 90-day volatility-normalised momentum to be positive with the weaker score at least 0.25, reviews weekly after a completed daily close, and fills no earlier than the next daily open. It skips a long when the prior three completed UTC days of settled funding sum above 9 bps. One position maximum, DCA=0, 2% planned stop risk, 3% maximum risk only for an exchange-minimum floor, 1x maximum leverage, 3 ATR initial stop, 3 ATR trail activation, 2.5 ATR trail, 7 bps per side and exact settled funding are included; costs are stressed at 10 bps per side.
+
+The first 75% after warm-up is development data with three chronological folds. The sealed final 25% opens only if development is fee-net positive, PF >=1.20, has at least 8 trades, at least 2/3 folds and 3/5 primary-plus-neighbour rules are positive, 10-bps stress stays positive, drawdown is below 20%, CAGR is at least 3%, the independent 30-day forward mean is positive, and trade sign-flip p <=0.20. Final admission separately requires positive net, PF >=1.10, at least 3 trades, positive stress and drawdown below 20%. Failure preserves the admitted base 30-day TSMOM candidate and creates no paper/live replacement.

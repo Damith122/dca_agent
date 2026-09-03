@@ -24,6 +24,9 @@ from breakout import Candle, atr_series
 @dataclass(frozen=True)
 class TSMOMParams:
     lookback: int = 30
+    # Optional second horizon.  Zero preserves the original single-horizon
+    # rule exactly; a positive value requires both trends to agree.
+    confirmation_lookback: int = 0
     vol_lookback: int = 30
     atr_period: int = 20
     signal_threshold: float = 0.25
@@ -41,6 +44,11 @@ class TSMOMParams:
     cooldown_bars: int = 3
     cost_bps_per_side: float = 7.0
     allow_short: bool = True
+    # Optional trailing settled-funding crowding filter.  Zero days disables
+    # it, preserving the original rule.  A long is skipped when the known
+    # trailing sum exceeds the cap; shorts use the symmetric lower bound.
+    funding_lookback_days: int = 0
+    max_trailing_funding_bps: float = float("inf")
 
 
 @dataclass(frozen=True)
@@ -141,6 +149,19 @@ def momentum_score(closes: Sequence[float], i: int, p: TSMOMParams) -> float:
     return move / scale if scale > 1e-12 else float("nan")
 
 
+def _horizon_score(closes: Sequence[float], i: int, lookback: int,
+                   vol_lookback: int) -> float:
+    """Volatility-normalised score for an explicit horizon."""
+    c = np.asarray(closes, dtype=float)
+    need = max(lookback, vol_lookback)
+    if i < need or c[i] <= 0 or c[i - lookback] <= 0:
+        return float("nan")
+    move = math.log(c[i] / c[i - lookback])
+    r = np.diff(np.log(c[i - vol_lookback:i + 1]))
+    scale = float(r.std(ddof=1) * math.sqrt(lookback)) if len(r) > 1 else 0.0
+    return move / scale if scale > 1e-12 else float("nan")
+
+
 def position_leverage(price: float, atr: float, annual_vol: float,
                       p: TSMOMParams) -> float:
     """Respect both the loss-at-stop budget and the annual volatility target."""
@@ -155,17 +176,39 @@ def position_leverage(price: float, atr: float, annual_vol: float,
 
 
 def choose_target(aligned: Mapping[str, Sequence[Candle]], atrs: Mapping[str, Sequence[Optional[float]]],
-                  i: int, p: TSMOMParams) -> Optional[Target]:
+                  i: int, p: TSMOMParams, *,
+                  times: Optional[Sequence[float]] = None,
+                  funding_bps_by_day: Optional[Mapping[str, Mapping[int, float]]] = None
+                  ) -> Optional[Target]:
     """Pick the strongest absolute trend; at most one position is allowed."""
     choices: List[Target] = []
     for symbol, candles in aligned.items():
         closes = [c.close for c in candles]
         score = momentum_score(closes, i, p)
+        if p.confirmation_lookback > 0:
+            confirmation = _horizon_score(
+                closes, i, p.confirmation_lookback, p.vol_lookback)
+            if (not math.isfinite(confirmation) or score * confirmation <= 0):
+                continue
+            # Rank on the weaker of the two agreeing signals so one extreme
+            # horizon cannot hide a marginal confirmation horizon.
+            score = math.copysign(min(abs(score), abs(confirmation)), score)
         atr = atrs[symbol][i] if i < len(atrs[symbol]) else None
         if not math.isfinite(score) or atr is None or atr <= 0:
             continue
         if abs(score) < p.signal_threshold or (score < 0 and not p.allow_short):
             continue
+        if (p.funding_lookback_days > 0 and times is not None
+                and i < len(times)):
+            day = int(times[i] // 86400 * 86400)
+            known = funding_bps_by_day or {}
+            trailing = sum(float(known.get(symbol, {}).get(
+                day - lag * 86400, 0.0))
+                for lag in range(p.funding_lookback_days))
+            cap = p.max_trailing_funding_bps
+            if ((score > 0 and trailing > cap)
+                    or (score < 0 and trailing < -cap)):
+                continue
         ann = _annual_vol(np.asarray(closes), i, p.vol_lookback)
         lev = position_leverage(candles[i].close, float(atr), ann, p)
         if lev > 0:
@@ -377,7 +420,9 @@ def run(series: Mapping[str, Sequence[Candle]],
         day_number = int(ts // 86400)
         if (i + 1 < end and active and
                 day_number % cadence == p.rebalance_offset % cadence):
-            pending = choose_target(aligned, atrs, i, p)
+            pending = choose_target(
+                aligned, atrs, i, p, times=times,
+                funding_bps_by_day=funding)
             pending_ready = True
 
     estimated_exit_fee = 0.0

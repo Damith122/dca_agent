@@ -32,6 +32,7 @@ MODULES = [
     "htf_breakout.py", "backtest_htf_breakout.py",
     "mtf_continuation.py", "backtest_mtf_continuation.py",
     "xs_reversal.py", "backtest_xs_reversal.py",
+    "backtest_tsmom_consensus.py",
 ]
 
 passed = failed = 0

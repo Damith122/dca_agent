@@ -2,8 +2,9 @@ import math
 import unittest
 
 import backtest_breakout
-from breakout import Candle
-from tsmom import TSMOMParams, momentum_score, position_leverage, run, stats
+from breakout import Candle, atr_series
+from tsmom import (TSMOMParams, align_candles, choose_target, momentum_score,
+                   position_leverage, run, stats)
 
 
 def bars(closes, *, opens=None, lows=None, highs=None):
@@ -24,6 +25,47 @@ class TSMOMTests(unittest.TestCase):
         before = momentum_score(a, 5, p)
         a[6] = 10000
         self.assertEqual(before, momentum_score(a, 5, p))
+
+    def test_confirmation_horizon_must_agree(self):
+        # The last 30 days rise, but the full 90-day move remains negative.
+        closes = ([200.0 - i * (100.0 / 60.0) for i in range(61)]
+                  + [100.0 + i for i in range(1, 31)])
+        panel = {"SOLUSDT": bars(closes)}
+        _, aligned = align_candles(panel)
+        atrs = {symbol: atr_series(rows, 5)
+                for symbol, rows in aligned.items()}
+        single = TSMOMParams(lookback=30, confirmation_lookback=0,
+                             vol_lookback=30, atr_period=5,
+                             signal_threshold=0.0, allow_short=False)
+        consensus = TSMOMParams(lookback=30, confirmation_lookback=90,
+                                vol_lookback=30, atr_period=5,
+                                signal_threshold=0.0, allow_short=False)
+        self.assertIsNotNone(choose_target(aligned, atrs, 90, single))
+        self.assertIsNone(choose_target(aligned, atrs, 90, consensus))
+
+    def test_known_trailing_funding_can_block_crowded_long(self):
+        closes = [100.0 + i * 0.5 + (0.1 if i % 2 else -0.1)
+                  for i in range(50)]
+        panel = {"SOLUSDT": bars(closes)}
+        times, aligned = align_candles(panel)
+        atrs = {symbol: atr_series(rows, 5)
+                for symbol, rows in aligned.items()}
+        p = TSMOMParams(lookback=5, confirmation_lookback=10,
+                        vol_lookback=5, atr_period=5,
+                        signal_threshold=0.0, allow_short=False,
+                        funding_lookback_days=3,
+                        max_trailing_funding_bps=9.0)
+        day = int(times[40])
+        acceptable = {"SOLUSDT": {day: 2.0, day - 86400: 2.0,
+                                   day - 2 * 86400: 2.0}}
+        crowded = {"SOLUSDT": {day: 4.0, day - 86400: 4.0,
+                                day - 2 * 86400: 4.0}}
+        self.assertIsNotNone(choose_target(
+            aligned, atrs, 40, p, times=times,
+            funding_bps_by_day=acceptable))
+        self.assertIsNone(choose_target(
+            aligned, atrs, 40, p, times=times,
+            funding_bps_by_day=crowded))
 
     def test_position_size_respects_both_caps(self):
         p = TSMOMParams(risk_pct=0.02, stop_atr=2.0,
