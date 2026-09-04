@@ -1,0 +1,32 @@
+{
+  "blocked_min_notional": 0,
+  "closed_trades": 0,
+  "estimated_final_equity": 15.0,
+  "estimated_total_fee_net_pnl": 0.0,
+  "exit_reasons": {},
+  "floored_min_notional": 0,
+  "live_orders_sent": 0,
+  "losses": 0,
+  "max_drawdown_pct": 0.0,
+  "namespace": "TSMOM_FORWARD_20260903",
+  "open_position": null,
+  "open_position_fee_net_estimate": 0.0,
+  "realized_fee_net_pnl": 0,
+  "realized_fees": 0.0,
+  "realized_funding": 0.0,
+  "schema": 1,
+  "simulation_only": true,
+  "start_utc": "2026-09-02T00:00:00+00:00",
+  "starting_equity": 15.0,
+  "strategy": "tsmom_30d_long_cash",
+  "symbols": [
+    "SOLUSDT",
+    "SUIUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "TRXUSDT",
+    "DOGEUSDT"
+  ],
+  "through_completed_candle_utc": "2026-09-03T00:00:00+00:00",
+  "wins": 0
+}
