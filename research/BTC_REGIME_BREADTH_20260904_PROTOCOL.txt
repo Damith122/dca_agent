@@ -1,0 +1,2 @@
+Research-only protocol frozen before result inspection.
+Primary: admitted 30-day long/cash TSMOM, weekly completed-close review and next-open fill; BTC must have two consecutive non-negative 28-day return blocks and at least 4 of SOL/SUI/BNB/XRP/TRX/DOGE must have positive 30-day raw returns. Regime-off means cash. Base sizing/stops/trail/funding/costs unchanged. Development 75%; sealed final 25% opens only if all predeclared development gates pass. Live orders forbidden.
