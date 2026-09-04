@@ -9,17 +9,13 @@
     "caveat": "Spot and perpetual are implementations of the same signal family, not two independent edges. Historical admission is not forward/live proof or a profit guarantee."
   },
   "admitted_paper_variants": [
-    {
-      "strategy": "30-day long/cash TSMOM on USD-M perpetuals",
-      "status": "forward paper running",
-      "evidence": "brain/TSMOM_FORWARD_20260903_tsmom_paper_summary.json"
-    },
-    {
-      "strategy": "30-day long/cash TSMOM on spot",
-      "status": "historically admitted for paper observation; no spot runner deployed",
-      "reason": "Matched-date development and sealed final were positive, robust to 15 bps/side spot cost stress.",
-      "evidence": "brain/SPOT_PERP_20260904_validation_summary.json"
-    }
+    {"strategy":"30-day long/cash TSMOM on USD-M perpetuals","status":"forward paper running","evidence":"brain/TSMOM_FORWARD_20260903_tsmom_paper_summary.json"},
+    {"strategy":"30-day long/cash TSMOM on spot","status":"historically admitted for paper observation; no spot runner deployed","reason":"Matched-date development and sealed final were positive, robust to 15 bps/side spot cost stress.","evidence":"brain/SPOT_PERP_20260904_validation_summary.json"}
+  ],
+  "watchlist_not_admitted": [
+    {"strategy":"BTC 1h shock -> highest-beta alt 4h lead-lag","reason":"476 dev events averaged +14.19 bps after 14-bps RT; all three folds and all neighbours positive; 20-bps stress +8.19 bps. But t=1.39 and one-sided p=0.082 failed preregistered evidence gates; final remains sealed.","evidence":"brain/BTC_LEAD_LAG_20260904_validation_summary.json"},
+    {"strategy":"broad-spot smooth-path continuation proxy","reason":"135 dev trades averaged +190.18 bps after 24-bps RT; 2/3 folds and all neighbours positive; stress +184.18 bps. But t=1.15 and p=0.125 failed evidence gates; final remains sealed.","evidence":"brain/BROAD_SPOT_PATH_20260904_validation_summary.json"},
+    {"strategy":"broad-spot 3-week cross-sectional momentum","reason":"164 dev trades averaged +133.90 bps after 24-bps RT; all lookback neighbours and stress positive, 2/3 folds positive. But t=0.95 and p=0.171 failed evidence gates; final remains sealed.","evidence":"brain/BROAD_SPOT_XS_MOMENTUM_20260904_validation_summary.json"}
   ],
   "constraints": {
     "starting_equity_usd": 15,
@@ -53,32 +49,36 @@
     {"strategy":"daily Donchian profit trail","reason":"Inner validation stress -$0.858; outer final sealed","evidence":"brain/DAILY_TRAIL_20260903_validation_summary.json"},
     {"strategy":"4H long-only boosted-tree screen","reason":"1110 OOS signals, all six symbols negative, PF 0.674","evidence":"brain/ML_4H_SCREEN_20260903_validation_summary.json"},
     {"strategy":"7/14/21-day long-only TSMOM","reason":"Positive but too few trades and statistically weak; all executable trades concentrated in TRX","evidence":"brain/SHORT_TSMOM_20260903_validation_summary.json"},
-    {"strategy":"BTC regime + six-coin breadth overlay","reason":"Positive development but only 2 executable trades, CAGR 1.09%, sign-flip p=0.240; final remained sealed.","evidence":"brain/TSMOM_REGIME_BREADTH_20260904_validation_summary.json"},
-    {"strategy":"volatility-managed dual momentum","reason":"Development -$0.0027, PF 0.993, 10-bps stress negative and sign-flip p=0.511; final remained sealed.","evidence":"brain/DUAL_MOMENTUM_20260904_validation_summary.json"},
-    {"strategy":"trend + funding-crowding ensemble","reason":"Strong aggregate development (+$1.3171, PF 2.52) but only 1/3 chronological folds was positive; final remained sealed.","evidence":"brain/TREND_FUNDING_20260904_validation_summary.json"},
-    {"strategy":"trend-conditioned pullback reversion","reason":"The frozen $15 execution/risk constraints blocked 19 minimum-notional entries and left zero executable trades; all neighbours also had zero trades.","evidence":"brain/PULLBACK_REVERSION_20260904_validation_summary.json"},
-    {"strategy":"negative-funding selloff rebound","reason":"Development passed strongly (+$1.8490, PF 1.77, CAGR 4.96%, 2/3 folds, p=0.126) but sealed final collapsed to +$0.0033, PF 1.004 and negative 10-bps stress.","evidence":"brain/FUNDING_REBOUND_20260904_validation_summary.json"},
-    {"strategy":"volatility-compression breakout","reason":"Development +$0.2073 but PF 1.028, CAGR 0.63%, only 1/3 folds positive and sign-flip p=0.464; final remained sealed.","evidence":"brain/VOL_COMPRESSION_20260904_validation_summary.json"},
-    {"strategy":"abnormal one-day continuation","reason":"88 development trades lost $2.6639, PF 0.564, CAGR -7.69%, stress -$2.9648 and only 1/3 folds positive; final remained sealed.","evidence":"brain/ABNORMAL_DAILY_20260904_validation_summary.json"},
-    {"strategy":"abnormal one-day reversal (secondary paired hypothesis)","reason":"98 development trades lost $0.4633, PF 0.922, stress negative and sign-flip p=0.618 despite 2/3 positive folds; final remained sealed.","evidence":"brain/ABNORMAL_REVERSAL_20260904_validation_summary.json"},
-    {"strategy":"1h shock to 4h continuation raw screen","reason":"1295 development events averaged -1.10 bps after 14-bps round-trip cost; stress mean -7.10 bps, t=-0.24, p=0.587 and all neighbour rules were negative; no execution engine built and final remained sealed.","evidence":"brain/HOURLY_SHOCK_20260904_validation_summary.json"}
+    {"strategy":"BTC regime + six-coin breadth overlay","reason":"Positive development but only 2 executable trades, CAGR 1.09%, p=0.240; final remained sealed.","evidence":"brain/TSMOM_REGIME_BREADTH_20260904_validation_summary.json"},
+    {"strategy":"volatility-managed dual momentum","reason":"Development -$0.0027, PF 0.993, 10-bps stress negative and p=0.511; final remained sealed.","evidence":"brain/DUAL_MOMENTUM_20260904_validation_summary.json"},
+    {"strategy":"trend + funding-crowding ensemble","reason":"Strong aggregate development (+$1.3171, PF 2.52) but only 1/3 chronological folds positive; final remained sealed.","evidence":"brain/TREND_FUNDING_20260904_validation_summary.json"},
+    {"strategy":"trend-conditioned pullback reversion","reason":"Frozen $15 risk/minimum constraints left zero executable trades.","evidence":"brain/PULLBACK_REVERSION_20260904_validation_summary.json"},
+    {"strategy":"negative-funding selloff rebound","reason":"Development passed strongly (+$1.8490, PF 1.77, CAGR 4.96%, 2/3 folds) but sealed final collapsed to +$0.0033, PF 1.004 and negative stress.","evidence":"brain/FUNDING_REBOUND_20260904_validation_summary.json"},
+    {"strategy":"volatility-compression breakout","reason":"Development +$0.2073 but PF 1.028, CAGR 0.63%, only 1/3 folds positive and p=0.464; final sealed.","evidence":"brain/VOL_COMPRESSION_20260904_validation_summary.json"},
+    {"strategy":"abnormal one-day continuation","reason":"88 development trades lost $2.6639, PF 0.564, CAGR -7.69%, stress -$2.9648; final sealed.","evidence":"brain/ABNORMAL_DAILY_20260904_validation_summary.json"},
+    {"strategy":"abnormal one-day reversal","reason":"98 development trades lost $0.4633, PF 0.922 and stress negative; final sealed.","evidence":"brain/ABNORMAL_REVERSAL_20260904_validation_summary.json"},
+    {"strategy":"1h shock to 4h continuation","reason":"1295 events averaged -1.10 bps after base cost and -7.10 bps under stress; final sealed.","evidence":"brain/HOURLY_SHOCK_20260904_validation_summary.json"},
+    {"strategy":"BTC-residual cross-sectional daily reversal","reason":"240 events averaged -87.27 bps after cost; all three folds and stress negative; final sealed.","evidence":"brain/RESIDUAL_REVERSAL_20260904_validation_summary.json"},
+    {"strategy":"6-perp 8-week high-vol loser reversal","reason":"56 dev trades averaged -3.86 bps, only 1/3 folds positive and stress negative; final sealed.","evidence":"brain/WEEKLY_LOSER_REVERSAL_20260904_validation_summary.json"},
+    {"strategy":"6-perp smooth-path continuation proxy","reason":"All development gates passed strongly (91 trades, +533 bps mean, t=3.40), but sealed final reversed to -178 bps mean and -46.38% summed trade returns; stress final also negative.","evidence":"brain/PATH_CONTINUITY_20260904_validation_summary.json"},
+    {"strategy":"15-major broad-spot 8-week high-vol loser reversal","reason":"105 dev trades averaged -98.52 bps, only 1/3 folds positive and stress negative; final sealed.","evidence":"brain/BROAD_SPOT_REVERSAL_20260904_validation_summary.json"},
+    {"strategy":"walk-forward hourly statistical-arbitrage pairs","reason":"Across 15 pairs only 4 pooled OOS trades survived; 0% win, -175.59 bps expectancy, t=-1.47, synthetic null p=0.709; not tradeable.","evidence":"brain/STAT_ARB_PUBLIC_20260904_validation_summary.json"}
   ],
   "research_rules": [
     "Test one genuinely distinct pre-registered family per research iteration.",
-    "Use completed candles, next-open fills, pessimistic intrabar ordering and gap-through-stop prices.",
+    "Use completed candles and next-open fills; never use future information.",
     "Use development selection, chronological folds, cost stress and one sealed final evaluation.",
     "Correct for multiple testing; never tune on the sealed final.",
-    "Reject a signal screen before building execution code when raw cost-adjusted expectancy is negative.",
-    "Do not infer monthly profit from a small sample.",
+    "Reject a signal screen before building execution code when raw cost-adjusted expectancy is negative or evidence gates fail.",
+    "Do not optimize to a requested monthly profit target or infer monthly profit from a small sample.",
     "A pass permits paper validation only; live requires separate explicit approval."
   ],
   "next_queue": [
-    "Keep the admitted perpetual 30-day TSMOM forward paper settings frozen and collect real forward evidence.",
-    "Investigate the recently documented quarter-hour crypto-futures microstructure effect only if public trade-level data can support a realistic out-of-sample, fee-aware test; do not substitute coarse candles and call it replication.",
-    "Screen a BTC-market-residual or cross-asset lead-lag event rule as a genuinely different mechanism; reject before execution code if cost-adjusted forward expectancy is not positive.",
-    "Revisit walk-forward statistical-arbitrage pairs only with exact funding, current minimums and a matched random-walk false-positive control.",
-    "Treat scheduled FOMC/NYSE-open effects primarily as risk/liquidity hypotheses unless a separately pre-registered directional rule shows out-of-sample net expectancy.",
-    "Do not retune any rejected rule on opened sealed data; any revisit requires new future data or a genuinely new mechanism.",
-    "Construct a portfolio ensemble only after a second independently admitted, low-correlation edge exists."
+    "Keep admitted perpetual 30-day TSMOM forward paper settings frozen and collect real forward evidence.",
+    "Do not open the sealed final for BTC lead-lag, broad-spot path continuity, or broad-spot 3-week momentum; gather genuinely new future data or preregister a structurally independent mechanism before revisiting.",
+    "Investigate quarter-hour crypto-futures microstructure only if public trade-level data can support realistic fee-aware out-of-sample testing; never substitute coarse candles and call it replication.",
+    "Test simple volume/flow-confirmed trend mechanisms, basis/funding dislocations, and event-conditioned risk premia only with decision-time features and strict costs.",
+    "Do not retune any rejected rule on opened sealed data.",
+    "Construct a portfolio ensemble only after a second independently admitted low-correlation edge exists."
   ]
 }
