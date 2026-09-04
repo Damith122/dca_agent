@@ -1,0 +1,50 @@
+{
+  "strategy": "broad_spot_low_vol_60d_hold28",
+  "date_utc": "2026-09-04",
+  "status": "REJECTED_NOT_ADMITTED",
+  "source_hypothesis": "2026 low-volatility anomaly literature; fixed broad Binance spot major implementation",
+  "implementation": {
+    "symbols": 15,
+    "formation_days": 60,
+    "holding_days": 28,
+    "direction": "long-only lowest realized-volatility asset",
+    "base_round_trip_cost_bps": 24,
+    "stress_round_trip_cost_bps": 30,
+    "split": "development 75% / sealed final 25%"
+  },
+  "development": {
+    "trades": 46,
+    "mean_bps": 216.10434858694572,
+    "median_bps": 143.74725559413173,
+    "positive_pct": 56.52173913043478,
+    "profit_factor": 1.5428917897669538,
+    "t_stat": 1.004330858387833,
+    "one_sided_p": 0.15760958222438481,
+    "sum_return_pct_noncompounded": 99.40800034999504
+  },
+  "stress": {
+    "mean_bps": 210.10434858694572,
+    "profit_factor": 1.524382206166122,
+    "t_stat": 0.9764462499117451,
+    "one_sided_p": 0.16442168582603955
+  },
+  "folds": [
+    {"mean_bps": -218.0869015491374, "profit_factor": 0.6913341818321616},
+    {"mean_bps": 340.53948060291367, "profit_factor": 1.745344996256448},
+    {"mean_bps": 1017.9472173573714, "profit_factor": 6.127077361456977}
+  ],
+  "robustness": {
+    "formation_30d_mean_bps": 287.72320758855005,
+    "formation_90d_mean_bps": 119.6052428455907,
+    "hold_14d_mean_bps": 59.854538726693114,
+    "hold_42d_mean_bps": 590.9072849507066,
+    "all_five_rules_positive": true
+  },
+  "failed_gates": [
+    "development_t_at_least_1_8",
+    "p_at_most_0_05"
+  ],
+  "sealed_final_opened": false,
+  "live_orders_sent": 0,
+  "caveat": "Fixed current-liquid major universe has survivorship bias. Positive development is not sufficient evidence for admission."
+}
