@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "strategy": "abnormal_daily_reversal_secondary",
+  "date_utc": "2026-09-04",
+  "status": "rejected",
+  "secondary_hypothesis": true,
+  "development_passed": false,
+  "sealed_final_opened": false,
+  "passed": false,
+  "development": {
+    "net_pnl": -0.4632647576537092,
+    "profit_factor": 0.9216117236316833,
+    "cagr_pct": -1.2754865325019904,
+    "max_drawdown_pct": 15.878895257696405,
+    "trades": 98,
+    "win_rate_pct": 56.1
+  },
+  "stress_10bps_side_net_pnl": -0.33739756145055466,
+  "sign_flip_p": 0.6175956010997251,
+  "positive_folds": 2,
+  "positive_rules": 1,
+  "reason": "Opposite-direction response to large one-day abnormal moves also failed profitability, robustness and statistical gates. Stricter secondary-hypothesis thresholds were not approached; final remained sealed.",
+  "live_orders_sent": 0,
+  "research_only": true
+}
