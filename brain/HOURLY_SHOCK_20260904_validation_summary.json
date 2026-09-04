@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "strategy": "hourly_shock_4h_continuation_screen",
+  "date_utc": "2026-09-04",
+  "status": "rejected_raw_screen",
+  "development_passed": false,
+  "sealed_final_opened": false,
+  "passed": false,
+  "development": {
+    "events": 1295,
+    "mean_bps_after_14bps_round_trip_cost": -1.1049586233678828,
+    "median_bps": -10.116832686140391,
+    "positive_pct": 45.79150579150579,
+    "t_stat": -0.2356807901002628,
+    "sign_flip_p": 0.5873531617095726,
+    "sum_return_pct": -14.309214172614082
+  },
+  "stress_20bps_round_trip": {
+    "mean_bps": -7.104958623367888,
+    "t_stat": -1.515443408080914,
+    "sum_return_pct": -92.00921417261415
+  },
+  "positive_folds": 2,
+  "positive_rules": 0,
+  "reason": "The literature-motivated one-hour shock to four-hour continuation screen had abundant events but no positive fee-adjusted expectancy; all neighbour rules were negative and the sealed final remained unopened.",
+  "live_orders_sent": 0,
+  "raw_screen_only": true,
+  "research_only": true
+}
