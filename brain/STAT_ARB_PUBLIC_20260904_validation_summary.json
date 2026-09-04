@@ -1,0 +1,14 @@
+{
+  "strategy": "public_walk_forward_stat_arb_raw_screen",
+  "status": "REJECTED",
+  "universe": ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","DOGEUSDT"],
+  "history_months": 18,
+  "fee_bps_per_leg_round_trip": 14,
+  "pairs_tested": 15,
+  "pooled_oos": {"trades": 4, "win_rate_pct": 0.0, "expectancy_bps": -175.59, "total_bps": -702, "t_stat": -1.47},
+  "null_control": {"universes": 100, "p_value": 0.709, "null_t_95th": 1.98},
+  "required_t_hurdle": 4.71,
+  "passed": false,
+  "note": "Almost no pair survived OOS cointegration; do not build exact-funding execution version.",
+  "live_orders_sent": 0
+}
