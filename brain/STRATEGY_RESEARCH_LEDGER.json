@@ -15,7 +15,8 @@
   "watchlist_not_admitted": [
     {"strategy":"BTC 1h shock -> highest-beta alt 4h lead-lag","reason":"476 dev events averaged +14.19 bps after 14-bps RT; all three folds and all neighbours positive; 20-bps stress +8.19 bps. But t=1.39 and one-sided p=0.082 failed preregistered evidence gates; final remains sealed.","evidence":"brain/BTC_LEAD_LAG_20260904_validation_summary.json"},
     {"strategy":"broad-spot smooth-path continuation proxy","reason":"135 dev trades averaged +190.18 bps after 24-bps RT; 2/3 folds and all neighbours positive; stress +184.18 bps. But t=1.15 and p=0.125 failed evidence gates; final remains sealed.","evidence":"brain/BROAD_SPOT_PATH_20260904_validation_summary.json"},
-    {"strategy":"broad-spot 3-week cross-sectional momentum","reason":"164 dev trades averaged +133.90 bps after 24-bps RT; all lookback neighbours and stress positive, 2/3 folds positive. But t=0.95 and p=0.171 failed evidence gates; final remains sealed.","evidence":"brain/BROAD_SPOT_XS_MOMENTUM_20260904_validation_summary.json"}
+    {"strategy":"broad-spot 3-week cross-sectional momentum","reason":"164 dev trades averaged +133.90 bps after 24-bps RT; all lookback neighbours and stress positive, 2/3 folds positive. But t=0.95 and p=0.171 failed evidence gates; final remains sealed.","evidence":"brain/BROAD_SPOT_XS_MOMENTUM_20260904_validation_summary.json"},
+    {"strategy":"broad-spot low-volatility anomaly, 60d formation / 28d hold","reason":"46 dev trades averaged +216.10 bps after 24-bps RT, PF 1.54; 2/3 folds, all five preregistered rules and 30-bps stress were positive. But t=1.00 and p=0.158 failed evidence gates; final remains sealed.","evidence":"brain/LOW_VOL_20260904_validation_summary.json"}
   ],
   "constraints": {
     "starting_equity_usd": 15,
@@ -75,7 +76,7 @@
   ],
   "next_queue": [
     "Keep admitted perpetual 30-day TSMOM forward paper settings frozen and collect real forward evidence.",
-    "Do not open the sealed final for BTC lead-lag, broad-spot path continuity, or broad-spot 3-week momentum; gather genuinely new future data or preregister a structurally independent mechanism before revisiting.",
+    "Do not open the sealed final for BTC lead-lag, broad-spot path continuity, broad-spot 3-week momentum, or broad-spot low-volatility; gather genuinely new future data or preregister a structurally independent mechanism before revisiting.",
     "Investigate quarter-hour crypto-futures microstructure only if public trade-level data can support realistic fee-aware out-of-sample testing; never substitute coarse candles and call it replication.",
     "Test simple volume/flow-confirmed trend mechanisms, basis/funding dislocations, and event-conditioned risk premia only with decision-time features and strict costs.",
     "Do not retune any rejected rule on opened sealed data.",
