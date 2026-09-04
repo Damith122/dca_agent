@@ -1,0 +1,15 @@
+{
+  "strategy": "broad_spot_smooth_path_continuation_proxy",
+  "status": "REJECTED_WATCHLIST",
+  "universe": "15 fixed current-liquid USDT spot majors",
+  "aligned_daily_bars": 1826,
+  "development": {"n": 135, "mean_bps": 190.1840, "median_bps": -118.3227, "t_stat": 1.1496, "p_one_sided": 0.12514, "sum_return_pct": 256.7484},
+  "fold_mean_bps": [-202.1942, 316.4494, 288.5201],
+  "stress": {"round_trip_bps": 30, "mean_bps": 184.1840},
+  "development_passed": false,
+  "sealed_final_opened": false,
+  "failed_gates": ["development_t_at_least_1_8", "p_at_most_0_05"],
+  "note": "Positive and robust to costs but too noisy for admission; final remains sealed.",
+  "survivorship_caveat": true,
+  "live_orders_sent": 0
+}
