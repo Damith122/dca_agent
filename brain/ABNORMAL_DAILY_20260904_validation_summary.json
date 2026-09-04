@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "strategy": "abnormal_daily_continuation",
+  "date_utc": "2026-09-04",
+  "status": "rejected",
+  "development_passed": false,
+  "sealed_final_opened": false,
+  "passed": false,
+  "development": {
+    "net_pnl": -2.66389905197064,
+    "profit_factor": 0.5635922084570815,
+    "cagr_pct": -7.688869700712164,
+    "max_drawdown_pct": 18.42578596242827,
+    "trades": 88,
+    "win_rate_pct": 38.6
+  },
+  "stress_10bps_side_net_pnl": -2.9647805024234515,
+  "sign_flip_p": 0.9695076230942264,
+  "positive_folds": 1,
+  "positive_rules": 0,
+  "reason": "Large one-day move continuation was strongly fee/funding-net negative across the development sample and robustness checks. Final 25% remained sealed.",
+  "live_orders_sent": 0,
+  "research_only": true
+}
