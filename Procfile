@@ -1,1 +1,1 @@
-worker: python -u backtest_funding.py --symbols BTCUSDT,ETHUSDT,SOLUSDT,SUIUSDT --months 12 --spot-bps 7.5 --perp-bps 2
+worker: python -u backtest_tsmom_regime_breadth.py --months 48 --starting-equity 15
