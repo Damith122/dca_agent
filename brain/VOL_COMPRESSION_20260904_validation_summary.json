@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "strategy": "volatility_compression_breakout",
+  "date_utc": "2026-09-04",
+  "status": "rejected_development",
+  "development": {
+    "trades": 30,
+    "net_pnl_usd": 0.2072496546260485,
+    "profit_factor": 1.028240020172183,
+    "cagr_pct": 0.6272465645580372,
+    "max_drawdown_pct": 18.92066918064871,
+    "positive_folds": 1,
+    "positive_rules": 4,
+    "stress_net_pnl_usd": 0.09718952352478816,
+    "sign_flip_p": 0.4636340914771307
+  },
+  "sealed_final": {"opened": false},
+  "reason": "Development was only weakly profitable, with PF near 1, CAGR below the hurdle, only one positive chronological fold and weak sign-flip evidence. Sealed final 25% remained unopened.",
+  "live_orders_sent": 0
+}
