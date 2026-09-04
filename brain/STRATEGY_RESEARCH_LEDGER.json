@@ -58,7 +58,10 @@
     {"strategy":"trend + funding-crowding ensemble","reason":"Strong aggregate development (+$1.3171, PF 2.52) but only 1/3 chronological folds was positive; final remained sealed.","evidence":"brain/TREND_FUNDING_20260904_validation_summary.json"},
     {"strategy":"trend-conditioned pullback reversion","reason":"The frozen $15 execution/risk constraints blocked 19 minimum-notional entries and left zero executable trades; all neighbours also had zero trades.","evidence":"brain/PULLBACK_REVERSION_20260904_validation_summary.json"},
     {"strategy":"negative-funding selloff rebound","reason":"Development passed strongly (+$1.8490, PF 1.77, CAGR 4.96%, 2/3 folds, p=0.126) but sealed final collapsed to +$0.0033, PF 1.004 and negative 10-bps stress.","evidence":"brain/FUNDING_REBOUND_20260904_validation_summary.json"},
-    {"strategy":"volatility-compression breakout","reason":"Development +$0.2073 but PF 1.028, CAGR 0.63%, only 1/3 folds positive and sign-flip p=0.464; final remained sealed.","evidence":"brain/VOL_COMPRESSION_20260904_validation_summary.json"}
+    {"strategy":"volatility-compression breakout","reason":"Development +$0.2073 but PF 1.028, CAGR 0.63%, only 1/3 folds positive and sign-flip p=0.464; final remained sealed.","evidence":"brain/VOL_COMPRESSION_20260904_validation_summary.json"},
+    {"strategy":"abnormal one-day continuation","reason":"88 development trades lost $2.6639, PF 0.564, CAGR -7.69%, stress -$2.9648 and only 1/3 folds positive; final remained sealed.","evidence":"brain/ABNORMAL_DAILY_20260904_validation_summary.json"},
+    {"strategy":"abnormal one-day reversal (secondary paired hypothesis)","reason":"98 development trades lost $0.4633, PF 0.922, stress negative and sign-flip p=0.618 despite 2/3 positive folds; final remained sealed.","evidence":"brain/ABNORMAL_REVERSAL_20260904_validation_summary.json"},
+    {"strategy":"1h shock to 4h continuation raw screen","reason":"1295 development events averaged -1.10 bps after 14-bps round-trip cost; stress mean -7.10 bps, t=-0.24, p=0.587 and all neighbour rules were negative; no execution engine built and final remained sealed.","evidence":"brain/HOURLY_SHOCK_20260904_validation_summary.json"}
   ],
   "research_rules": [
     "Test one genuinely distinct pre-registered family per research iteration.",
@@ -72,9 +75,10 @@
   "next_queue": [
     "Keep the admitted perpetual 30-day TSMOM forward paper settings frozen and collect real forward evidence.",
     "Investigate the recently documented quarter-hour crypto-futures microstructure effect only if public trade-level data can support a realistic out-of-sample, fee-aware test; do not substitute coarse candles and call it replication.",
-    "Screen hourly return autocorrelation/continuation as a distinct short-horizon hypothesis before building execution logic; require raw forward edge to clear realistic round-trip costs.",
+    "Screen a BTC-market-residual or cross-asset lead-lag event rule as a genuinely different mechanism; reject before execution code if cost-adjusted forward expectancy is not positive.",
     "Revisit walk-forward statistical-arbitrage pairs only with exact funding, current minimums and a matched random-walk false-positive control.",
-    "Do not retune the rejected funding-rebound rule on its opened sealed final; any revisit requires new future data or a genuinely new pre-registered mechanism.",
+    "Treat scheduled FOMC/NYSE-open effects primarily as risk/liquidity hypotheses unless a separately pre-registered directional rule shows out-of-sample net expectancy.",
+    "Do not retune any rejected rule on opened sealed data; any revisit requires new future data or a genuinely new mechanism.",
     "Construct a portfolio ensemble only after a second independently admitted, low-correlation edge exists."
   ]
 }
