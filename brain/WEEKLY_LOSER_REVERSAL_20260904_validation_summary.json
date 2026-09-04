@@ -1,0 +1,11 @@
+{
+  "strategy": "weekly_high_vol_loser_reversal_56d_long_only",
+  "status": "REJECTED",
+  "development": {"n": 56, "mean_bps": -3.8631, "t_stat": -0.0200, "p_one_sided": 0.50799, "sum_return_pct": -2.1633},
+  "fold_mean_bps": [-208.6327, -102.3225, 154.7485],
+  "stress": {"round_trip_bps": 20, "mean_bps": -9.8631},
+  "development_passed": false,
+  "sealed_final_opened": false,
+  "note": "Literature-motivated 8-week loser reversal did not replicate in six-liquid-perp implementation.",
+  "live_orders_sent": 0
+}
