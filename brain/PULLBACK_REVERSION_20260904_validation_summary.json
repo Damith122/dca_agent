@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "strategy": "trend_conditioned_pullback_reversion",
+  "date_utc": "2026-09-04",
+  "status": "rejected_development",
+  "development": {
+    "trades": 0,
+    "net_pnl_usd": 0.0,
+    "profit_factor": null,
+    "cagr_pct": 0.0,
+    "max_drawdown_pct": 0.0,
+    "blocked_min_notional": 19
+  },
+  "reason": "Signals could not be executed inside the frozen $15 wallet, <=1x leverage, 2% planned risk and <=3% minimum-order floor-risk constraints. Primary and all neighbours produced zero executable trades; sealed final 25% remained unopened.",
+  "live_orders_sent": 0
+}
