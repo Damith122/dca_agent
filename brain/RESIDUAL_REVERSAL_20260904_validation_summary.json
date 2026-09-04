@@ -1,0 +1,10 @@
+{
+  "strategy": "btc_residual_cross_sectional_reversal_raw_screen",
+  "status": "REJECTED",
+  "development": {"n": 240, "mean_bps": -87.2716, "median_bps": 1.9113, "t_stat": -2.4866, "p_one_sided": 0.99355, "sum_return_pct": -209.4518},
+  "fold_mean_bps": [-72.9566, -164.5096, -14.5625],
+  "stress": {"round_trip_bps": 20, "mean_bps": -93.2716, "sum_return_pct": -223.8518},
+  "development_passed": false,
+  "sealed_final_opened": false,
+  "live_orders_sent": 0
+}
