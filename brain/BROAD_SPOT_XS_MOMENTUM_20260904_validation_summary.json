@@ -1,0 +1,15 @@
+{
+  "strategy": "broad_spot_cross_sectional_momentum_21d",
+  "status": "REJECTED_WATCHLIST",
+  "universe": "15 fixed current-liquid USDT spot majors",
+  "aligned_daily_bars": 1826,
+  "development": {"n": 164, "mean_bps": 133.9001, "median_bps": -142.4627, "t_stat": 0.9489, "p_one_sided": 0.17134, "sum_return_pct": 219.5962},
+  "fold_mean_bps": [-91.4446, 270.5651, 171.8775],
+  "stress": {"round_trip_bps": 30, "mean_bps": 127.9001},
+  "development_passed": false,
+  "sealed_final_opened": false,
+  "failed_gates": ["development_t_at_least_1_8", "p_at_most_0_05"],
+  "note": "Positive across all nearby lookbacks and stress but statistically weak; final remains sealed.",
+  "survivorship_caveat": true,
+  "live_orders_sent": 0
+}
