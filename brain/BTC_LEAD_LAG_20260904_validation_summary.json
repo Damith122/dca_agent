@@ -1,0 +1,12 @@
+{
+  "strategy": "btc_lead_lag_high_beta_alt_raw_screen",
+  "status": "REJECTED_WATCHLIST",
+  "development": {"n": 476, "mean_bps": 14.1869, "median_bps": 4.4363, "t_stat": 1.3944, "p_one_sided": 0.08159, "sum_return_pct": 67.5295},
+  "fold_mean_bps": [5.2820, 15.6554, 21.7591],
+  "stress": {"round_trip_bps": 20, "mean_bps": 8.1869, "sum_return_pct": 38.9695},
+  "development_passed": false,
+  "sealed_final_opened": false,
+  "failed_gates": ["development_t_at_least_2", "one_sided_p_at_most_0_05"],
+  "note": "Promising positive cost-adjusted lead-lag evidence, but statistical hurdle not met. Do not retune or paper deploy yet.",
+  "live_orders_sent": 0
+}
