@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "strategy": "trend_funding_crowding_ensemble",
+  "runtime_deployment": "13cd465a-51b2-4ee4-92c8-f74471cee586",
+  "source_commit": "7739a65dd0cbce23ba6cb0b51f5529c3a4530016",
+  "development_passed": false,
+  "sealed_final_opened": false,
+  "passed": false,
+  "development": {
+    "net_pnl": 1.317095080861133,
+    "final_equity": 16.317095080861133,
+    "trades": 13,
+    "win_rate_pct": 69.2,
+    "profit_factor": 2.520989102343381,
+    "cagr_pct": 3.5361473740466387,
+    "max_drawdown_pct": 5.485886315576167,
+    "estimated_monthly_pnl": 0.0454
+  },
+  "baseline_development": {
+    "net_pnl": 0.6026832216151377,
+    "final_equity": 15.602683221615138,
+    "trades": 11,
+    "profit_factor": 1.74,
+    "cagr_pct": 1.64,
+    "max_drawdown_pct": 5.74
+  },
+  "stress_10bps_per_side": {
+    "net_pnl": 1.2752558660693865,
+    "profit_factor": 2.45,
+    "cagr_pct": 3.43
+  },
+  "diagnostics": {
+    "forward_30d_fee_net_mean_pct": 12.429988057613091,
+    "forward_30d_t": 3.358138105585722,
+    "trade_sign_flip_p": 0.0994751312171957,
+    "positive_folds": 1,
+    "positive_rules": 5
+  },
+  "development_folds_net_pnl": [1.5945, -0.4346, -0.0700],
+  "failed_gates": [
+    "at_least_2_of_3_folds_positive"
+  ],
+  "live_orders_sent": 0,
+  "decision": "REJECTED because profitability was concentrated in one chronological fold; sealed final 25% remained unopened. Preserve the admitted base 30-day TSMOM candidate."
+}
