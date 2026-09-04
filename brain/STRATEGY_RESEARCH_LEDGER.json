@@ -1,13 +1,26 @@
 {
   "schema": 1,
-  "updated_utc": "2026-09-03",
+  "updated_utc": "2026-09-04",
   "objective": "Find a robust paper-trading candidate for a $15 wallet without optimizing to a profit target.",
   "current_best": {
-    "strategy": "30-day long/cash TSMOM",
-    "status": "historically admitted; forward paper only",
-    "evidence_summary": "3.33y +17.47%, PF 1.53; final 40% +5.75%, PF 1.49; $15 replay about 7.7% annualized",
-    "caveat": "Not evidence for $5/month or 30-50% monthly profit."
+    "strategy_family": "30-day long/cash TSMOM",
+    "status": "historically admitted; perpetual forward paper running; spot venue also passed historical paper admission on matched dates",
+    "evidence_summary": "Base study: 3.33y +17.47%, PF 1.53; final 40% +5.75%, PF 1.49. Matched spot/perp study: spot development +$0.9093 vs perp +$0.6027; sealed spot final +$1.5213, PF 5.49, DD 3.51%, with +$1.4944 at 15 bps/side stress.",
+    "caveat": "Spot and perpetual are implementations of the same signal family, not two independent edges. Historical admission is not forward/live proof or a profit guarantee."
   },
+  "admitted_paper_variants": [
+    {
+      "strategy": "30-day long/cash TSMOM on USD-M perpetuals",
+      "status": "forward paper running",
+      "evidence": "brain/TSMOM_FORWARD_20260903_tsmom_paper_summary.json"
+    },
+    {
+      "strategy": "30-day long/cash TSMOM on spot",
+      "status": "historically admitted for paper observation; no spot runner deployed",
+      "reason": "Matched-date development and sealed final were positive, robust to 15 bps/side spot cost stress.",
+      "evidence": "brain/SPOT_PERP_20260904_validation_summary.json"
+    }
+  ],
   "constraints": {
     "starting_equity_usd": 15,
     "normal_target_notional_usd": 5,
@@ -15,9 +28,12 @@
     "max_open_positions": 1,
     "dca_steps": 0,
     "adverse_slippage_bps_per_fill": 2,
-    "taker_fee_bps_per_fill": 5,
-    "base_cost_bps_per_side": 7,
-    "stress_cost_bps_per_side": 10,
+    "perp_taker_fee_bps_per_fill": 5,
+    "perp_base_cost_bps_per_side": 7,
+    "perp_stress_cost_bps_per_side": 10,
+    "spot_standard_fee_assumption_bps_per_fill": 10,
+    "spot_base_cost_bps_per_side": 12,
+    "spot_stress_cost_bps_per_side": 15,
     "daily_profit_target_usd": 0.5,
     "daily_loss_gate_usd": -0.3,
     "funding": "Include exact settled funding when applicable.",
@@ -84,6 +100,21 @@
       "strategy": "7/14/21-day long-only TSMOM",
       "reason": "Positive but too few trades and statistically weak; all executable trades concentrated in TRX",
       "evidence": "brain/SHORT_TSMOM_20260903_validation_summary.json"
+    },
+    {
+      "strategy": "BTC regime + six-coin breadth overlay",
+      "reason": "Positive development but only 2 executable trades, CAGR 1.09%, sign-flip p=0.240; final remained sealed.",
+      "evidence": "brain/TSMOM_REGIME_BREADTH_20260904_validation_summary.json"
+    },
+    {
+      "strategy": "volatility-managed dual momentum",
+      "reason": "Development -$0.0027, PF 0.993, 10-bps stress negative and sign-flip p=0.511; final remained sealed.",
+      "evidence": "brain/DUAL_MOMENTUM_20260904_validation_summary.json"
+    },
+    {
+      "strategy": "trend + funding-crowding ensemble",
+      "reason": "Strong aggregate development (+$1.3171, PF 2.52) but only 1/3 chronological folds was positive; final remained sealed.",
+      "evidence": "brain/TREND_FUNDING_20260904_validation_summary.json"
     }
   ],
   "research_rules": [
@@ -96,10 +127,9 @@
     "A pass permits paper validation only; live requires separate explicit approval."
   ],
   "next_queue": [
-    "BTC market-regime and six-coin breadth overlay on the admitted 30-day TSMOM rule",
-    "Spot-versus-perpetual long/cash momentum comparison under actual minimums and fees",
-    "Volatility-managed dual momentum with a cash state and no shorts",
-    "Trend plus funding-crowding ensemble using only individually known-at-decision features",
-    "Portfolio ensemble only after two independently admitted, low-correlation components exist"
+    "Keep the admitted perpetual 30-day TSMOM forward paper settings frozen and collect real forward evidence.",
+    "Build a keyless spot paper reconstruction only if a parallel spot observation is desired; do not replace the perpetual paper evidence stream by accident.",
+    "Search for a genuinely independent second edge before constructing any portfolio ensemble; a second venue for the same signal does not count as independence.",
+    "Do not retune the rejected trend+funding ensemble on its sealed data; revisit only with new future data or a genuinely pre-registered structural change."
   ]
 }
