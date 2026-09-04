@@ -41,81 +41,24 @@
     "deploy_branch": "Never write runtime evidence to main; use brain-state."
   },
   "rejected_families": [
-    {
-      "strategy": "24h directional paper bot",
-      "reason": "17 trades, fee-net -$0.2236; gross also negative",
-      "evidence": "PAPER_LIVE_3fec05136496 evidence"
-    },
-    {
-      "strategy": "delta-neutral funding carry",
-      "reason": "About 0.2% annualized under assumptions; economically immaterial at $15",
-      "evidence": "RISK_VALIDATION_REPORT.md"
-    },
-    {
-      "strategy": "higher-timeframe EMA/RSI/ATR",
-      "reason": "Development failed profitability and stability gates",
-      "evidence": "RISK_VALIDATION_REPORT.md"
-    },
-    {
-      "strategy": "relative-strength long/short pair",
-      "reason": "Final fee/funding-net -$1.4491, PF 0.61",
-      "evidence": "brain/XS_PAIR_20260902_validation_summary.json"
-    },
-    {
-      "strategy": "4H Donchian + daily regime",
-      "reason": "Apparent training profit concentrated in one segment; drawdown 26.44%",
-      "evidence": "RISK_VALIDATION_REPORT.md"
-    },
-    {
-      "strategy": "4H/1H continuation",
-      "reason": "653 development trades, fee/funding-net -$7.5590, PF 0.886",
-      "evidence": "RISK_VALIDATION_REPORT.md"
-    },
-    {
-      "strategy": "24h cross-sectional reversal",
-      "reason": "371 pairs, fee/funding-net -$9.6766, PF 0.769",
-      "evidence": "brain/XS_REVERSAL_20260903_validation_summary.json"
-    },
-    {
-      "strategy": "30d/90d TSMOM consensus",
-      "reason": "+$0.0012 but PF 1.001, stress negative, p=0.511",
-      "evidence": "brain/TSMOM_CONSENSUS_20260903_validation_summary.json"
-    },
-    {
-      "strategy": "completed-daily Donchian",
-      "reason": "Development positive but 30-34% drawdowns; final sealed",
-      "evidence": "brain/DAILY_BREAKOUT_20260903_validation_summary.json"
-    },
-    {
-      "strategy": "daily Donchian profit trail",
-      "reason": "Inner validation stress -$0.858; outer final sealed",
-      "evidence": "brain/DAILY_TRAIL_20260903_validation_summary.json"
-    },
-    {
-      "strategy": "4H long-only boosted-tree screen",
-      "reason": "1110 OOS signals, all six symbols negative, PF 0.674",
-      "evidence": "brain/ML_4H_SCREEN_20260903_validation_summary.json"
-    },
-    {
-      "strategy": "7/14/21-day long-only TSMOM",
-      "reason": "Positive but too few trades and statistically weak; all executable trades concentrated in TRX",
-      "evidence": "brain/SHORT_TSMOM_20260903_validation_summary.json"
-    },
-    {
-      "strategy": "BTC regime + six-coin breadth overlay",
-      "reason": "Positive development but only 2 executable trades, CAGR 1.09%, sign-flip p=0.240; final remained sealed.",
-      "evidence": "brain/TSMOM_REGIME_BREADTH_20260904_validation_summary.json"
-    },
-    {
-      "strategy": "volatility-managed dual momentum",
-      "reason": "Development -$0.0027, PF 0.993, 10-bps stress negative and sign-flip p=0.511; final remained sealed.",
-      "evidence": "brain/DUAL_MOMENTUM_20260904_validation_summary.json"
-    },
-    {
-      "strategy": "trend + funding-crowding ensemble",
-      "reason": "Strong aggregate development (+$1.3171, PF 2.52) but only 1/3 chronological folds was positive; final remained sealed.",
-      "evidence": "brain/TREND_FUNDING_20260904_validation_summary.json"
-    }
+    {"strategy":"24h directional paper bot","reason":"17 trades, fee-net -$0.2236; gross also negative","evidence":"PAPER_LIVE_3fec05136496 evidence"},
+    {"strategy":"delta-neutral funding carry","reason":"About 0.2% annualized under assumptions; economically immaterial at $15","evidence":"RISK_VALIDATION_REPORT.md"},
+    {"strategy":"higher-timeframe EMA/RSI/ATR","reason":"Development failed profitability and stability gates","evidence":"RISK_VALIDATION_REPORT.md"},
+    {"strategy":"relative-strength long/short pair","reason":"Final fee/funding-net -$1.4491, PF 0.61","evidence":"brain/XS_PAIR_20260902_validation_summary.json"},
+    {"strategy":"4H Donchian + daily regime","reason":"Apparent training profit concentrated in one segment; drawdown 26.44%","evidence":"RISK_VALIDATION_REPORT.md"},
+    {"strategy":"4H/1H continuation","reason":"653 development trades, fee/funding-net -$7.5590, PF 0.886","evidence":"RISK_VALIDATION_REPORT.md"},
+    {"strategy":"24h cross-sectional reversal","reason":"371 pairs, fee/funding-net -$9.6766, PF 0.769","evidence":"brain/XS_REVERSAL_20260903_validation_summary.json"},
+    {"strategy":"30d/90d TSMOM consensus","reason":"+$0.0012 but PF 1.001, stress negative, p=0.511","evidence":"brain/TSMOM_CONSENSUS_20260903_validation_summary.json"},
+    {"strategy":"completed-daily Donchian","reason":"Development positive but 30-34% drawdowns; final sealed","evidence":"brain/DAILY_BREAKOUT_20260903_validation_summary.json"},
+    {"strategy":"daily Donchian profit trail","reason":"Inner validation stress -$0.858; outer final sealed","evidence":"brain/DAILY_TRAIL_20260903_validation_summary.json"},
+    {"strategy":"4H long-only boosted-tree screen","reason":"1110 OOS signals, all six symbols negative, PF 0.674","evidence":"brain/ML_4H_SCREEN_20260903_validation_summary.json"},
+    {"strategy":"7/14/21-day long-only TSMOM","reason":"Positive but too few trades and statistically weak; all executable trades concentrated in TRX","evidence":"brain/SHORT_TSMOM_20260903_validation_summary.json"},
+    {"strategy":"BTC regime + six-coin breadth overlay","reason":"Positive development but only 2 executable trades, CAGR 1.09%, sign-flip p=0.240; final remained sealed.","evidence":"brain/TSMOM_REGIME_BREADTH_20260904_validation_summary.json"},
+    {"strategy":"volatility-managed dual momentum","reason":"Development -$0.0027, PF 0.993, 10-bps stress negative and sign-flip p=0.511; final remained sealed.","evidence":"brain/DUAL_MOMENTUM_20260904_validation_summary.json"},
+    {"strategy":"trend + funding-crowding ensemble","reason":"Strong aggregate development (+$1.3171, PF 2.52) but only 1/3 chronological folds was positive; final remained sealed.","evidence":"brain/TREND_FUNDING_20260904_validation_summary.json"},
+    {"strategy":"trend-conditioned pullback reversion","reason":"The frozen $15 execution/risk constraints blocked 19 minimum-notional entries and left zero executable trades; all neighbours also had zero trades.","evidence":"brain/PULLBACK_REVERSION_20260904_validation_summary.json"},
+    {"strategy":"negative-funding selloff rebound","reason":"Development passed strongly (+$1.8490, PF 1.77, CAGR 4.96%, 2/3 folds, p=0.126) but sealed final collapsed to +$0.0033, PF 1.004 and negative 10-bps stress.","evidence":"brain/FUNDING_REBOUND_20260904_validation_summary.json"},
+    {"strategy":"volatility-compression breakout","reason":"Development +$0.2073 but PF 1.028, CAGR 0.63%, only 1/3 folds positive and sign-flip p=0.464; final remained sealed.","evidence":"brain/VOL_COMPRESSION_20260904_validation_summary.json"}
   ],
   "research_rules": [
     "Test one genuinely distinct pre-registered family per research iteration.",
@@ -128,8 +71,10 @@
   ],
   "next_queue": [
     "Keep the admitted perpetual 30-day TSMOM forward paper settings frozen and collect real forward evidence.",
-    "Build a keyless spot paper reconstruction only if a parallel spot observation is desired; do not replace the perpetual paper evidence stream by accident.",
-    "Search for a genuinely independent second edge before constructing any portfolio ensemble; a second venue for the same signal does not count as independence.",
-    "Do not retune the rejected trend+funding ensemble on its sealed data; revisit only with new future data or a genuinely pre-registered structural change."
+    "Investigate the recently documented quarter-hour crypto-futures microstructure effect only if public trade-level data can support a realistic out-of-sample, fee-aware test; do not substitute coarse candles and call it replication.",
+    "Screen hourly return autocorrelation/continuation as a distinct short-horizon hypothesis before building execution logic; require raw forward edge to clear realistic round-trip costs.",
+    "Revisit walk-forward statistical-arbitrage pairs only with exact funding, current minimums and a matched random-walk false-positive control.",
+    "Do not retune the rejected funding-rebound rule on its opened sealed final; any revisit requires new future data or a genuinely new pre-registered mechanism.",
+    "Construct a portfolio ensemble only after a second independently admitted, low-correlation edge exists."
   ]
 }
