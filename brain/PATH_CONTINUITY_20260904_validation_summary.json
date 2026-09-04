@@ -1,0 +1,14 @@
+{
+  "strategy": "smooth_path_continuation_proxy_14d",
+  "status": "REJECTED_AFTER_SEALED_FINAL",
+  "development": {"n": 91, "mean_bps": 533.2401, "median_bps": 322.6681, "t_stat": 3.3981, "p_one_sided": 0.000339, "sum_return_pct": 485.2485},
+  "fold_mean_bps": [708.6090, 993.3085, 53.9563],
+  "development_stress_mean_bps": 527.2401,
+  "development_passed": true,
+  "sealed_final_opened": true,
+  "final": {"n": 26, "mean_bps": -178.3774, "median_bps": -130.4437, "t_stat": -1.1856, "sum_return_pct": -46.3781},
+  "final_stress": {"mean_bps": -184.3774, "sum_return_pct": -47.9381},
+  "passed": false,
+  "note": "Strong development completely failed the sealed final; do not retune on final data.",
+  "live_orders_sent": 0
+}
