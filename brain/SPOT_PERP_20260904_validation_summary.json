@@ -1,0 +1,57 @@
+{
+  "schema": 1,
+  "strategy": "spot_vs_perp_30d_long_cash_tsmom",
+  "runtime_deployment": "9d88b12d-75de-40a7-8aa4-46ef8a93c3e9",
+  "source_commit": "bed3a3addd58cc7c381c0c67ca0f63df76c3aa25",
+  "common_bars": 1220,
+  "development_passed": true,
+  "sealed_final_opened": true,
+  "passed_for_spot_paper_candidate": true,
+  "cost_model": {
+    "perp_bps_per_side": 7.0,
+    "spot_bps_per_side": 12.0,
+    "spot_stress_bps_per_side": 15.0,
+    "spot_note": "10 bps published standard spot trading fee plus 2 bps adverse fill; no account-specific discount assumed"
+  },
+  "spot_current_minimum_notional": {
+    "BNBUSDT": 5.0,
+    "XRPUSDT": 5.0,
+    "TRXUSDT": 5.0,
+    "DOGEUSDT": 1.0,
+    "SOLUSDT": 5.0,
+    "SUIUSDT": 5.0
+  },
+  "perp_current_minimum_notional": {
+    "BNBUSDT": 5.0,
+    "XRPUSDT": 5.0,
+    "TRXUSDT": 5.0,
+    "DOGEUSDT": 5.0,
+    "SOLUSDT": 5.0,
+    "SUIUSDT": 5.0
+  },
+  "development": {
+    "spot_net_pnl": 0.9092928276095549,
+    "spot_final_equity": 15.909292827609555,
+    "spot_profit_factor": 1.8199318032977951,
+    "spot_cagr_pct": 2.459790035613185,
+    "spot_max_drawdown_pct": 5.685453867358983,
+    "spot_trades": 17,
+    "spot_stress_net_pnl": 0.8649355472965627,
+    "perp_net_pnl": 0.6026832216151377,
+    "perp_profit_factor": 1.7397280793027827,
+    "spot_positive_folds": 2
+  },
+  "sealed_final": {
+    "spot_net_pnl": 1.521277321938527,
+    "spot_final_equity": 16.521277321938527,
+    "spot_profit_factor": 5.49,
+    "spot_cagr_pct": 12.74,
+    "spot_max_drawdown_pct": 3.51,
+    "spot_trades": 8,
+    "spot_stress_net_pnl": 1.4944,
+    "perp_net_pnl": 1.4368324846130989,
+    "perp_profit_factor": 5.28
+  },
+  "live_orders_sent": 0,
+  "decision": "PASS for paper-only spot observation; no live deployment approval."
+}
