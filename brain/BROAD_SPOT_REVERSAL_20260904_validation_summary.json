@@ -1,0 +1,13 @@
+{
+  "strategy": "broad_spot_weekly_high_vol_loser_reversal_56d",
+  "status": "REJECTED",
+  "universe": "15 fixed current-liquid USDT spot majors",
+  "aligned_daily_bars": 1826,
+  "development": {"n": 105, "mean_bps": -98.5169, "t_stat": -0.8519, "p_one_sided": 0.80285, "sum_return_pct": -103.4427},
+  "fold_mean_bps": [-118.7271, 102.2563, -160.8623],
+  "stress": {"round_trip_bps": 30, "mean_bps": -104.5169},
+  "development_passed": false,
+  "sealed_final_opened": false,
+  "survivorship_caveat": true,
+  "live_orders_sent": 0
+}
