@@ -1,0 +1,72 @@
+{
+  "schema": 1,
+  "created_utc": "2026-09-04",
+  "strategy": "tsmom_30d_plus_btc_leadlag_cash_state_ensemble",
+  "status": "PREREGISTERED_NOT_EVALUATED",
+  "purpose": "Freeze a materially distinct slow-trend plus intraday-event ensemble before any combined-data evaluation.",
+  "hypothesis": "Use the admitted 30-day long/cash TSMOM as the primary allocation. When TSMOM is in cash, a statistically promising but not-admitted BTC shock -> high-beta alt lead-lag event may use otherwise idle capital. The combination is admitted only if the combined chronological OOS evidence passes every gate; neither component receives looser hurdles.",
+  "frozen_rules": {
+    "primary_component": {
+      "name": "30-day long/cash TSMOM",
+      "lookback_days": 30,
+      "signal_threshold": 0.25,
+      "rebalance_bars": 7,
+      "allow_short": false,
+      "decision": "completed daily candle only",
+      "fill": "next daily open",
+      "priority": 1
+    },
+    "secondary_component": {
+      "name": "BTC 1h shock -> highest-beta alt 4h lead-lag",
+      "btc_shock_sigma_multiple": 1.75,
+      "btc_sigma_lookback_hours": 72,
+      "alt_beta_lookback_hours": 720,
+      "direction": "same sign as completed BTC 1h shock",
+      "entry": "next 1h open",
+      "holding_hours": 4,
+      "overlap": "forbidden",
+      "eligibility": "only when the TSMOM account is in cash and no position is open",
+      "priority": 2
+    },
+    "collision_rule": "TSMOM always has priority. A lead-lag position is not opened if it would overlap a pending or open TSMOM position. No forced early TSMOM exit is allowed to make room for lead-lag.",
+    "weights": "No optimized weights. One account, at most one position; normal target notional $5 and absolute entry-notional cap $10.",
+    "dca_steps": 0,
+    "starting_equity_usd": 15,
+    "daily_profit_lock_usd": 0.50,
+    "daily_loss_gate_usd": -0.30,
+    "perp_base_cost_bps_per_side": 7,
+    "perp_stress_cost_bps_per_side": 10,
+    "funding": "Exact settled funding included for any position crossing funding timestamps.",
+    "minimums": "Use decision-date/currently applicable Binance minimum-notional and quantity-step filters in execution-aware evaluation.",
+    "intrabar": "Use pessimistic ordering and adverse gap handling where applicable."
+  },
+  "evaluation_protocol": {
+    "data": "Public market data only; no Binance credentials.",
+    "development": "Chronological development region only; never inspect either component's unopened sealed final while constructing the ensemble.",
+    "folds": 3,
+    "cost_stress_required": true,
+    "multiple_testing_correction_required": true,
+    "sealed_final": "One ensemble final segment, opened once only after all development gates pass.",
+    "minimum_development_gates": [
+      "combined fee/funding-net expectancy > 0",
+      "at least 2 of 3 chronological folds positive",
+      "stress-cost result positive",
+      "sufficient independent trade/event count",
+      "statistical credibility after multiple-testing correction",
+      "execution under $15/minimum-notional constraints is non-trivial",
+      "risk and drawdown not worse than admitted TSMOM benchmark without compensating return improvement"
+    ],
+    "admission": "Paper-only even if passed; live trading remains forbidden without separate explicit approval."
+  },
+  "component_evidence_at_preregistration": {
+    "tsmom": "Historically admitted; base 3.33y +17.47%, PF 1.53; final 40% +5.75%, PF 1.49.",
+    "lead_lag": "Not admitted: 476 development events, +14.1869 bps mean after 14-bps round trip, all 3 folds positive, 20-bps stress +8.1869 bps, but t=1.3944 and one-sided p=0.08159 failed preregistered evidence gates; its sealed final remains unopened."
+  },
+  "this_run": {
+    "combined_backtest_completed": false,
+    "blocked_reason": "The available local sandbox cannot reach public Binance/GitHub hosts, the Railway cron container is not running between jobs, and the connected Railway interface exposes no read-only one-off shell execution. Creating or redeploying a separate Railway research service would violate the frozen-runner/no-deployment constraint.",
+    "sealed_final_opened": false,
+    "live_orders_sent": 0,
+    "runner_settings_changed": false
+  }
+}
