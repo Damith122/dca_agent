@@ -1,0 +1,58 @@
+{
+  "schema": 1,
+  "strategy": "tsmom_30d_btc_upup_breadth",
+  "study": "BTC regime + six-coin breadth overlay on admitted 30-day long/cash TSMOM",
+  "runtime_deployment": "f71963d2-463b-4be2-b8bd-8cca7133fe0f",
+  "source_commit": "3744ea4181de9702a22471af2498a02d2d8ddf17",
+  "development_passed": false,
+  "sealed_final_opened": false,
+  "passed": false,
+  "development": {
+    "net_pnl": 0.39080795034099935,
+    "final_equity": 15.390807950341,
+    "trades": 2,
+    "win_rate_pct": 100.0,
+    "profit_factor": "Infinity",
+    "cagr_pct": 1.0924857388596942,
+    "max_drawdown_pct": 0.589695457923843,
+    "estimated_monthly_pnl": 0.0138
+  },
+  "baseline_development": {
+    "net_pnl": 0.6026832216151377,
+    "final_equity": 15.602683221615138,
+    "trades": 11,
+    "win_rate_pct": 63.6,
+    "profit_factor": 1.74,
+    "cagr_pct": 1.68,
+    "max_drawdown_pct": 5.74,
+    "estimated_monthly_pnl": 0.0212
+  },
+  "stress_10bps_per_side": {
+    "net_pnl": 0.3842780093409992,
+    "trades": 2
+  },
+  "diagnostics": {
+    "reviewed_rebalances": 123,
+    "btc_regime_pass_reviews": 40,
+    "breadth_pass_reviews": 62,
+    "both_regime_pass_reviews": 33,
+    "base_candidates": 105,
+    "regime_blocks": 72,
+    "overlay_candidates": 33,
+    "forward_30d_observations": 33,
+    "forward_30d_fee_net_mean_pct": 29.008,
+    "forward_30d_fee_net_median_pct": 10.063,
+    "forward_30d_positive_pct": 60.6,
+    "forward_30d_t": 3.53,
+    "trade_sign_flip_p": 0.24018995251187203,
+    "positive_folds": 2,
+    "positive_rules": 4
+  },
+  "failed_gates": [
+    "development_at_least_8_trades",
+    "development_cagr_at_least_3pct",
+    "trade_sign_flip_p_at_most_0_20"
+  ],
+  "live_orders_sent": 0,
+  "decision": "REJECTED; preserve the admitted base 30-day TSMOM candidate."
+}
