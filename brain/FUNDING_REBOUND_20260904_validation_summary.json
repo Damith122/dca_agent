@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "strategy": "negative_funding_selloff_rebound",
+  "date_utc": "2026-09-04",
+  "status": "rejected_final",
+  "development": {
+    "trades": 22,
+    "net_pnl_usd": 1.849004474783186,
+    "profit_factor": 1.7651827247203438,
+    "cagr_pct": 4.962599464424011,
+    "max_drawdown_pct": 6.158633544893133,
+    "positive_folds": 2,
+    "positive_rules": 5,
+    "stress_net_pnl_usd": 1.7599786613806465,
+    "sign_flip_p": 0.12646838290427392,
+    "development_passed": true
+  },
+  "sealed_final": {
+    "opened": true,
+    "trades": 7,
+    "net_pnl_usd": 0.003276238278072441,
+    "profit_factor": 1.0037230998316653,
+    "stress_net_pnl_usd": -0.0307,
+    "passed": false
+  },
+  "reason": "Development was robust enough to open the sealed final 25%, but final profitability collapsed to essentially flat, PF stayed below 1.10 and 10-bps/side stress was negative. Do not retune on sealed data.",
+  "live_orders_sent": 0
+}
