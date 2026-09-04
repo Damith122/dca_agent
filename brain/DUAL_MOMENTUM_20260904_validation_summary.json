@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "strategy": "volatility_managed_dual_momentum",
+  "runtime_deployment": "86060e75-e54c-4c15-9797-21b2f970e475",
+  "source_commit": "e6e8e6551c02d10f99908a787ee36dba9de3cbf2",
+  "development_passed": false,
+  "sealed_final_opened": false,
+  "passed": false,
+  "development": {
+    "net_pnl": -0.0027203260954333786,
+    "final_equity": 14.997279673904567,
+    "trades": 6,
+    "win_rate_pct": 66.7,
+    "profit_factor": 0.9928496979327537,
+    "cagr_pct": -0.007890106443542155,
+    "max_drawdown_pct": 3.97791212447944
+  },
+  "stress_10bps_per_side": {
+    "net_pnl": -0.021014613832109674
+  },
+  "diagnostics": {
+    "forward_30d_fee_net_mean_pct": 8.844833209460791,
+    "forward_30d_t": 2.6658842507012017,
+    "positive_folds": 2,
+    "positive_rules": 2,
+    "trade_sign_flip_p": 0.5113721569607598
+  },
+  "failed_gates": [
+    "development_fee_net_positive",
+    "development_profit_factor_at_least_1_20",
+    "development_at_least_8_trades",
+    "at_least_3_of_5_rules_positive",
+    "positive_at_stressed_cost",
+    "development_cagr_at_least_3pct",
+    "trade_sign_flip_p_at_most_0_20"
+  ],
+  "live_orders_sent": 0,
+  "decision": "REJECTED; preserve the admitted base 30-day TSMOM candidate."
+}
