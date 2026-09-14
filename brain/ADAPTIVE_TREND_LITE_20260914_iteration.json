@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "iteration_date_utc": "2026-09-14",
+  "strategy_family": "AdaptiveTrend-Lite: completed 6-hour trend, slow asset selection, dynamic volatility sizing, one long/cash position",
+  "status": "not_admitted",
+  "decision": "blocked_before_valid_backtest",
+  "pre_registered_rules": {
+    "universe": "BTC, ETH, BNB, XRP, ADA, DOGE, SOL public spot/perpetual OHLCV only",
+    "signal": "At each completed 6h candle, select the single asset with best trailing 28-day return, require its 28-day return > 0, otherwise cash",
+    "trend_confirmation": "Selected asset must also have close above completed 6h EMA(20); no intrabar lookahead",
+    "sizing": "Target annualized volatility 35%, realized vol from trailing 20 completed 6h returns, cap notional at $5 normal and $10 absolute",
+    "execution": "next 6h open, one open position, DCA=0, pessimistic intrabar ordering, adverse gap handling",
+    "costs": "7 bps/side base, 10 bps/side stress, plus 2 bps adverse slippage per fill; exact funding if perpetual",
+    "account_constraints": "$15 equity, daily profit lock +$0.50, daily loss gate -$0.30, current exchange min notional and quantity filters",
+    "validation": "development segment, chronological folds, one sealed final only after all gates pass; no parameter sweep"
+  },
+  "authoritative_prior_evidence": [
+    "AdaptiveTrend paper (arXiv:2602.11708, Feb 2026) motivates 6-hour trend, volatility-calibrated stops and slow portfolio adaptation, but its 150+ pair, asymmetric long-short setup is not directly transferable to this $15 one-position long/cash constraint.",
+    "Recent crypto momentum evidence reports time-series momentum outperforming cross-sectional momentum on risk-adjusted basis, supporting a conservative long/cash test rather than a long-short replication."
+  ],
+  "data_status": {
+    "required": "Verified public 6h OHLCV across the full study window plus exchange minimum filters and funding when perpetual",
+    "available_in_repo_main": false,
+    "result": "No verified dataset/evidence artifact was available in the repository main branch for a reproducible execution-grade run in this iteration; no substitute coarse or synthetic data was used."
+  },
+  "results": null,
+  "rejection_reason": "No valid out-of-sample backtest could be completed without verified public data and current filter metadata. Candidate is not admitted, and no monthly profit estimate is inferred.",
+  "next_step": "Keep current best frozen: 30-day long/cash TSMOM pending forward paper evidence. Next distinct queue item remains long/cash residual momentum after removing BTC or equal-weight market beta, but only after obtaining a reproducible public-data snapshot."
+}
