@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "iteration_date_utc": "2026-09-21",
+  "strategy_family": "volume/flow-confirmed long-cash trend overlay",
+  "status": "blocked_before_valid_backtest",
+  "hypothesis": "A decision-time volume/flow confirmation filter may improve the admitted 30-day long/cash TSMOM by suppressing low-conviction signals without adding shorts or extra positions.",
+  "primary_evidence": [
+    {
+      "source": "Fičura (2023), Impact of size and volume on cryptocurrency momentum",
+      "finding": "Large/liquid crypto assets showed weekly momentum while small/illiquid assets showed reversal; this motivates liquidity/volume-aware screening.",
+      "url": "https://ideas.repec.org/p/prg/jnlwps/v5y2023id5.003.html"
+    },
+    {
+      "source": "Huang (2024), Cryptocurrency Volume-Weighted Time Series Momentum",
+      "finding": "Reports evidence for volume-weighted cryptocurrency TSMOM; used only as mechanism justification, not as proof for this exact constrained implementation.",
+      "url": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4825389"
+    }
+  ],
+  "preregistered_rules": {
+    "signal": "Use only completed candles; baseline 30-day long/cash TSMOM signal; permit long only when rolling 7-day dollar-volume percentile is at least 50th percentile and up-volume share over the prior 20 completed candles is at least 55%.",
+    "execution": "Next-open fill; one open position maximum; DCA=0; pessimistic intrabar ordering; adverse gap handling.",
+    "constraints": {
+      "starting_equity_usd": 15,
+      "typical_position_notional_usd": 5,
+      "absolute_entry_cap_usd": 10,
+      "base_cost_bps_per_side": 7,
+      "stress_cost_bps_per_side": 10,
+      "daily_profit_lock_usd": 0.5,
+      "daily_loss_gate_usd": -0.3,
+      "funding": "exact settled funding when applicable"
+    },
+    "validation": "development segment, chronological validation folds, cost stress, one sealed final only after all admission gates pass; no exhaustive tuning"
+  },
+  "data_window": "Not executed: reproducible public OHLCV plus decision-time volume/flow data for the exact universe and matched dates was not available in the repository evidence set during this run.",
+  "fold_results": null,
+  "rejection_or_admission_reason": "Rejected as untestable in this iteration. No synthetic or coarse substitute data was used; sealed final remained unopened. This is a data-integrity block, not a profitability result.",
+  "next_distinct_queue_item": "Investigate basis/funding dislocation or another structurally distinct mechanism only when exact public decision-time data and current minimum filters can be reproduced.",
+  "safety": {
+    "main_changed": false,
+    "railway_changed": false,
+    "credentials_used": false,
+    "live_orders": false,
+    "automation_created": false
+  }
+}
