@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "iteration_utc": "2026-09-28",
+  "strategy_family": "long/cash residual momentum after removing BTC market beta",
+  "status": "rejected_as_untestable_before_backtest",
+  "hypothesis": "Removing rolling BTC beta from each altcoin's completed-candle returns may isolate residual continuation and improve risk-adjusted long/cash selection versus the admitted 30-day long/cash TSMOM.",
+  "primary_evidence": [
+    "Residualization is a standard single-index construction: asset return = alpha + beta*market return + residual.",
+    "Crypto residual-momentum claims exist in public research, but the cited evidence is not a substitute for a reproducible matched-data test under this project's $15 constraints."
+  ],
+  "preregistered_rules": {
+    "data": "Public OHLCV only; completed candles; exact decision-time information.",
+    "universe": "Same admitted six-coin universe and BTC market factor used by the benchmark.",
+    "beta": "Rolling 30 completed daily returns; OLS beta of each asset versus BTC; residual return = asset return - beta*BTC return.",
+    "signal": "30-day cumulative residual return; long the top positive residual asset, otherwise cash; one position only.",
+    "execution": "Next-open fills; pessimistic intrabar ordering; adverse-gap handling; no shorts; DCA=0.",
+    "constraints": "$15 start; $5 typical notional; $10 entry cap; 7 bps/side base; 10 bps/side stress; exact filters/minimums; daily +$0.50 lock; daily -$0.30 gate."
+  },
+  "data_window": "Not executed: repository branch brain-state was readable, but current main reports/evidence directory and a reproducible public OHLCV snapshot with exact exchange minimum filters were not available through the connected GitHub read path during this run.",
+  "fold_results": null,
+  "sealed_final_opened": false,
+  "admission_reason": "No valid development/chronological-fold/strict-cost backtest could be run without inventing or substituting data. Candidate was not admitted.",
+  "next_queue_item": "BTC-to-altcoin lead/lag prediction with strict non-overlapping out-of-sample signals, only if exact public decision-time data can be reproduced.",
+  "safety": "No credentials, live orders, Railway changes, deployments, schedules, or main-branch writes."
+}
