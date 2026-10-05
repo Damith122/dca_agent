@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "updated_utc": "2026-09-21",
+  "updated_utc": "2026-10-05",
   "objective": "Find a robust paper-trading candidate for a $15 wallet without optimizing to a profit target.",
   "current_best": {
     "strategy_family": "30-day long/cash TSMOM",
@@ -23,20 +23,23 @@
     "deploy_branch": "Never write runtime evidence to main; use brain-state."
   },
   "new_iteration": {
-    "date_utc": "2026-09-21",
-    "strategy_family": "volume/flow-confirmed long-cash trend overlay",
-    "hypothesis": "Decision-time volume/flow confirmation may suppress low-conviction 30-day long/cash TSMOM signals.",
-    "preregistered_rules": "Completed candles; baseline 30-day long/cash TSMOM; 7-day dollar-volume percentile >= 50th; 20-candle up-volume share >= 55%; next-open fills; pessimistic intrabar ordering; no shorts; one position; DCA=0; base and stress costs; chronological folds; sealed final only after gates.",
-    "data_window": "Not executed because exact reproducible public OHLCV and decision-time volume/flow data for the exact universe and matched dates was not available in the repository evidence set during this run.",
+    "date_utc": "2026-10-05",
+    "strategy_family": "BTC-to-altcoin lead/lag prediction with strict non-overlapping out-of-sample signals",
+    "hypothesis": "Lagged BTC returns may contain incremental predictive information for subsequent altcoin returns; strict non-overlap is required to avoid leakage.",
+    "preregistered_rules": "Completed daily BTC candles only; fixed simple lag map trained only on information available before each decision; at most one long alt or cash; next-open fills; pessimistic intrabar ordering; adverse gap handling; $15 equity; $5 typical notional; $10 cap; one position; DCA=0; 7 bps/side base and 10 bps/side stress costs; exact funding when applicable; current minimum filters; development segment; chronological validation folds; multiple-testing correction; signal-economics screen; sealed final only after all gates pass.",
+    "data_window": "Not executed. Repository search did not expose a reproducible historical OHLCV dataset/report set on main, and the research environment could not retrieve public Binance market-data files directly. No credentials or substitute dataset were used.",
     "fold_results": null,
     "decision": "rejected_as_untestable_before_backtest",
-    "reason": "No synthetic or coarse substitute data was used; sealed final remained unopened. This is a data-integrity block, not a profitability result.",
-    "evidence": "brain/VOLUME_FLOW_TREND_20260921_iteration.json"
+    "reason": "Required public historical data could not be reproduced in this run, so development/validation folds and the sealed final were not opened. This is a data-integrity block, not evidence of unprofitability.",
+    "evidence": "brain/LEAD_LAG_BTC_ALT_20261005_iteration.json"
   },
   "rejected_families": [
     "BTC regime + six-coin breadth overlay",
     "volatility-managed dual momentum",
     "AdaptiveTrend-Lite",
+    "long/cash residual momentum after removing BTC or equal-weight market beta (blocked before valid backtest)",
+    "volume/flow-confirmed long-cash trend overlay (blocked before valid backtest)",
+    "BTC-to-altcoin lead/lag prediction with strict non-overlapping out-of-sample signals (blocked before valid backtest)",
     "trend + funding-crowding ensemble",
     "and all previously recorded rejected families in earlier ledger versions"
   ],
@@ -51,7 +54,8 @@
   ],
   "next_queue": [
     "Keep admitted 30-day long/cash TSMOM forward paper settings frozen and collect real forward evidence.",
-    "Investigate basis/funding dislocation or another structurally distinct mechanism only when exact public decision-time data and current minimum filters can be reproduced.",
+    "Investigate trend plus funding-crowding filter using only settled funding known at decision time when exact public funding history and current minimum filters can be reproduced.",
+    "Investigate spot-versus-perpetual long/cash momentum under actual minimums and fees only when matched public spot/perpetual history is reproducible.",
     "Construct a portfolio ensemble only after a second independently admitted low-correlation edge exists."
   ]
 }
