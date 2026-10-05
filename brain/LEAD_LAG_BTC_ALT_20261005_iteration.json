@@ -1,0 +1,48 @@
+{
+  "schema": 1,
+  "iteration_date_utc": "2026-10-05",
+  "strategy_family": "BTC-to-altcoin lead/lag prediction with strict non-overlapping out-of-sample signals",
+  "status": "blocked_before_valid_backtest",
+  "hypothesis": "Lagged BTC returns may contain incremental predictive information for subsequent altcoin returns; any signal must be generated only from completed BTC observations and evaluated on strictly non-overlapping out-of-sample periods.",
+  "primary_evidence": [
+    {
+      "source": "Jia, Wu, Yan, Yin (2019/2023), A Seesaw Effect in the Cryptocurrency Market",
+      "finding": "Reports cross-predictability among major cryptocurrencies, with large cryptocurrencies including Bitcoin predicting other coins; this supports testing a BTC-to-alt lead-lag mechanism but does not establish profitability for this constrained implementation.",
+      "url": "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3465924"
+    },
+    {
+      "source": "Wen, Bouri, Xu, Zhao (2022), Intraday Return Predictability in the Cryptocurrency Markets",
+      "finding": "Reports time-dependent momentum/reversal predictability in actively traded cryptocurrencies; used only as mechanism context, not as proof for this exact small-account strategy.",
+      "url": "https://papers.ssrn.com/sol3/Delivery.cfm/SSRN_ID4080253_code2537556.pdf?abstractid=4080253"
+    }
+  ],
+  "preregistered_rules": {
+    "signal": "Use completed daily BTC candles only. At each decision date, fit a fixed simple lag map from BTC return to each eligible altcoin using only the development/training history available before that date; select at most one alt with positive predicted next-period return. No overlapping training/test labels and no reuse of future observations.",
+    "execution": "Next-open fill; one open position maximum; long/cash only; DCA=0; pessimistic intrabar ordering; adverse gap handling.",
+    "constraints": {
+      "starting_equity_usd": 15,
+      "typical_position_notional_usd": 5,
+      "absolute_entry_notional_cap_usd": 10,
+      "base_cost_bps_per_side": 7,
+      "stress_cost_bps_per_side": 10,
+      "daily_profit_lock_usd": 0.5,
+      "daily_loss_gate_usd": -0.3,
+      "funding": "exact settled funding when applicable",
+      "exchange_filters": "current public minimum-notional and quantity filters required"
+    },
+    "validation": "Development segment, chronological validation folds, cost stress, multiple-testing correction, signal-economics screen, and one sealed final segment only after all admission gates pass; no exhaustive parameter tuning."
+  },
+  "data_window": "Not executed. Repository search did not expose a reproducible historical OHLCV dataset/report set on main, and the research environment could not retrieve public Binance market-data files directly. Current authoritative Binance documentation confirms public market-data infrastructure exists, but no credentials were used and no substitute dataset was fabricated.",
+  "fold_results": null,
+  "decision": "rejected_as_untestable_before_backtest",
+  "reason": "The required public historical data could not be reproduced in this run, so development/validation folds and the sealed final were not opened. This is a data-integrity block, not evidence that the strategy is unprofitable.",
+  "benchmark": "30-day long/cash TSMOM remains the admitted historical benchmark, pending forward paper evidence.",
+  "next_distinct_queue_item": "Trend plus funding-crowding filter using only settled funding known at decision time, provided exact public funding history and current minimum filters can be reproduced without credentials.",
+  "safety": {
+    "main_changed": false,
+    "railway_changed": false,
+    "credentials_used": false,
+    "live_orders": false,
+    "automation_created": false
+  }
+}
